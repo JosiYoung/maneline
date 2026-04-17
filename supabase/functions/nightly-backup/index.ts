@@ -26,6 +26,10 @@
 //             trainer_applications  (Phase 0 / Prompt 9.2)
 //           + vet_records, animal_media, r2_objects,
 //             animal_archive_events  (Phase 1 / Prompt 1.9)
+//           + training_sessions, session_payments,
+//             stripe_connect_accounts, platform_settings,
+//             stripe_webhook_events, session_archive_events
+//                                    (Phase 2 / Prompt 2.9)
 //
 // Layer 2 guarantee: open-format (JSON + CSV), standard Git,
 // zero ManeLine tooling required to read. If Supabase AND
@@ -166,6 +170,16 @@ Deno.serve(async (_req) => {
       "animal_media",
       "r2_objects",
       "animal_archive_events",
+      // Phase 2 (Prompt 2.9) — trainer portal + Stripe payouts tables.
+      // No card data lives in any of these rows; Stripe holds PCI data.
+      // We only store account/intent/charge ids as opaque strings, fee
+      // config, and idempotency-keyed webhook event bodies.
+      "training_sessions",
+      "session_payments",
+      "stripe_connect_accounts",
+      "platform_settings",
+      "stripe_webhook_events",
+      "session_archive_events",
     ] as const;
 
     const tableData: Record<string, Record<string, unknown>[]> = {};

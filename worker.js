@@ -71,9 +71,12 @@ import { renderRecordsPdf } from './worker/records-export.js';
 import {
   createAccountLink,
   createExpressAccount,
+  createPaymentIntent,
   isStripeConfigured,
   retrieveAccount,
+  retrievePaymentIntent,
 } from './worker/stripe.js';
+import { verifyStripeSignature } from './worker/stripe-webhook.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -109,6 +112,18 @@ export default {
       }
       if (url.pathname === '/api/sessions/archive') {
         return handleSessionArchive(request, env);
+      }
+      if (url.pathname === '/api/sessions/approve') {
+        return handleSessionApprove(request, env);
+      }
+      if (url.pathname === '/api/stripe/sessions/pay') {
+        return handleSessionPay(request, env);
+      }
+      if (url.pathname === '/api/stripe/webhook') {
+        return handleStripeWebhook(request, env);
+      }
+      if (url.pathname === '/api/stripe/sweep/process') {
+        return handleStripeSweepProcess(request, env);
       }
       if (url.pathname === '/api/records/export-pdf') {
         return handleRecordsExport(request, env);
@@ -2176,5 +2191,791 @@ async function handleStripeConnectReturn(_request, _env, url) {
   const target = new URL('/trainer/payouts', `${url.protocol}//${url.host}`);
   target.searchParams.set('returned', '1');
   return Response.redirect(target.toString(), 302);
+}
+
+/* =============================================================
+   /api/sessions/approve
+   -------------------------------------------------------------
+   Owner flips a session 'logged' → 'approved'. This is a
+   separate step from payment so owners can approve a session
+   (committing to pay) even before a Connect account is ready.
+   The 'pay' call is the second step.
+   ============================================================= */
+const SESSION_APPROVE_RATE = { limit: 20, windowSec: 60 };
+
+async function handleSessionApprove(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const rl = await rateLimitKv(
+    env.ML_RL,
+    `ratelimit:session_approve:${actorId}`,
+    SESSION_APPROVE_RATE
+  );
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, {
+      'retry-after': String(rl.resetSec),
+    });
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const sessionId = typeof body?.session_id === 'string' ? body.session_id : '';
+  if (!sessionId) return json({ error: 'session_id required' }, 400);
+
+  // Read with the caller's JWT — RLS confirms the owner owns the row.
+  const lookup = await supabaseSelect(
+    env,
+    'training_sessions',
+    `select=id,owner_id,trainer_id,status,archived_at,trainer_price_cents&id=eq.${encodeURIComponent(sessionId)}`,
+    { userJwt: jwt }
+  );
+  const row = Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!row) return json({ error: 'not_found' }, 404);
+  if (row.owner_id !== actorId) return json({ error: 'forbidden' }, 403);
+  if (row.archived_at) return json({ error: 'archived' }, 409);
+  if (row.status === 'approved' || row.status === 'paid') {
+    return json({ session: row });
+  }
+  if (row.status !== 'logged') {
+    return json({ error: 'not_approvable', status: row.status }, 409);
+  }
+  if (row.trainer_price_cents == null || row.trainer_price_cents <= 0) {
+    return json({ error: 'price_not_set' }, 409);
+  }
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'training_sessions',
+    `id=eq.${encodeURIComponent(sessionId)}&status=eq.logged`,
+    { status: 'approved' }
+  );
+  if (!upd.ok || !upd.data) {
+    return json({ error: 'session_update_failed', status: upd.status }, 500);
+  }
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'owner',
+    action:       'session.approve',
+    target_table: 'training_sessions',
+    target_id:    sessionId,
+    ip:           clientIp(request),
+    user_agent:   request.headers.get('user-agent') || null,
+    metadata:     { trainer_id: row.trainer_id, amount_cents: row.trainer_price_cents },
+  });
+
+  return json({ session: upd.data });
+}
+
+/* =============================================================
+   /api/stripe/sessions/pay
+   -------------------------------------------------------------
+   Owner starts payment for an approved session. Two paths:
+     • trainer Connect ready → create PaymentIntent, insert
+       session_payments with status='pending', return
+       { client_secret, payment_intent_id }.
+     • trainer not ready → insert session_payments with
+       status='awaiting_trainer_setup', return that status so
+       the SPA can render the "waiting on trainer" helper.
+   Fee math uses public.effective_fee_bps (single source of
+   truth across admin default + per-trainer overrides).
+   Idempotent on an existing session_payments row: if a
+   'pending' intent already exists, retrieve it and return
+   its client_secret rather than creating a second intent.
+   ============================================================= */
+const SESSION_PAY_RATE = { limit: 10, windowSec: 60 };
+
+async function handleSessionPay(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const rl = await rateLimitKv(
+    env.ML_RL,
+    `ratelimit:session_pay:${actorId}`,
+    SESSION_PAY_RATE
+  );
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, {
+      'retry-after': String(rl.resetSec),
+    });
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const sessionId = typeof body?.session_id === 'string' ? body.session_id : '';
+  if (!sessionId) return json({ error: 'session_id required' }, 400);
+
+  // RLS-scoped read: owner only sees rows where owner_id = auth.uid().
+  const lookup = await supabaseSelect(
+    env,
+    'training_sessions',
+    `select=id,owner_id,trainer_id,status,archived_at,trainer_price_cents&id=eq.${encodeURIComponent(sessionId)}`,
+    { userJwt: jwt }
+  );
+  const row = Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!row) return json({ error: 'not_found' }, 404);
+  if (row.owner_id !== actorId) return json({ error: 'forbidden' }, 403);
+  if (row.archived_at) return json({ error: 'archived' }, 409);
+  if (row.status !== 'approved') {
+    return json({ error: 'not_payable', status: row.status }, 409);
+  }
+  if (row.trainer_price_cents == null || row.trainer_price_cents <= 0) {
+    return json({ error: 'price_not_set' }, 409);
+  }
+
+  // Compute platform fee via the single source-of-truth SQL helper.
+  const feeRpc = await supabaseRpc(
+    env,
+    'effective_fee_bps',
+    { p_trainer_id: row.trainer_id },
+    { serviceRole: true }
+  );
+  if (!feeRpc.ok) {
+    return json({ error: 'fee_lookup_failed' }, 500);
+  }
+  const feeBps = typeof feeRpc.data === 'number'
+    ? feeRpc.data
+    : Number(feeRpc.data);
+  if (!Number.isFinite(feeBps) || feeBps < 0 || feeBps > 10000) {
+    return json({ error: 'fee_invalid' }, 500);
+  }
+  const amountCents = row.trainer_price_cents;
+  const platformFeeCents = Math.ceil((amountCents * feeBps) / 10000);
+
+  // Existing payment row? (Idempotency on repeated clicks.)
+  const existingQ = await supabaseSelect(
+    env,
+    'session_payments',
+    `select=id,status,stripe_payment_intent_id,amount_cents,platform_fee_cents&session_id=eq.${encodeURIComponent(sessionId)}`,
+    { serviceRole: true }
+  );
+  const existing = Array.isArray(existingQ.data) ? existingQ.data[0] : null;
+
+  // Succeeded / refunded rows short-circuit — the session is done.
+  if (existing && (existing.status === 'succeeded' || existing.status === 'processing')) {
+    return json({
+      status: existing.status,
+      payment_intent_id: existing.stripe_payment_intent_id,
+    });
+  }
+
+  // Look up trainer Connect status.
+  const connect = await getLatestConnectForTrainer(env, row.trainer_id);
+  const connectReady =
+    connect && connect.charges_enabled && !connect.deactivated_at;
+
+  // --- Path A: trainer not ready → park as awaiting_trainer_setup. ---
+  if (!connectReady) {
+    if (existing && existing.status === 'awaiting_trainer_setup') {
+      return json({
+        status: 'awaiting_trainer_setup',
+        amount_cents: existing.amount_cents,
+        platform_fee_cents: existing.platform_fee_cents,
+      });
+    }
+    // Insert fresh (or upgrade a stale 'failed' row by deleting + reinserting
+    // is risky; instead we only insert when no row exists and otherwise
+    // return the current state).
+    if (!existing) {
+      const ins = await supabaseInsertReturning(env, 'session_payments', {
+        session_id:         sessionId,
+        payer_id:           actorId,
+        payee_id:           row.trainer_id,
+        amount_cents:       amountCents,
+        platform_fee_cents: platformFeeCents,
+        currency:           'usd',
+        status:             'awaiting_trainer_setup',
+      });
+      if (!ins.ok) {
+        return json({ error: 'payment_insert_failed', status: ins.status }, 500);
+      }
+    }
+    ctx_audit(env, {
+      actor_id:     actorId,
+      actor_role:   'owner',
+      action:       'session_payment.awaiting_trainer_setup',
+      target_table: 'session_payments',
+      target_id:    sessionId,
+      metadata:     { amount_cents: amountCents, platform_fee_cents: platformFeeCents },
+    });
+    return json({
+      status: 'awaiting_trainer_setup',
+      amount_cents: amountCents,
+      platform_fee_cents: platformFeeCents,
+    });
+  }
+
+  // --- Path B: trainer ready → create / re-fetch PaymentIntent. ---
+  if (!isStripeConfigured(env)) {
+    return json({ error: 'stripe_not_configured' }, 501);
+  }
+
+  // If we already have a pending intent for this session, just re-retrieve
+  // its client_secret so the SPA can resume.
+  if (existing && existing.status === 'pending' && existing.stripe_payment_intent_id) {
+    const pi = await retrievePaymentIntent(env, existing.stripe_payment_intent_id);
+    if (pi.ok && pi.data?.client_secret) {
+      return json({
+        status: 'pending',
+        client_secret: pi.data.client_secret,
+        payment_intent_id: pi.data.id,
+      });
+    }
+    // fall through and create a new one if Stripe lost it
+  }
+
+  const idempotencyKey = `session_pay:${sessionId}:${amountCents}:${platformFeeCents}`;
+  const piRes = await createPaymentIntent(env, {
+    amountCents,
+    applicationFeeAmountCents: platformFeeCents,
+    destinationAccountId: connect.stripe_account_id,
+    idempotencyKey,
+    description: `Mane Line session ${sessionId}`,
+    metadata: {
+      session_id: sessionId,
+      owner_id:   actorId,
+      trainer_id: row.trainer_id,
+      fee_bps:    String(feeBps),
+    },
+  });
+  if (!piRes.ok || !piRes.data?.id || !piRes.data?.client_secret) {
+    return json({
+      error: piRes.error || 'stripe_create_intent_failed',
+      message: piRes.message ?? null,
+    }, 502);
+  }
+
+  // Insert or update the session_payments row to track this intent.
+  if (existing) {
+    const upd = await supabaseUpdateReturning(
+      env,
+      'session_payments',
+      `id=eq.${encodeURIComponent(existing.id)}`,
+      {
+        stripe_payment_intent_id: piRes.data.id,
+        amount_cents:             amountCents,
+        platform_fee_cents:       platformFeeCents,
+        status:                   'pending',
+        failure_code:             null,
+        failure_message:          null,
+      }
+    );
+    if (!upd.ok) {
+      return json({ error: 'payment_update_failed', status: upd.status }, 500);
+    }
+  } else {
+    const ins = await supabaseInsertReturning(env, 'session_payments', {
+      session_id:               sessionId,
+      payer_id:                 actorId,
+      payee_id:                 row.trainer_id,
+      stripe_payment_intent_id: piRes.data.id,
+      amount_cents:             amountCents,
+      platform_fee_cents:       platformFeeCents,
+      currency:                 'usd',
+      status:                   'pending',
+    });
+    if (!ins.ok) {
+      return json({ error: 'payment_insert_failed', status: ins.status }, 500);
+    }
+  }
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'owner',
+    action:       'session_payment.create_intent',
+    target_table: 'session_payments',
+    target_id:    sessionId,
+    ip:           clientIp(request),
+    user_agent:   request.headers.get('user-agent') || null,
+    metadata:     {
+      payment_intent_id:  piRes.data.id,
+      amount_cents:       amountCents,
+      platform_fee_cents: platformFeeCents,
+      fee_bps:            feeBps,
+    },
+  });
+
+  return json({
+    status: 'pending',
+    client_secret: piRes.data.client_secret,
+    payment_intent_id: piRes.data.id,
+    amount_cents: amountCents,
+    platform_fee_cents: platformFeeCents,
+  });
+}
+
+
+/* =============================================================
+   /api/stripe/webhook
+   -------------------------------------------------------------
+   Receives every Stripe event. Auth is signature-only:
+   Stripe-Signature header is HMAC-SHA256 over the raw body with
+   STRIPE_WEBHOOK_SECRET. No JWT.
+
+   Flow:
+     1. Read raw body, verify signature.
+     2. INSERT stripe_webhook_events row keyed by event.id.
+        ON CONFLICT means we've seen this event — return 200 and
+        skip the handler (idempotency §7 in the law file).
+     3. processStripeEvent fans out by event.type.
+     4. On success stamp processed_at = now().
+     5. On failure store last_error + bump processing_attempts;
+        the pg_cron sweep will retry.
+   ============================================================= */
+const STRIPE_WEBHOOK_RATE = { limit: 120, windowSec: 60 };
+
+async function handleStripeWebhook(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+  if (!env.STRIPE_WEBHOOK_SECRET) {
+    // Placeholder until the payment processor is verified.
+    return json({ error: 'webhook_not_configured' }, 501);
+  }
+
+  // Per-IP ceiling — Stripe's own throughput is well below this.
+  const rl = await rateLimitKv(
+    env.ML_RL,
+    `ratelimit:stripe_webhook:${clientIp(request)}`,
+    STRIPE_WEBHOOK_RATE
+  );
+  if (!rl.ok) {
+    return json({ error: 'rate_limited' }, 429, {
+      'retry-after': String(rl.resetSec),
+    });
+  }
+
+  const rawBody = await request.text();
+  const sigHeader = request.headers.get('stripe-signature') || '';
+  const verify = await verifyStripeSignature({
+    rawBody,
+    signatureHeader: sigHeader,
+    secret: env.STRIPE_WEBHOOK_SECRET,
+  });
+  if (!verify.ok) {
+    console.warn('[stripe_webhook] signature rejected', { reason: verify.error });
+    return json({ error: 'invalid_signature' }, 400);
+  }
+
+  let event;
+  try { event = JSON.parse(rawBody); } catch {
+    return json({ error: 'invalid_json' }, 400);
+  }
+  const eventId = typeof event?.id === 'string' ? event.id : '';
+  const eventType = typeof event?.type === 'string' ? event.type : '';
+  if (!eventId || !eventType) return json({ error: 'event_malformed' }, 400);
+
+  return ingestStripeEvent(env, event, 'webhook');
+}
+
+/* =============================================================
+   /api/stripe/sweep/process
+   -------------------------------------------------------------
+   Internal entry point for the `sweep-stripe-events` Supabase
+   Edge Function. Authenticated with the service_role Bearer
+   token (the Edge Function already runs with service_role,
+   so we compare Authorization to SUPABASE_SERVICE_ROLE_KEY).
+   Body: { event: <raw Stripe event object> }
+   ============================================================= */
+async function handleStripeSweepProcess(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+  const authz = request.headers.get('authorization') || '';
+  const expected = `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`;
+  if (!timingSafeEqual(authz, expected)) {
+    return json({ error: 'unauthorized' }, 401);
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const event = body?.event;
+  if (!event || typeof event.id !== 'string' || typeof event.type !== 'string') {
+    return json({ error: 'event_malformed' }, 400);
+  }
+  return ingestStripeEvent(env, event, 'sweep');
+}
+
+/**
+ * Shared event ingestion path. Idempotent on event.id. Stamps
+ * processed_at on success; otherwise records last_error and
+ * bumps processing_attempts for the sweep to retry.
+ */
+async function ingestStripeEvent(env, event, source) {
+  const eventId = event.id;
+  const eventType = event.type;
+
+  // 1) Idempotency: has this event already been processed?
+  const seen = await supabaseSelect(
+    env,
+    'stripe_webhook_events',
+    `select=id,processed_at,processing_attempts&event_id=eq.${encodeURIComponent(eventId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const seenRow = Array.isArray(seen.data) ? seen.data[0] : null;
+
+  let rowId;
+  let currentAttempts = 0;
+  if (seenRow) {
+    if (seenRow.processed_at) {
+      return json({ ok: true, idempotent: true, event_id: eventId });
+    }
+    rowId = seenRow.id;
+    currentAttempts = seenRow.processing_attempts || 0;
+  } else {
+    const ins = await supabaseInsertReturning(env, 'stripe_webhook_events', {
+      event_id:   eventId,
+      event_type: eventType,
+      payload:    event,
+      source,
+    });
+    if (!ins.ok) {
+      // Race: another request inserted first. Treat as already-seen.
+      return json({ ok: true, idempotent: true, race: true, event_id: eventId });
+    }
+    rowId = ins.data?.id;
+  }
+
+  // 2) Fan out by event type.
+  let handlerResult;
+  try {
+    handlerResult = await processStripeEvent(env, event);
+  } catch (err) {
+    handlerResult = { ok: false, error: err?.message || 'handler_threw' };
+  }
+
+  // 3) Mark processed or bump attempts.
+  if (handlerResult.ok) {
+    await supabaseUpdateReturning(
+      env,
+      'stripe_webhook_events',
+      `id=eq.${encodeURIComponent(rowId)}`,
+      { processed_at: new Date().toISOString(), last_error: null }
+    );
+    return json({ ok: true, event_id: eventId });
+  }
+
+  await supabaseUpdateReturning(
+    env,
+    'stripe_webhook_events',
+    `id=eq.${encodeURIComponent(rowId)}`,
+    {
+      processing_attempts: currentAttempts + 1,
+      last_error:          handlerResult.error || 'unknown',
+    }
+  );
+  // Return 500 so Stripe's own retry loop also fires — belt + suspenders
+  // with the pg_cron sweep.
+  return json({ ok: false, error: handlerResult.error || 'handler_failed' }, 500);
+}
+
+/**
+ * Fan-out handler. Returns { ok: true } or { ok: false, error }.
+ * Kept side-effect-free of the stripe_webhook_events row — the caller
+ * manages processed_at / last_error so replay behavior lives in one
+ * place (ingestStripeEvent).
+ */
+async function processStripeEvent(env, event) {
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      return handlePaymentIntentSucceeded(env, event);
+    case 'payment_intent.payment_failed':
+      return handlePaymentIntentFailed(env, event);
+    case 'account.updated':
+      return handleAccountUpdated(env, event);
+    case 'charge.refunded':
+      return handleChargeRefunded(env, event);
+    default:
+      // Unhandled events are recorded but treated as success so they
+      // don't clog the retry queue. Stripe sends many event types we
+      // don't care about.
+      return { ok: true, ignored: true };
+  }
+}
+
+async function handlePaymentIntentSucceeded(env, event) {
+  const pi = event.data?.object;
+  if (!pi?.id) return { ok: false, error: 'missing_payment_intent' };
+
+  const lookup = await supabaseSelect(
+    env,
+    'session_payments',
+    `select=id,session_id,status&stripe_payment_intent_id=eq.${encodeURIComponent(pi.id)}&limit=1`,
+    { serviceRole: true }
+  );
+  const row = Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!row) return { ok: false, error: 'session_payment_not_found' };
+  if (row.status === 'succeeded') return { ok: true, idempotent: true };
+
+  const chargeId =
+    (Array.isArray(pi.charges?.data) && pi.charges.data[0]?.id) ||
+    pi.latest_charge ||
+    null;
+
+  const updPay = await supabaseUpdateReturning(
+    env,
+    'session_payments',
+    `id=eq.${encodeURIComponent(row.id)}`,
+    {
+      status:                 'succeeded',
+      stripe_charge_id:       chargeId,
+      stripe_event_last_seen: event.id,
+      failure_code:           null,
+      failure_message:        null,
+    }
+  );
+  if (!updPay.ok) return { ok: false, error: 'session_payment_update_failed' };
+
+  const updSess = await supabaseUpdateReturning(
+    env,
+    'training_sessions',
+    `id=eq.${encodeURIComponent(row.session_id)}`,
+    { status: 'paid' }
+  );
+  if (!updSess.ok) return { ok: false, error: 'training_session_update_failed' };
+
+  ctx_audit(env, {
+    action:       'session_payment.succeeded',
+    target_table: 'session_payments',
+    target_id:    row.id,
+    metadata:     { event_id: event.id, charge_id: chargeId },
+  });
+  return { ok: true };
+}
+
+async function handlePaymentIntentFailed(env, event) {
+  const pi = event.data?.object;
+  if (!pi?.id) return { ok: false, error: 'missing_payment_intent' };
+
+  const lookup = await supabaseSelect(
+    env,
+    'session_payments',
+    `select=id,status&stripe_payment_intent_id=eq.${encodeURIComponent(pi.id)}&limit=1`,
+    { serviceRole: true }
+  );
+  const row = Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!row) return { ok: false, error: 'session_payment_not_found' };
+
+  const err = pi.last_payment_error || {};
+  const upd = await supabaseUpdateReturning(
+    env,
+    'session_payments',
+    `id=eq.${encodeURIComponent(row.id)}`,
+    {
+      status:                 'failed',
+      failure_code:           err.code || err.decline_code || null,
+      failure_message:        err.message || null,
+      stripe_event_last_seen: event.id,
+    }
+  );
+  if (!upd.ok) return { ok: false, error: 'session_payment_update_failed' };
+
+  ctx_audit(env, {
+    action:       'session_payment.failed',
+    target_table: 'session_payments',
+    target_id:    row.id,
+    metadata:     { event_id: event.id, failure_code: err.code || null },
+  });
+  return { ok: true };
+}
+
+async function handleAccountUpdated(env, event) {
+  const acct = event.data?.object;
+  const acctId = acct?.id;
+  if (!acctId) return { ok: false, error: 'missing_account' };
+
+  const lookup = await supabaseSelect(
+    env,
+    'stripe_connect_accounts',
+    `select=id,trainer_id,charges_enabled,payouts_enabled,details_submitted,disabled_reason,deactivated_at&stripe_account_id=eq.${encodeURIComponent(acctId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const row = Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!row) {
+    // An account we don't track — ignore gracefully.
+    return { ok: true, ignored: true };
+  }
+
+  const prevChargesEnabled = Boolean(row.charges_enabled);
+  const nextChargesEnabled = Boolean(acct.charges_enabled);
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'stripe_connect_accounts',
+    `id=eq.${encodeURIComponent(row.id)}`,
+    {
+      charges_enabled:   nextChargesEnabled,
+      payouts_enabled:   Boolean(acct.payouts_enabled),
+      details_submitted: Boolean(acct.details_submitted),
+      disabled_reason:   acct.requirements?.disabled_reason ?? null,
+    }
+  );
+  if (!upd.ok) return { ok: false, error: 'connect_update_failed' };
+
+  ctx_audit(env, {
+    action:       'stripe.account.updated',
+    target_table: 'stripe_connect_accounts',
+    target_id:    row.id,
+    metadata:     {
+      event_id:        event.id,
+      charges_enabled: nextChargesEnabled,
+      payouts_enabled: Boolean(acct.payouts_enabled),
+    },
+  });
+
+  // Edge-triggered retry: false → true flip on charges_enabled means any
+  // awaiting_trainer_setup rows for this trainer should now become real
+  // PaymentIntents.
+  if (!prevChargesEnabled && nextChargesEnabled && !row.deactivated_at) {
+    const retryRes = await retryAwaitingPaymentsForTrainer(env, row.trainer_id, acctId);
+    if (!retryRes.ok) return retryRes;
+  }
+  return { ok: true };
+}
+
+async function handleChargeRefunded(env, event) {
+  const ch = event.data?.object;
+  const piId = ch?.payment_intent;
+  const chId = ch?.id;
+  if (!piId && !chId) return { ok: false, error: 'missing_identifiers' };
+
+  const filter = piId
+    ? `stripe_payment_intent_id=eq.${encodeURIComponent(piId)}`
+    : `stripe_charge_id=eq.${encodeURIComponent(chId)}`;
+  const lookup = await supabaseSelect(
+    env,
+    'session_payments',
+    `select=id,session_id,status&${filter}&limit=1`,
+    { serviceRole: true }
+  );
+  const row = Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!row) return { ok: true, ignored: true };
+  if (row.status === 'refunded') return { ok: true, idempotent: true };
+
+  const updPay = await supabaseUpdateReturning(
+    env,
+    'session_payments',
+    `id=eq.${encodeURIComponent(row.id)}`,
+    { status: 'refunded', stripe_event_last_seen: event.id }
+  );
+  if (!updPay.ok) return { ok: false, error: 'session_payment_update_failed' };
+
+  // Session goes back to 'approved' so owner/trainer know the charge
+  // was reversed but the event itself still happened.
+  const updSess = await supabaseUpdateReturning(
+    env,
+    'training_sessions',
+    `id=eq.${encodeURIComponent(row.session_id)}`,
+    { status: 'approved' }
+  );
+  if (!updSess.ok) return { ok: false, error: 'training_session_update_failed' };
+
+  ctx_audit(env, {
+    action:       'session_payment.refunded',
+    target_table: 'session_payments',
+    target_id:    row.id,
+    metadata:     { event_id: event.id, request_id: event.request?.id ?? null },
+  });
+  return { ok: true };
+}
+
+/**
+ * For every session_payments row belonging to this trainer that is
+ * still parked in 'awaiting_trainer_setup', mint a PaymentIntent and
+ * flip to 'pending'. Called from the account.updated handler when
+ * charges_enabled transitions false → true.
+ *
+ * TECH_DEBT(phase-2.5): we should email the owner a one-tap confirm
+ * link per pending row. No mail helper exists yet; for now we log an
+ * audit_log row per retry so ops can follow up by hand. See
+ * docs/phase-2-plan.md §6 (resolved decision #2 + watch item on email).
+ */
+async function retryAwaitingPaymentsForTrainer(env, trainerId, stripeAccountId) {
+  const pending = await supabaseSelect(
+    env,
+    'session_payments',
+    `select=id,session_id,amount_cents,platform_fee_cents,payer_id&payee_id=eq.${encodeURIComponent(trainerId)}&status=eq.awaiting_trainer_setup`,
+    { serviceRole: true }
+  );
+  const rows = Array.isArray(pending.data) ? pending.data : [];
+  if (rows.length === 0) return { ok: true, retried: 0 };
+
+  if (!isStripeConfigured(env)) {
+    return { ok: false, error: 'stripe_not_configured_on_retry' };
+  }
+
+  let retried = 0;
+  for (const r of rows) {
+    const pi = await createPaymentIntent(env, {
+      amountCents:               r.amount_cents,
+      applicationFeeAmountCents: r.platform_fee_cents,
+      destinationAccountId:      stripeAccountId,
+      idempotencyKey:            `session_pay_retry:${r.id}:${r.amount_cents}:${r.platform_fee_cents}`,
+      description:               `Mane Line session ${r.session_id}`,
+      metadata: {
+        session_id: r.session_id,
+        owner_id:   r.payer_id,
+        trainer_id: trainerId,
+        retry:      'account.updated',
+      },
+    });
+    if (!pi.ok || !pi.data?.id) {
+      // Leave this row in awaiting_trainer_setup; the next sweep or
+      // the next account.updated event will pick it up.
+      continue;
+    }
+    const upd = await supabaseUpdateReturning(
+      env,
+      'session_payments',
+      `id=eq.${encodeURIComponent(r.id)}`,
+      {
+        stripe_payment_intent_id: pi.data.id,
+        status:                   'pending',
+        failure_code:             null,
+        failure_message:          null,
+      }
+    );
+    if (upd.ok) {
+      retried++;
+      ctx_audit(env, {
+        action:       'session_payment.auto_retry',
+        target_table: 'session_payments',
+        target_id:    r.id,
+        metadata:     { payment_intent_id: pi.data.id, trigger: 'account.updated' },
+      });
+    }
+  }
+  return { ok: true, retried };
 }
 

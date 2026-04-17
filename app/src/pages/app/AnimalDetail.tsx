@@ -117,6 +117,7 @@ function SessionsSection({ animalId }: { animalId: string }) {
             sessions={q.data ?? []}
             emptyText="No training sessions logged on this animal yet."
             showAnimal={false}
+            detailHref={(sid) => `/app/sessions/${sid}/pay`}
           />
         )}
       </CardContent>

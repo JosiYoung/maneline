@@ -144,3 +144,66 @@ export function createAccountLink(env, {
     type,
   });
 }
+
+/**
+ * POST /v1/payment_intents — creates a PaymentIntent whose funds route to
+ * the trainer's Connect account minus the platform fee.
+ *
+ *   application_fee_amount — in cents, kept by the platform
+ *   transfer_data.destination — the trainer's acct_xxx
+ *
+ * We use an `Idempotency-Key` header (recommended for mutating Stripe
+ * calls) so a retry from the SPA doesn't create two intents for the same
+ * session_payment row.
+ */
+export async function createPaymentIntent(env, {
+  amountCents,
+  applicationFeeAmountCents,
+  destinationAccountId,
+  metadata = {},
+  idempotencyKey,
+  description,
+}) {
+  if (!isStripeConfigured(env)) {
+    return { ok: false, status: 501, data: null, error: 'stripe_not_configured' };
+  }
+  const body = {
+    amount: amountCents,
+    currency: 'usd',
+    application_fee_amount: applicationFeeAmountCents,
+    transfer_data: { destination: destinationAccountId },
+    automatic_payment_methods: { enabled: true },
+    metadata,
+  };
+  if (description) body.description = description;
+
+  const headers = {
+    Authorization: basicAuthHeader(env.STRIPE_SECRET_KEY),
+    'Stripe-Version': STRIPE_API_VERSION,
+    'content-type': 'application/x-www-form-urlencoded',
+  };
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+
+  const res = await fetch(`${STRIPE_API_BASE}/payment_intents`, {
+    method: 'POST',
+    headers,
+    body: encodeForm(body),
+  });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      data,
+      error: data?.error?.code || data?.error?.type || 'stripe_request_failed',
+      message: data?.error?.message ?? null,
+    };
+  }
+  return { ok: true, status: res.status, data };
+}
+
+export function retrievePaymentIntent(env, paymentIntentId) {
+  return stripeFetch(env, 'GET', `/payment_intents/${encodeURIComponent(paymentIntentId)}`);
+}

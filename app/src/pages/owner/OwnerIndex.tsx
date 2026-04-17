@@ -11,6 +11,7 @@ import ExportRecords from "../app/ExportRecords";
 import TrainersIndex from "../app/TrainersIndex";
 import TrainerInvite from "../app/TrainerInvite";
 import Settings      from "../app/Settings";
+import SessionApproveAndPay from "../app/SessionApproveAndPay";
 
 // OwnerIndex — /app/* dispatcher. Wraps every owner route in OwnerLayout
 // (HeroUIProvider + PortalHeader + BottomNav) and hands off to the page
@@ -29,6 +30,7 @@ export default function OwnerIndex() {
         <Route path="records/export"    element={<ExportRecords />} />
         <Route path="trainers"          element={<TrainersIndex />} />
         <Route path="trainers/invite"   element={<TrainerInvite />} />
+        <Route path="sessions/:id/pay"  element={<SessionApproveAndPay />} />
         <Route path="settings"          element={<Settings />} />
         {/* Unknown /app/* path falls back to Today. */}
         <Route path="*"                 element={<Navigate to="/app" replace />} />
