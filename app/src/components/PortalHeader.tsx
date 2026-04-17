@@ -10,8 +10,7 @@ interface PortalHeaderProps {
 const PORTAL_LABELS: Record<PortalHeaderProps['portal'], string> = {
   owner: 'Mane Line',
   trainer: 'Mane Line · Trainer',
-  // Admin chrome may reference Silver Lining — this portal is internal.
-  admin: 'Mane Line · Silver Lining Admin',
+  admin: 'Mane Line · Admin',
 };
 
 export function PortalHeader({ portal }: PortalHeaderProps) {

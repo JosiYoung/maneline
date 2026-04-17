@@ -6,7 +6,7 @@ export default function AdminIndex() {
     <>
       <PortalHeader portal="admin" />
       <main style={{ maxWidth: 1100, margin: '0 auto', padding: '32px 24px' }}>
-        <h1 style={{ fontSize: 30, marginBottom: 8 }}>Silver Lining admin</h1>
+        <h1 style={{ fontSize: 30, marginBottom: 8 }}>Admin</h1>
         <p style={{ color: 'var(--color-muted)', marginBottom: 24 }}>
           Internal control panel — trainer vetting, system health, user overview.
         </p>
