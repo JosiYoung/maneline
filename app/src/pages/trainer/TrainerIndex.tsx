@@ -7,7 +7,7 @@ import AnimalReadOnly from "./AnimalReadOnly";
 import SessionsIndex from "./SessionsIndex";
 import SessionNew from "./SessionNew";
 import SessionDetail from "./SessionDetail";
-import TrainerComingSoon from "./TrainerComingSoon";
+import PayoutsIndex from "./PayoutsIndex";
 
 // TrainerIndex — the trainer portal's route shell. Mounted under
 // <ProtectedRoute allow="trainer"> in App.tsx, so every child route here
@@ -26,7 +26,7 @@ export default function TrainerIndex() {
         <Route path="sessions"          element={<SessionsIndex />} />
         <Route path="sessions/new"      element={<SessionNew />} />
         <Route path="sessions/:id"      element={<SessionDetail />} />
-        <Route path="payouts"     element={<TrainerComingSoon title="Payouts" />} />
+        <Route path="payouts"     element={<PayoutsIndex />} />
         <Route path="account"     element={<TrainerAccount />} />
         <Route path="*" element={<Navigate to="/trainer" replace />} />
       </Routes>

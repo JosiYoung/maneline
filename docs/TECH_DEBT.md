@@ -64,6 +64,7 @@ As of Phase 0 hardening (2026-04-16):
 | Tag | Location | Summary |
 |---|---|---|
 | phase-1 | `app/src/lib/database.types.ts` | Replace hand-rolled types with `supabase gen types` output |
+| phase-2 | `worker/stripe.js`, `worker.js` (`handleStripeConnect*`) | `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` are placeholders; Cedric is verifying the company's payment processor before we mint live keys. All `/api/stripe/*` endpoints return `501 stripe_not_configured` until secrets are added via `npx wrangler secret put`; the SPA renders a "waiting on keys" state in that case. Resolve by setting the secrets in production + preview environments. |
 | phase-4 | `supabase-edge/apps-script/*` (future) | Add HMAC signing to Google Apps Script payloads |
 | phase-5 | `supabase/migrations/00002_phase0_multirole_foundation.sql` | Admin RLS policies were dropped in 00004; this file's REVISIT block is superseded |
 

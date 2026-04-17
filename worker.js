@@ -68,6 +68,12 @@
  */
 import { presignPut, presignGet } from './worker/r2-presign.js';
 import { renderRecordsPdf } from './worker/records-export.js';
+import {
+  createAccountLink,
+  createExpressAccount,
+  isStripeConfigured,
+  retrieveAccount,
+} from './worker/stripe.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -112,6 +118,15 @@ export default {
       }
       if (url.pathname === '/api/access/revoke') {
         return handleAccessRevoke(request, env);
+      }
+      if (url.pathname === '/api/stripe/connect/onboard') {
+        return handleStripeConnectOnboard(request, env, url);
+      }
+      if (url.pathname === '/api/stripe/connect/refresh') {
+        return handleStripeConnectRefresh(request, env);
+      }
+      if (url.pathname === '/api/stripe/connect/return') {
+        return handleStripeConnectReturn(request, env, url);
       }
       if (url.pathname === '/api/_integrations-health') {
         return handleIntegrationsHealth(request, env);
@@ -384,6 +399,18 @@ async function handleAdmin(request, env, url) {
   if (tail === 'ping' && request.method === 'GET') {
     action = 'admin.ping';
     response = json({ ok: true });
+  } else if (tail === 'fees' && request.method === 'GET') {
+    action = 'admin.read.platform_fees';
+    targetTable = 'platform_settings';
+    response = await adminFeesGet(env);
+  } else if (tail === 'fees/default' && request.method === 'POST') {
+    action = 'admin.update.platform_fees_default';
+    targetTable = 'platform_settings';
+    response = await adminFeesSetDefault(request, env, actorId);
+  } else if (tail === 'fees/trainer' && request.method === 'POST') {
+    action = 'admin.update.platform_fees_trainer_override';
+    targetTable = 'stripe_connect_accounts';
+    response = await adminFeesSetTrainerOverride(request, env, actorId);
   } else if (tail === 'trainer-applications' && request.method === 'GET') {
     action = 'admin.read.trainer_applications';
     targetTable = 'trainer_applications';
@@ -1761,5 +1788,393 @@ async function handleAccessRevoke(request, env) {
   });
 
   return json({ grant: upd.data });
+}
+
+/* =============================================================
+   Admin fee helpers — called from handleAdmin() dispatcher.
+   -------------------------------------------------------------
+   All three helpers assume the caller has already been verified
+   as an active silver_lining admin. Every change writes a
+   separate audit_log row with prev + new values so we can
+   reconstruct the fee history in an incident review.
+   ============================================================= */
+
+async function adminFeesGet(env) {
+  const settings = await supabaseSelect(
+    env,
+    'platform_settings',
+    'select=id,default_fee_bps,updated_by,updated_at&id=eq.1',
+    { serviceRole: true }
+  );
+  if (!settings.ok) return json({ error: 'settings_fetch_failed' }, 500);
+  const defaultRow = Array.isArray(settings.data) ? settings.data[0] : null;
+
+  const overrides = await supabaseSelect(
+    env,
+    'stripe_connect_accounts',
+    'select=id,trainer_id,fee_override_bps,fee_override_reason,fee_override_set_by,fee_override_set_at' +
+      '&fee_override_bps=not.is.null&deactivated_at=is.null&order=fee_override_set_at.desc',
+    { serviceRole: true }
+  );
+  if (!overrides.ok) return json({ error: 'overrides_fetch_failed' }, 500);
+
+  const rows = Array.isArray(overrides.data) ? overrides.data : [];
+  const trainerIds = Array.from(new Set(rows.map((r) => r.trainer_id).filter(Boolean)));
+  let nameMap = new Map();
+  if (trainerIds.length > 0) {
+    const names = await supabaseSelect(
+      env,
+      'user_profiles',
+      `select=user_id,display_name,email&user_id=in.(${trainerIds.map(encodeURIComponent).join(',')})`,
+      { serviceRole: true }
+    );
+    if (names.ok && Array.isArray(names.data)) {
+      for (const n of names.data) {
+        nameMap.set(n.user_id, n.display_name || n.email || 'Trainer');
+      }
+    }
+  }
+
+  return json({
+    default_fee_bps: defaultRow?.default_fee_bps ?? 1000,
+    default_updated_at: defaultRow?.updated_at ?? null,
+    default_updated_by: defaultRow?.updated_by ?? null,
+    overrides: rows.map((r) => ({
+      trainer_id:       r.trainer_id,
+      trainer_name:     nameMap.get(r.trainer_id) ?? 'Trainer',
+      fee_override_bps: r.fee_override_bps,
+      reason:           r.fee_override_reason,
+      set_by:           r.fee_override_set_by,
+      set_at:           r.fee_override_set_at,
+    })),
+  });
+}
+
+async function adminFeesSetDefault(request, env, actorId) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const bps = Number(body?.default_fee_bps);
+  if (!Number.isInteger(bps) || bps < 0 || bps > 10000) {
+    return json({ error: 'bad_default_fee_bps', detail: 'integer 0..10000' }, 400);
+  }
+
+  // Capture the old value for the audit row.
+  const prev = await supabaseSelect(
+    env,
+    'platform_settings',
+    'select=default_fee_bps&id=eq.1',
+    { serviceRole: true }
+  );
+  const prevBps = Array.isArray(prev.data) && prev.data[0]
+    ? prev.data[0].default_fee_bps
+    : null;
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'platform_settings',
+    'id=eq.1',
+    { default_fee_bps: bps, updated_by: actorId }
+  );
+  if (!upd.ok) return json({ error: 'update_failed', status: upd.status }, 500);
+
+  // Fire-and-forget a structured audit row alongside the default handleAdmin
+  // log so the prev + new values are captured atomically.
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'silver_lining',
+    action:       'admin.platform_fees.default.update',
+    target_table: 'platform_settings',
+    target_id:    '1',
+    metadata:     { prev_bps: prevBps, new_bps: bps },
+  });
+
+  return json({ default_fee_bps: bps });
+}
+
+async function adminFeesSetTrainerOverride(request, env, actorId) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const trainerId = typeof body?.trainer_id === 'string' ? body.trainer_id : '';
+  if (!trainerId) return json({ error: 'trainer_id required' }, 400);
+
+  let overrideBps = body?.fee_override_bps;
+  if (overrideBps !== null) {
+    overrideBps = Number(overrideBps);
+    if (!Number.isInteger(overrideBps) || overrideBps < 0 || overrideBps > 10000) {
+      return json({ error: 'bad_fee_override_bps', detail: 'integer 0..10000 or null' }, 400);
+    }
+  }
+  const reason = typeof body?.reason === 'string' ? body.reason.trim().slice(0, 500) : null;
+
+  const existing = await supabaseSelect(
+    env,
+    'stripe_connect_accounts',
+    `select=id,trainer_id,fee_override_bps,fee_override_reason&trainer_id=eq.${encodeURIComponent(trainerId)}&deactivated_at=is.null&limit=1`,
+    { serviceRole: true }
+  );
+  if (!existing.ok) return json({ error: 'trainer_lookup_failed' }, 500);
+  const row = Array.isArray(existing.data) ? existing.data[0] : null;
+  if (!row) return json({ error: 'trainer_has_no_connect_account' }, 404);
+
+  const patch = {
+    fee_override_bps:     overrideBps,
+    fee_override_reason:  overrideBps === null ? null : reason,
+    fee_override_set_by:  actorId,
+    fee_override_set_at:  new Date().toISOString(),
+  };
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'stripe_connect_accounts',
+    `id=eq.${encodeURIComponent(row.id)}`,
+    patch
+  );
+  if (!upd.ok) return json({ error: 'update_failed', status: upd.status }, 500);
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'silver_lining',
+    action:       'admin.platform_fees.trainer_override.update',
+    target_table: 'stripe_connect_accounts',
+    target_id:    row.id,
+    metadata: {
+      trainer_id: trainerId,
+      prev_bps:   row.fee_override_bps,
+      new_bps:    overrideBps,
+      reason,
+    },
+  });
+
+  return json({
+    trainer_id:       trainerId,
+    fee_override_bps: overrideBps,
+    reason:           overrideBps === null ? null : reason,
+  });
+}
+
+/* =============================================================
+   /api/stripe/connect/*  — trainer onboarding for Stripe Express
+   -------------------------------------------------------------
+   These endpoints all require a valid trainer JWT. Writes to
+   stripe_connect_accounts go through service_role (RLS blocks
+   authenticated writes per migration 00006:205).
+
+   When STRIPE_SECRET_KEY is not set the handlers short-circuit
+   with 501 stripe_not_configured so the SPA can render a
+   "waiting on keys" state without a 500.
+
+   TECH_DEBT(phase-2): Stripe keys are placeholders until the
+   company's payment processor is verified. See docs/TECH_DEBT.md
+   and worker/stripe.js.
+   ============================================================= */
+const STRIPE_CONNECT_RATE = { limit: 10, windowSec: 60 };
+
+async function getLatestConnectForTrainer(env, trainerId) {
+  const r = await supabaseSelect(
+    env,
+    'stripe_connect_accounts',
+    `select=id,trainer_id,stripe_account_id,charges_enabled,payouts_enabled,details_submitted,disabled_reason,onboarding_link_last_issued_at,deactivated_at,created_at,updated_at&trainer_id=eq.${encodeURIComponent(trainerId)}&deactivated_at=is.null&order=created_at.desc&limit=1`,
+    { serviceRole: true }
+  );
+  if (!r.ok) return null;
+  return Array.isArray(r.data) && r.data.length > 0 ? r.data[0] : null;
+}
+
+function stripeReturnBaseUrl(url) {
+  // Use the Worker's host so the Stripe redirect lands somewhere that
+  // exists in production; local dev users hit the SPA directly so
+  // `/api/stripe/connect/return` will still resolve.
+  return `${url.protocol}//${url.host}`;
+}
+
+async function handleStripeConnectOnboard(request, env, url) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+  void jwt;
+
+  if (!isStripeConfigured(env)) {
+    return json({ error: 'stripe_not_configured' }, 501);
+  }
+
+  const rl = await rateLimitKv(
+    env.ML_RL,
+    `ratelimit:stripe_connect_onboard:${actorId}`,
+    STRIPE_CONNECT_RATE
+  );
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, {
+      'retry-after': String(rl.resetSec),
+    });
+  }
+
+  // Confirm the caller is an active trainer.
+  const profile = await supabaseSelect(
+    env,
+    'user_profiles',
+    `select=role,status,email,display_name&user_id=eq.${encodeURIComponent(actorId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const p = Array.isArray(profile.data) ? profile.data[0] : null;
+  if (!p || p.role !== 'trainer' || p.status !== 'active') {
+    return json({ error: 'forbidden' }, 403);
+  }
+
+  const base = stripeReturnBaseUrl(url);
+  const returnUrl  = `${base}/api/stripe/connect/return`;
+  const refreshUrl = `${base}/api/stripe/connect/refresh-link`;
+
+  let accountId;
+  let existing = await getLatestConnectForTrainer(env, actorId);
+
+  if (!existing) {
+    const created = await createExpressAccount(env, {
+      email: p.email ?? undefined,
+      metadata: { trainer_id: actorId },
+    });
+    if (!created.ok) {
+      return json({ error: created.error || 'stripe_create_account_failed', message: created.message ?? null }, 502);
+    }
+    accountId = created.data?.id;
+    if (!accountId) return json({ error: 'stripe_missing_account_id' }, 502);
+
+    const ins = await supabaseInsertReturning(env, 'stripe_connect_accounts', {
+      trainer_id:        actorId,
+      stripe_account_id: accountId,
+      charges_enabled:   Boolean(created.data?.charges_enabled),
+      payouts_enabled:   Boolean(created.data?.payouts_enabled),
+      details_submitted: Boolean(created.data?.details_submitted),
+      disabled_reason:   created.data?.requirements?.disabled_reason ?? null,
+    });
+    if (!ins.ok) {
+      return json({ error: 'connect_row_insert_failed', status: ins.status }, 500);
+    }
+    existing = ins.data;
+  } else {
+    accountId = existing.stripe_account_id;
+  }
+
+  const link = await createAccountLink(env, {
+    accountId,
+    refreshUrl,
+    returnUrl,
+    type: 'account_onboarding',
+  });
+  if (!link.ok) {
+    return json({ error: link.error || 'stripe_account_link_failed', message: link.message ?? null }, 502);
+  }
+
+  await supabaseUpdateReturning(
+    env,
+    'stripe_connect_accounts',
+    `id=eq.${encodeURIComponent(existing.id)}`,
+    { onboarding_link_last_issued_at: new Date().toISOString() }
+  );
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'trainer',
+    action:       'stripe.connect.onboard',
+    target_table: 'stripe_connect_accounts',
+    target_id:    existing.id,
+    ip:           clientIp(request),
+    user_agent:   request.headers.get('user-agent') || null,
+    metadata:     { stripe_account_id: accountId },
+  });
+
+  return json({ onboarding_url: link.data?.url });
+}
+
+async function handleStripeConnectRefresh(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+  void jwt;
+
+  if (!isStripeConfigured(env)) {
+    return json({ error: 'stripe_not_configured' }, 501);
+  }
+
+  const rl = await rateLimitKv(
+    env.ML_RL,
+    `ratelimit:stripe_connect_refresh:${actorId}`,
+    STRIPE_CONNECT_RATE
+  );
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, {
+      'retry-after': String(rl.resetSec),
+    });
+  }
+
+  const existing = await getLatestConnectForTrainer(env, actorId);
+  if (!existing) return json({ error: 'no_connect_account' }, 404);
+
+  const acct = await retrieveAccount(env, existing.stripe_account_id);
+  if (!acct.ok) {
+    return json({ error: acct.error || 'stripe_retrieve_failed', message: acct.message ?? null }, 502);
+  }
+
+  const patch = {
+    charges_enabled:   Boolean(acct.data?.charges_enabled),
+    payouts_enabled:   Boolean(acct.data?.payouts_enabled),
+    details_submitted: Boolean(acct.data?.details_submitted),
+    disabled_reason:   acct.data?.requirements?.disabled_reason ?? null,
+  };
+  const upd = await supabaseUpdateReturning(
+    env,
+    'stripe_connect_accounts',
+    `id=eq.${encodeURIComponent(existing.id)}`,
+    patch
+  );
+  if (!upd.ok) return json({ error: 'connect_row_update_failed', status: upd.status }, 500);
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'trainer',
+    action:       'stripe.connect.refresh',
+    target_table: 'stripe_connect_accounts',
+    target_id:    existing.id,
+    metadata:     patch,
+  });
+
+  return json({ account: upd.data });
+}
+
+/**
+ * GET /api/stripe/connect/return
+ *
+ * Stripe redirects the trainer here after they finish the Express
+ * onboarding flow. We can't read the JWT from the browser navigation,
+ * so we don't try to mutate DB state here — we just bounce them to the
+ * SPA with a `returned=1` flag. The Payouts page runs a
+ * POST /api/stripe/connect/refresh on mount when that flag is present
+ * (that POST carries the Supabase Authorization header).
+ */
+async function handleStripeConnectReturn(_request, _env, url) {
+  const target = new URL('/trainer/payouts', `${url.protocol}//${url.host}`);
+  target.searchParams.set('returned', '1');
+  return Response.redirect(target.toString(), 302);
 }
 
