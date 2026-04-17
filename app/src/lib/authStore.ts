@@ -20,6 +20,16 @@ interface AuthState {
 
 let initialized = false;
 
+// When > 0, onAuthStateChange skips profile re-fetch to avoid
+// unmounting components mid-async-flow (e.g. PIN save).
+let pauseDepth = 0;
+
+/** Call before an operation that triggers onAuthStateChange (e.g. updateUser). */
+export function pauseAuthRefresh() { pauseDepth++; }
+
+/** Call when the operation is done (in a finally block). */
+export function resumeAuthRefresh() { pauseDepth = Math.max(0, pauseDepth - 1); }
+
 async function fetchProfile(userId: string): Promise<UserProfile | null> {
   // `user_profiles.user_id` is the FK to auth.users(id). The row's own
   // `id` column is an unrelated surrogate PK, so we must NOT filter on it.
@@ -52,6 +62,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ session, profile, loading: false });
 
     supabase.auth.onAuthStateChange(async (_event, nextSession) => {
+      if (pauseDepth > 0) {
+        // Only update the session token, keep the existing profile stable
+        // so in-flight component async flows aren't disrupted.
+        set({ session: nextSession });
+        return;
+      }
       const nextProfile = nextSession ? await fetchProfile(nextSession.user.id) : null;
       set({ session: nextSession, profile: nextProfile, loading: false });
     });

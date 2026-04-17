@@ -1,6 +1,7 @@
 import { useState, useRef, type FormEvent } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuthStore } from '../lib/authStore';
+import { pauseAuthRefresh, resumeAuthRefresh } from '../lib/authStore';
 
 export function PinSettings() {
   const profile = useAuthStore((s) => s.profile);
@@ -31,6 +32,10 @@ export function PinSettings() {
     saving.current = true;
     setStatus('saving');
 
+    // Pause auth-state-change profile refetch so the component tree stays
+    // stable while we run updateUser + set_pin sequentially.
+    pauseAuthRefresh();
+
     try {
       // 1. Update password in auth.users
       const { error: pwError } = await supabase.auth.updateUser({ password: newPin });
@@ -40,7 +45,7 @@ export function PinSettings() {
         return;
       }
 
-      // 2. Mark has_pin = true (may race with onAuthStateChange, so retry once)
+      // 2. Mark has_pin = true
       const { error: rpcError } = await supabase.rpc('set_pin');
       if (rpcError) {
         setStatus('error');
@@ -51,13 +56,14 @@ export function PinSettings() {
       setNewPin('');
       setConfirmPin('');
       setStatus('success');
-      // Don't await refreshProfile — onAuthStateChange already handles it
-      // and awaiting it blocks the UI from showing "success"
     } catch (err) {
       setStatus('error');
       setErrorMessage(err instanceof Error ? err.message : 'Unexpected error');
     } finally {
       saving.current = false;
+      resumeAuthRefresh();
+      // Now that the flow is done, refresh the profile to pick up has_pin change
+      useAuthStore.getState().refreshProfile();
     }
   }
 
