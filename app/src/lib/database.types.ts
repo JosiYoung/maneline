@@ -1,7 +1,7 @@
 /**
  * Hand-rolled database types for the Mane Line Supabase schema.
  *
- * Source of truth: supabase/migrations/00002 through 00004. Only the tables
+ * Source of truth: supabase/migrations/00002 through 00006. Only the tables
  * the SPA reads or writes are mirrored here — we don't replicate the
  * internal audit/log tables or anything the worker owns (service_role only).
  *
@@ -24,6 +24,15 @@ export type TrainerApplicationStatus =
   | 'submitted' | 'approved' | 'rejected' | 'withdrawn' | 'archived';
 export type TrainerProfileStatus =
   | 'submitted' | 'approved' | 'rejected' | 'suspended';
+
+// Phase 2 — training sessions + payments
+export type SessionType =
+  | 'ride' | 'groundwork' | 'bodywork' | 'health_check' | 'lesson' | 'other';
+export type SessionStatus = 'logged' | 'approved' | 'paid' | 'disputed';
+export type SessionPaymentStatus =
+  | 'pending' | 'processing' | 'succeeded' | 'failed'
+  | 'refunded' | 'awaiting_trainer_setup';
+export type SessionArchiveAction = 'archive' | 'unarchive';
 
 type Json =
   | string | number | boolean | null
@@ -285,6 +294,152 @@ export interface Database {
         Update: Partial<Database['public']['Tables']['trainer_applications']['Insert']>;
         Relationships: [];
       };
+
+      // ── Phase 2 — 00006_phase2_trainer_sessions ────────────────
+      training_sessions: {
+        Row: {
+          id: string;
+          trainer_id: string;
+          owner_id: string;
+          animal_id: string;
+          session_type: SessionType;
+          started_at: string;
+          duration_minutes: number;
+          title: string;
+          notes: string | null;
+          trainer_price_cents: number | null;
+          currency: string;
+          status: SessionStatus;
+          created_at: string;
+          updated_at: string;
+          archived_at: string | null;
+        };
+        Insert: {
+          id?: string;
+          trainer_id: string;
+          owner_id: string;
+          animal_id: string;
+          session_type: SessionType;
+          started_at: string;
+          duration_minutes: number;
+          title: string;
+          notes?: string | null;
+          trainer_price_cents?: number | null;
+          currency?: string;
+          status?: SessionStatus;
+          created_at?: string;
+          updated_at?: string;
+          archived_at?: string | null;
+        };
+        Update: Partial<Database['public']['Tables']['training_sessions']['Insert']>;
+        Relationships: [];
+      };
+      session_payments: {
+        // Client-readable (owner sees payer_id match, trainer sees payee_id
+        // match). All writes go through the Worker service_role.
+        Row: {
+          id: string;
+          session_id: string;
+          payer_id: string;
+          payee_id: string;
+          stripe_payment_intent_id: string | null;
+          stripe_charge_id: string | null;
+          stripe_event_last_seen: string | null;
+          amount_cents: number;
+          platform_fee_cents: number;
+          currency: string;
+          status: SessionPaymentStatus;
+          failure_code: string | null;
+          failure_message: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          session_id: string;
+          payer_id: string;
+          payee_id: string;
+          stripe_payment_intent_id?: string | null;
+          stripe_charge_id?: string | null;
+          stripe_event_last_seen?: string | null;
+          amount_cents: number;
+          platform_fee_cents: number;
+          currency?: string;
+          status?: SessionPaymentStatus;
+          failure_code?: string | null;
+          failure_message?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Database['public']['Tables']['session_payments']['Insert']>;
+        Relationships: [];
+      };
+      stripe_connect_accounts: {
+        // Trainers read their own row via the v_my_connect_account view so
+        // the fee_override_* columns stay hidden. This Row type mirrors the
+        // full table because the Worker (service_role) reads/writes it
+        // directly. SPA code should prefer `v_my_connect_account`.
+        Row: {
+          id: string;
+          trainer_id: string;
+          stripe_account_id: string;
+          charges_enabled: boolean;
+          payouts_enabled: boolean;
+          details_submitted: boolean;
+          disabled_reason: string | null;
+          onboarding_link_last_issued_at: string | null;
+          fee_override_bps: number | null;
+          fee_override_reason: string | null;
+          fee_override_set_by: string | null;
+          fee_override_set_at: string | null;
+          created_at: string;
+          updated_at: string;
+          deactivated_at: string | null;
+        };
+        Insert: {
+          id?: string;
+          trainer_id: string;
+          stripe_account_id: string;
+          charges_enabled?: boolean;
+          payouts_enabled?: boolean;
+          details_submitted?: boolean;
+          disabled_reason?: string | null;
+          onboarding_link_last_issued_at?: string | null;
+          fee_override_bps?: number | null;
+          fee_override_reason?: string | null;
+          fee_override_set_by?: string | null;
+          fee_override_set_at?: string | null;
+          created_at?: string;
+          updated_at?: string;
+          deactivated_at?: string | null;
+        };
+        Update: Partial<Database['public']['Tables']['stripe_connect_accounts']['Insert']>;
+        Relationships: [];
+      };
+      session_archive_events: {
+        Row: {
+          id: string;
+          session_id: string;
+          actor_id: string;
+          action: SessionArchiveAction;
+          reason: string | null;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          session_id: string;
+          actor_id: string;
+          action: SessionArchiveAction;
+          reason?: string | null;
+          created_at?: string;
+        };
+        Update: Partial<Database['public']['Tables']['session_archive_events']['Insert']>;
+        Relationships: [];
+      };
+      // NOTE: platform_settings and stripe_webhook_events are deliberately
+      // omitted — both are service_role-only (no client policy grants
+      // select to authenticated). Adding Row types would invite the SPA
+      // to query tables it cannot read.
     };
     Functions: {
       // NOTE: check_has_pin's EXECUTE grant to anon/authenticated was revoked
@@ -318,9 +473,43 @@ export interface Database {
         Args: { animal_id: string };
         Returns: boolean;
       };
+      // Phase 2 — 00006
+      // effective_fee_bps + latest_connect_for are revoked from
+      // anon/authenticated; only the Worker service_role may invoke them.
+      // The types are kept so the Worker's Supabase client stays strict.
+      effective_fee_bps: {
+        Args: { p_trainer_id: string };
+        Returns: number;
+      };
+      session_is_payable: {
+        Args: { p_session_id: string };
+        Returns: boolean;
+      };
+    };
+    Views: {
+      // Trainer-facing read of their own Connect status. Service_invoker=true
+      // so the trainer's RLS policy on stripe_connect_accounts still governs
+      // access; this view only hides the fee_override_* columns.
+      v_my_connect_account: {
+        Row: {
+          id: string;
+          trainer_id: string;
+          stripe_account_id: string;
+          charges_enabled: boolean;
+          payouts_enabled: boolean;
+          details_submitted: boolean;
+          disabled_reason: string | null;
+          onboarding_link_last_issued_at: string | null;
+          created_at: string;
+          updated_at: string;
+          deactivated_at: string | null;
+        };
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
     };
     Enums: Record<string, never>;
-    Views: Record<string, never>;
     CompositeTypes: Record<string, never>;
   };
 }
