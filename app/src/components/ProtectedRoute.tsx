@@ -12,19 +12,27 @@ interface ProtectedRouteProps {
 /**
  * Guards a portal subtree.
  *
- * - If no session or no profile, defer to AuthGate (should have redirected
- *   upstream) and render null.
- * - If the profile's role isn't in `allow`, send the user to their role's
- *   home page. We never render the wrong portal.
- * - Trainer-specific: if role=trainer and status=pending_review, force
- *   them to /trainer/pending-review. They are allowed IN the trainer
- *   subtree, but only on the pending page, until SLH approves them.
+ * - If no session or no profile, defensive redirect to /login. AuthGate
+ *   SHOULD have already redirected; this is belt-and-braces for when
+ *   a race condition or misconfiguration lets us reach here dry.
+ * - If the profile's role isn't in `allow`, bounce to the caller's
+ *   role home. We never render the wrong portal.
+ * - Trainer-specific: role=trainer + status=pending_review is forced to
+ *   /trainer/pending-review. They are allowed IN the trainer subtree,
+ *   but only on the pending page, until SLH approves them.
  */
 export function ProtectedRoute({ allow, children }: ProtectedRouteProps) {
   const location = useLocation();
-  const { profile } = useAuthStore();
+  const session = useAuthStore((s) => s.session);
+  const profile = useAuthStore((s) => s.profile);
 
-  if (!profile) return null;
+  if (!session) {
+    const target = encodeURIComponent(location.pathname + location.search);
+    return <Navigate to={`/login?next=${target}`} replace />;
+  }
+  if (!profile) {
+    return <Navigate to="/signup/complete-profile" replace />;
+  }
 
   const allowed = Array.isArray(allow) ? allow : [allow];
   if (!allowed.includes(profile.role)) {

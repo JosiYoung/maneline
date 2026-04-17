@@ -150,6 +150,67 @@ curl -s https://maneline.co/api/_integrations-health | jq '.workersAi'
 
 ---
 
+## Cloudflare R2 (Phase 1 — private records bucket)
+
+### What it does
+Stores every uploaded vet record, photo, video, and generated records-export PDF. The bucket is **private** — nothing has public-read enabled. Browser direct uploads and downloads go through short-lived SigV4 presigned URLs minted by the Worker. Server-side I/O from the Worker itself goes through the `env.MANELINE_R2` binding.
+
+Three Worker endpoints drive the flow:
+- `POST /api/uploads/sign` — returns a 5-minute presigned PUT URL + the `object_key` the browser should PUT to and report back.
+- `POST /api/uploads/commit` — Worker HEADs R2 to confirm the PUT landed, then writes `r2_objects` + the typed row (`vet_records` / `animal_media`). All in a single service-role transaction with rollback on failure.
+- `GET /api/uploads/read-url?object_key=…` — owner-or-authorized-trainer check, returns a 5-minute presigned GET.
+
+Object key convention: `<user_id>/<kind>/<uuid>.<ext>`. The user-id prefix is enforced at `/commit` time so a caller can't commit someone else's upload.
+
+### Where to get credentials
+1. In the Cloudflare dashboard, go to **R2 → Overview** and note your **Account ID** (shown in the right-hand sidebar). This is `R2_ACCOUNT_ID`.
+2. **R2 → Manage R2 API Tokens → Create API Token**.
+   - **Token name:** `maneline-worker-presign`
+   - **Permissions:** `Object Read & Write`
+   - **Specify bucket:** `maneline-records` (and `maneline-records-preview` if you're provisioning the preview too).
+   - **TTL:** leave blank (indefinite) — rotate manually.
+3. On creation, Cloudflare shows the **Access Key ID** and **Secret Access Key** exactly once. Copy both.
+
+### Env var mapping
+| Secret name | What it is | Where it's set |
+|---|---|---|
+| `R2_ACCOUNT_ID` | 32-char hex account id | `npx wrangler secret put R2_ACCOUNT_ID` |
+| `R2_ACCESS_KEY_ID` | S3-compat access key id | `npx wrangler secret put R2_ACCESS_KEY_ID` |
+| `R2_SECRET_ACCESS_KEY` | S3-compat secret access key | `npx wrangler secret put R2_SECRET_ACCESS_KEY` |
+| `MANELINE_R2` (binding) | R2 bucket declared in `wrangler.toml` | Already set — `[[r2_buckets]]` stanza |
+
+### Flip from mock to live
+1. Create the buckets one time (skip if already done):
+   ```bash
+   npx wrangler r2 bucket create maneline-records
+   npx wrangler r2 bucket create maneline-records-preview
+   ```
+2. Set the three secrets (see above).
+3. Redeploy: `npx wrangler deploy`.
+4. The health endpoint will flip from `"r2": "mock"` to `"r2": "live"` automatically once the binding is present AND all three secrets are populated.
+
+### Verify once live
+```bash
+curl -s https://maneline.co/api/_integrations-health | jq '.r2, .bindings.MANELINE_R2, .secrets_present.R2_ACCESS_KEY_ID'
+# Expect: "live", true, true
+
+# End-to-end smoke (from the app, logged in as an owner):
+# 1. /app/records → Upload → pick a PDF.
+# 2. Browser → /api/uploads/sign → 200 { put_url, object_key, expires_in: 300 }
+# 3. Browser → PUT put_url (with the same Content-Type) → 200
+# 4. Browser → /api/uploads/commit → 200 { id, r2_object_id }
+# 5. Click the row → /api/uploads/read-url → 200 { get_url } → PDF opens in new tab.
+# 6. Wait 6 minutes, hit the same get_url again → 403 (signature expired).
+```
+
+### Safety rails worth knowing
+- **25 MB hard cap** on every presigned PUT and a belt-and-suspenders check at `/commit` (the Worker HEADs the object and refuses to record it if `size > MAX_UPLOAD_BYTES`).
+- **Content-type whitelist** per kind — see `ALLOWED_CONTENT_TYPES` in `worker.js`. Reject-by-default; signing happens only for known MIME types.
+- **Rate limits via `env.ML_RL`:** 20 presigns/min/user on `/sign`, 60 read-URLs/min/user on `/read-url`.
+- **audit_log rows** are written for `upload.sign`, `records.upload`, and `records.read_url` — the full lifecycle is traceable.
+
+---
+
 ## Stripe (Phase 2)
 
 ### What it does

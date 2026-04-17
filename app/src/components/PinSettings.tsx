@@ -1,10 +1,12 @@
 import { useState, useRef, type FormEvent } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuthStore } from '../lib/authStore';
-import { pauseAuthRefresh, resumeAuthRefresh } from '../lib/authStore';
+import { mapSupabaseError } from '../lib/errors';
 
 export function PinSettings() {
   const profile = useAuthStore((s) => s.profile);
+  const withAuthPause = useAuthStore((s) => s.withAuthPause);
+  const refreshProfile = useAuthStore((s) => s.refreshProfile);
   const hasPin = profile?.has_pin ?? false;
 
   const [newPin, setNewPin] = useState('');
@@ -12,7 +14,7 @@ export function PinSettings() {
   const [status, setStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Guard against concurrent submissions and auth-state-change re-renders
+  // Guard against concurrent submissions.
   const saving = useRef(false);
 
   async function onSetPin(e: FormEvent<HTMLFormElement>) {
@@ -32,38 +34,24 @@ export function PinSettings() {
     saving.current = true;
     setStatus('saving');
 
-    // Pause auth-state-change profile refetch so the component tree stays
-    // stable while we run updateUser + set_pin sequentially.
-    pauseAuthRefresh();
-
     try {
-      // 1. Update password in auth.users
-      const { error: pwError } = await supabase.auth.updateUser({ password: newPin });
-      if (pwError) {
-        setStatus('error');
-        setErrorMessage(pwError.message);
-        return;
-      }
+      await withAuthPause(async () => {
+        const { error: pwError } = await supabase.auth.updateUser({ password: newPin });
+        if (pwError) throw pwError;
 
-      // 2. Mark has_pin = true
-      const { error: rpcError } = await supabase.rpc('set_pin');
-      if (rpcError) {
-        setStatus('error');
-        setErrorMessage(rpcError.message);
-        return;
-      }
+        const { error: rpcError } = await supabase.rpc('set_pin');
+        if (rpcError) throw rpcError;
+      });
 
       setNewPin('');
       setConfirmPin('');
       setStatus('success');
+      await refreshProfile();
     } catch (err) {
       setStatus('error');
-      setErrorMessage(err instanceof Error ? err.message : 'Unexpected error');
+      setErrorMessage(mapSupabaseError(err as Error));
     } finally {
       saving.current = false;
-      resumeAuthRefresh();
-      // Now that the flow is done, refresh the profile to pick up has_pin change
-      useAuthStore.getState().refreshProfile();
     }
   }
 
@@ -75,16 +63,12 @@ export function PinSettings() {
 
     try {
       const { error } = await supabase.rpc('clear_pin');
-      if (error) {
-        setStatus('error');
-        setErrorMessage(error.message);
-        return;
-      }
-
+      if (error) throw error;
       setStatus('success');
+      await refreshProfile();
     } catch (err) {
       setStatus('error');
-      setErrorMessage(err instanceof Error ? err.message : 'Unexpected error');
+      setErrorMessage(mapSupabaseError(err as Error));
     } finally {
       saving.current = false;
     }
@@ -112,7 +96,7 @@ export function PinSettings() {
       <strong style={{ display: 'block', marginBottom: 6 }}>
         {hasPin ? 'PIN login enabled' : 'Set a 6-digit PIN for faster login'}
       </strong>
-      <p style={{ color: 'var(--color-muted)', fontSize: 14, margin: '0 0 16px' }}>
+      <p style={{ color: 'var(--text-muted)', fontSize: 14, margin: '0 0 16px' }}>
         {hasPin
           ? 'You can sign in with your PIN instead of a magic link.'
           : 'A PIN lets you skip the magic link email and sign in instantly.'}

@@ -14,8 +14,24 @@ compatibility_date = "2025-10-01"
 #   SUPABASE_URL               (public — set in [vars])
 #   SUPABASE_ANON_KEY          (public — set in [vars] — RLS protects data)
 #   SUPABASE_WEBHOOK_SECRET    (SECRET — `wrangler secret put ...`)
+#   SUPABASE_SERVICE_ROLE_KEY  (SECRET — added in Phase 0 hardening 00004;
+#                               required for /api/has-pin and /api/admin/*.
+#                               Get it from Supabase dashboard →
+#                               Settings → API → service_role key.)
 #   GOOGLE_APPS_SCRIPT_URL     (SECRET — `wrangler secret put ...`)
 #   GOOGLE_APPS_SCRIPT_SECRET  (SECRET — must match SHARED_SECRET in .gs)
+#
+# Phase 1 — Cloudflare R2 (private records bucket, SigV4 presigned URLs):
+#   R2_ACCOUNT_ID              (public — 32-char hex account id. Safe to
+#                               put in [vars]. Shown here as SECRET only so
+#                               we can rotate without redeploying wrangler.)
+#   R2_ACCESS_KEY_ID           (SECRET — S3-compat API token id.
+#                               Create at Cloudflare dashboard → R2 →
+#                               Manage R2 API Tokens → "Create API Token"
+#                               with Object Read & Write scope on
+#                               `maneline-records`.)
+#   R2_SECRET_ACCESS_KEY       (SECRET — matching secret access key.
+#                               Cloudflare shows it ONCE at token creation.)
 #
 # Phase 2 — Stripe (payments + trainer payouts):
 #   STRIPE_SECRET_KEY          (SECRET — starts with sk_live_ / sk_test_)
@@ -43,8 +59,12 @@ SUPABASE_ANON_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 
 # Secrets — never paste here. Set at the CLI:
 #   npx wrangler secret put SUPABASE_WEBHOOK_SECRET
+#   npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY
 #   npx wrangler secret put GOOGLE_APPS_SCRIPT_URL
 #   npx wrangler secret put GOOGLE_APPS_SCRIPT_SECRET
+#   npx wrangler secret put R2_ACCOUNT_ID
+#   npx wrangler secret put R2_ACCESS_KEY_ID
+#   npx wrangler secret put R2_SECRET_ACCESS_KEY
 
 # -----------------------------------------------------------------
 # KV — feature flags
@@ -65,8 +85,31 @@ SUPABASE_ANON_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 # -----------------------------------------------------------------
 
 [[kv_namespaces]]
-binding = "FLAGS"
-id      = "27bb09d5d64944e8be2a2b0733f542e7"
+binding = "ML_RL"
+id      = "c324ea72ead849faa55e7b372fe97cc1"
+
+# -----------------------------------------------------------------
+# R2 — private records bucket (Phase 1)
+#
+# The bucket is PRIVATE. Public access is disabled at the bucket
+# level; every read and write goes through signed URLs minted by
+# the Worker (/api/uploads/sign, /api/uploads/read-url).
+#
+# The Worker itself uses env.MANELINE_R2 (the binding) for server-side
+# I/O (HEAD after upload commit, PDF export writes, etc). The SigV4
+# presigner in worker/r2-presign.js is only for BROWSER-DIRECT PUT/GET
+# via the S3-compat endpoint — browsers can't use the binding.
+#
+# See docs/phase-1-plan.md §2.2 and docs/INTEGRATIONS.md "Cloudflare R2".
+#
+# One-time setup (Cedric, before first deploy that references this):
+#   npx wrangler r2 bucket create maneline-records
+#   npx wrangler r2 bucket create maneline-records-preview
+# -----------------------------------------------------------------
+[[r2_buckets]]
+binding             = "MANELINE_R2"
+bucket_name         = "maneline-records"
+preview_bucket_name = "maneline-records-preview"
 
 # -----------------------------------------------------------------
 # STATIC ASSETS (Mane Line SPA)

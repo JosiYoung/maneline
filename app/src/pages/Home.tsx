@@ -13,7 +13,7 @@ export default function Home() {
         <div style={{ fontFamily: 'var(--font-display)', fontSize: 28, fontWeight: 700, color: 'var(--color-primary)' }}>
           Mane Line
         </div>
-        <div style={{ fontSize: 13, color: 'var(--color-muted)', letterSpacing: '.08em', textTransform: 'uppercase' }}>
+        <div style={{ fontSize: 13, color: 'var(--text-muted)', letterSpacing: '.08em', textTransform: 'uppercase' }}>
           The Horse OS
         </div>
       </header>
@@ -75,7 +75,7 @@ export default function Home() {
         )}
       </div>
 
-      <footer style={{ marginTop: 80, fontSize: 12, color: 'var(--color-muted)' }}>
+      <footer style={{ marginTop: 80, fontSize: 12, color: 'var(--text-muted)' }}>
         Mane Line &middot; Phase 0 preview &middot; not for public distribution
       </footer>
     </main>

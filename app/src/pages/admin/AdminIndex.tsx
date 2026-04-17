@@ -7,7 +7,7 @@ export default function AdminIndex() {
       <PortalHeader portal="admin" />
       <main style={{ maxWidth: 1100, margin: '0 auto', padding: '32px 24px' }}>
         <h1 style={{ fontSize: 30, marginBottom: 8 }}>Admin</h1>
-        <p style={{ color: 'var(--color-muted)', marginBottom: 24 }}>
+        <p style={{ color: 'var(--text-muted)', marginBottom: 24 }}>
           Internal control panel — trainer vetting, system health, user overview.
         </p>
 
@@ -18,7 +18,7 @@ export default function AdminIndex() {
           background: 'var(--color-surface)',
         }}>
           <strong style={{ display: 'block', marginBottom: 6 }}>Phase 0 placeholder</strong>
-          <p style={{ color: 'var(--color-muted)', fontSize: 14, margin: 0 }}>
+          <p style={{ color: 'var(--text-muted)', fontSize: 14, margin: 0 }}>
             Routes like <code>/admin/trainer-applications</code>, <code>/admin/users</code>, and
             <code>/admin/health</code> will hang off this index.
           </p>

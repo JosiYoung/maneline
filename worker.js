@@ -5,33 +5,72 @@
  *
  *   POST /webhook/sheets          — forwards Supabase DB webhooks to Apps
  *                                   Script so the L1 Google Sheets mirror
- *                                   stays warm. MUST REMAIN — the live
- *                                   waitlist depends on it.
- *   GET  /api/flags               — returns feature flags read from the
- *                                   FLAGS KV namespace (see wrangler.toml).
- *   GET  /api/_integrations-health — Phase 0 smoke test. Reports which
- *                                   placeholder integrations are wired
- *                                   (all "mock" today) and which env keys
- *                                   are present. Never returns secret
- *                                   values.
- *   GET  /join                    — legacy single-step waitlist form (v1).
- *                                   Preserved so existing bookmarks +
- *                                   indexed URLs keep working.
+ *                                   stays warm. Uses constant-time compare
+ *                                   on the shared secret header.
+ *   GET  /api/flags               — returns feature flags read from FLAGS KV.
+ *   POST /api/has-pin             — [Phase 0 hardening] proxies
+ *                                   check_has_pin() via service_role with
+ *                                   per-IP rate limiting. Replaces the
+ *                                   anon-callable RPC the SPA used to hit
+ *                                   directly.
+ *   GET  /api/admin/*             — service_role admin endpoints. Every
+ *                                   successful read writes an audit_log
+ *                                   row. Requires the caller to hold a
+ *                                   valid Supabase session AND be a
+ *                                   silver_lining admin (status=active).
+ *   POST /api/uploads/sign        — [Phase 1] returns a 5-minute presigned
+ *                                   R2 PUT URL plus the object_key the
+ *                                   browser must send back to /commit.
+ *   POST /api/uploads/commit      — [Phase 1] Worker HEADs R2 to confirm
+ *                                   the PUT actually landed, then writes
+ *                                   r2_objects + the typed row
+ *                                   (vet_records or animal_media).
+ *   GET  /api/uploads/read-url    — [Phase 1] returns a 5-minute presigned
+ *                                   R2 GET URL for an object the caller
+ *                                   is authorized to read.
+ *   POST /api/animals/archive     — [Phase 1] atomic soft-archive:
+ *                                   animals.archived_at = now() plus a
+ *                                   row in animal_archive_events. Reason
+ *                                   is required (OAG §8).
+ *   POST /api/animals/unarchive   — [Phase 1] reverse of the above.
+ *   POST /api/records/export-pdf  — [Phase 1] server-side renders a
+ *                                   12-month records PDF, stores it in
+ *                                   R2 under kind='records_export', and
+ *                                   returns a 15-min signed GET URL.
+ *   POST /api/access/grant        — [Phase 1] owner grants a trainer
+ *                                   access (scope=animal|ranch|owner_all).
+ *                                   Looks up the trainer by email (must
+ *                                   be approved) and writes
+ *                                   animal_access_grants via service_role.
+ *   POST /api/access/revoke       — [Phase 1] owner revokes a grant; sets
+ *                                   revoked_at + grace_period_ends_at so
+ *                                   the trainer keeps read access for N
+ *                                   days (default 7, max 30).
+ *   GET  /api/_integrations-health — Phase 0 smoke test.
  *   GET  /healthz                 — trivial liveness probe.
+ *   GET  /join                    — 301 → /signup (legacy waitlist form
+ *                                   retired; SPA has a v1 fallback flag).
  *
- * Every other request is handed to the Workers Assets binding (see
- * wrangler.toml `[assets]`), which serves the built SPA from `app/dist`.
+ * Every other request is handed to the Workers Assets binding which
+ * serves the built SPA from `app/dist`.
  *
  * Env expected:
  *   SUPABASE_URL, SUPABASE_ANON_KEY            (public vars)
  *   SUPABASE_WEBHOOK_SECRET                    (secret)
+ *   SUPABASE_SERVICE_ROLE_KEY                  (secret, NEW in 00004)
  *   GOOGLE_APPS_SCRIPT_URL / _SECRET           (secrets)
+ *   R2_ACCOUNT_ID                              (secret, Phase 1)
+ *   R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY    (secrets, Phase 1)
  *   FLAGS                                      (KV namespace binding)
+ *   ML_RL                                      (KV — rate-limit buckets)
  *   ASSETS                                     (Workers Assets binding)
+ *   MANELINE_R2                                (R2 bucket binding, Phase 1)
  */
+import { presignPut, presignGet } from './worker/r2-presign.js';
+import { renderRecordsPdf } from './worker/records-export.js';
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     try {
@@ -41,32 +80,347 @@ export default {
       if (url.pathname === '/api/flags') {
         return handleFlags(request, env);
       }
+      if (url.pathname === '/api/has-pin') {
+        return handleHasPin(request, env, ctx);
+      }
+      if (url.pathname.startsWith('/api/admin/')) {
+        return handleAdmin(request, env, url);
+      }
+      if (url.pathname === '/api/uploads/sign') {
+        return handleUploadSign(request, env);
+      }
+      if (url.pathname === '/api/uploads/commit') {
+        return handleUploadCommit(request, env);
+      }
+      if (url.pathname === '/api/uploads/read-url') {
+        return handleUploadReadUrl(request, env, url);
+      }
+      if (url.pathname === '/api/animals/archive') {
+        return handleAnimalArchive(request, env);
+      }
+      if (url.pathname === '/api/animals/unarchive') {
+        return handleAnimalUnarchive(request, env);
+      }
+      if (url.pathname === '/api/records/export-pdf') {
+        return handleRecordsExport(request, env);
+      }
+      if (url.pathname === '/api/access/grant') {
+        return handleAccessGrant(request, env);
+      }
+      if (url.pathname === '/api/access/revoke') {
+        return handleAccessRevoke(request, env);
+      }
       if (url.pathname === '/api/_integrations-health') {
         return handleIntegrationsHealth(request, env);
-      }
-      if (url.pathname === '/join') {
-        return new Response(LEGACY_JOIN_HTML, {
-          headers: {
-            'content-type': 'text/html; charset=utf-8',
-            'cache-control': 'public, max-age=120',
-          },
-        });
       }
       if (url.pathname === '/healthz') {
         return new Response('ok', {
           headers: { 'content-type': 'text/plain; charset=utf-8' },
         });
       }
+      if (url.pathname === '/join') {
+        // Legacy waitlist retired in Phase 0 hardening. SPA /signup renders
+        // the v1 form when feature:signup_v2 = false.
+        return Response.redirect(new URL('/signup', url).toString(), 301);
+      }
 
-      // Everything else is the SPA (or one of its static assets).
       return env.ASSETS.fetch(request);
     } catch (err) {
-      return new Response('Server error: ' + (err?.message ?? 'unknown'), {
-        status: 500,
-      });
+      return json({ ok: false, error: 'Server error', detail: err?.message ?? 'unknown' }, 500);
     }
   },
 };
+
+/* =============================================================
+   Crypto / request helpers
+   ============================================================= */
+
+/**
+ * Constant-time string compare. Returns false fast on length mismatch
+ * (length is not a secret), then XORs every byte so timing is a
+ * function of input length alone, not matching-prefix length.
+ */
+function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  let out = 0;
+  for (let i = 0; i < a.length; i++) {
+    out |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return out === 0;
+}
+
+function json(body, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      ...extraHeaders,
+    },
+  });
+}
+
+function clientIp(request) {
+  return (
+    request.headers.get('cf-connecting-ip') ||
+    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+    'unknown'
+  );
+}
+
+/**
+ * Simple per-key token bucket in KV.
+ *
+ * Not distributed-exact — KV has eventual consistency across regions —
+ * but easily tight enough to defeat scripted enumeration from a single
+ * endpoint. Callers that need hard guarantees should layer Cloudflare
+ * rate-limiting rules in front.
+ *
+ * Returns { ok: boolean, remaining: number, resetSec: number }.
+ */
+async function rateLimit(env, bucketKey, { limit, windowSec }) {
+  if (!env.FLAGS) return { ok: true, remaining: limit, resetSec: windowSec };
+
+  const now = Math.floor(Date.now() / 1000);
+  const raw = await env.FLAGS.get(bucketKey);
+  let state = raw ? safeParse(raw) : null;
+
+  if (!state || typeof state.resetAt !== 'number' || state.resetAt <= now) {
+    state = { count: 0, resetAt: now + windowSec };
+  }
+
+  state.count += 1;
+  const ok = state.count <= limit;
+
+  // TTL so stale buckets self-expire even if the next request never comes.
+  const ttl = Math.max(state.resetAt - now + 5, 10);
+  await env.FLAGS.put(bucketKey, JSON.stringify(state), { expirationTtl: ttl });
+
+  return {
+    ok,
+    remaining: Math.max(0, limit - state.count),
+    resetSec: Math.max(1, state.resetAt - now),
+  };
+}
+
+function safeParse(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+/* =============================================================
+   Supabase REST helpers (used by /api/has-pin and /api/admin/*)
+   ============================================================= */
+
+async function supabaseRpc(env, fnName, body, { serviceRole = false, userJwt = null } = {}) {
+  if (!env.SUPABASE_URL) throw new Error('SUPABASE_URL missing');
+  const key = serviceRole
+    ? env.SUPABASE_SERVICE_ROLE_KEY
+    : (userJwt ?? env.SUPABASE_ANON_KEY);
+  if (!key) throw new Error('Supabase key missing for request');
+
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${fnName}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      apikey: serviceRole ? env.SUPABASE_SERVICE_ROLE_KEY : env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${key}`,
+    },
+    body: JSON.stringify(body ?? {}),
+  });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function supabaseSelect(env, table, query, { serviceRole = false, userJwt = null } = {}) {
+  const key = serviceRole
+    ? env.SUPABASE_SERVICE_ROLE_KEY
+    : (userJwt ?? env.SUPABASE_ANON_KEY);
+
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}?${query}`, {
+    method: 'GET',
+    headers: {
+      apikey: serviceRole ? env.SUPABASE_SERVICE_ROLE_KEY : env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${key}`,
+    },
+  });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function supabaseInsert(env, table, row, { serviceRole = true } = {}) {
+  const key = serviceRole ? env.SUPABASE_SERVICE_ROLE_KEY : env.SUPABASE_ANON_KEY;
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      apikey: serviceRole ? env.SUPABASE_SERVICE_ROLE_KEY : env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${key}`,
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify(row),
+  });
+  return { ok: res.ok, status: res.status };
+}
+
+/* =============================================================
+   /api/has-pin  — replaces the anon-callable check_has_pin() RPC
+   -------------------------------------------------------------
+   Shape:
+     POST /api/has-pin  { "email": "user@example.com" }
+     → 200 { "has_pin": true|false }
+     → 429 { "error": "rate_limited", "retry_after": <seconds> }
+   Rate: 10 req / 60s per IP (see RATE).
+   ============================================================= */
+const HAS_PIN_RATE = { limit: 10, windowSec: 60 };
+
+async function handleHasPin(request, env /* ctx */) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    // If the service role secret isn't set, we never want to silently
+    // fall back to the old anon-callable path.
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  const ip = clientIp(request);
+  const rl = await rateLimit(env, `ratelimit:haspin:${ip}`, HAS_PIN_RATE);
+  if (!rl.ok) {
+    return json(
+      { error: 'rate_limited', retry_after: rl.resetSec },
+      429,
+      { 'retry-after': String(rl.resetSec) }
+    );
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'bad_request' }, 400);
+  }
+
+  const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
+  // We deliberately do NOT validate email format here. The RPC returns
+  // `false` for any input that isn't a real row, which is the same
+  // response an enumeration attacker would get for a miss. Returning
+  // 400 for malformed input would leak that distinction.
+  if (!email) {
+    return json({ has_pin: false });
+  }
+
+  const { ok, data } = await supabaseRpc(env, 'check_has_pin', { p_email: email }, { serviceRole: true });
+  if (!ok) {
+    return json({ has_pin: false }, 200);
+  }
+  // RPC returns a literal boolean.
+  return json({ has_pin: data === true });
+}
+
+/* =============================================================
+   /api/admin/*  — service_role admin surface (B2)
+   -------------------------------------------------------------
+   Every endpoint:
+     1. Verifies the caller's Supabase session JWT.
+     2. Confirms user_profiles.role = 'silver_lining' AND status = 'active'.
+     3. Performs the privileged read via service_role.
+     4. Writes an audit_log row (best-effort — failure does not abort
+        the response, but is logged).
+   ============================================================= */
+
+async function handleAdmin(request, env, url) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  const authHeader = request.headers.get('authorization') || '';
+  const jwt = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  if (!jwt) {
+    return json({ error: 'unauthorized' }, 401);
+  }
+
+  // 1. Resolve the caller by asking Supabase who this JWT belongs to.
+  const who = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+    headers: {
+      apikey: env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${jwt}`,
+    },
+  });
+  if (!who.ok) {
+    return json({ error: 'unauthorized' }, 401);
+  }
+  const whoData = await who.json().catch(() => null);
+  const actorId = whoData?.id;
+  if (!actorId) {
+    return json({ error: 'unauthorized' }, 401);
+  }
+
+  // 2. Confirm silver_lining + active.
+  const profileRes = await supabaseSelect(
+    env,
+    'user_profiles',
+    `select=role,status&user_id=eq.${encodeURIComponent(actorId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const profile = Array.isArray(profileRes.data) ? profileRes.data[0] : null;
+  if (!profile || profile.role !== 'silver_lining' || profile.status !== 'active') {
+    return json({ error: 'forbidden' }, 403);
+  }
+
+  // 3. Dispatch.
+  const tail = url.pathname.slice('/api/admin/'.length);
+  let response;
+  let action;
+  let targetTable = null;
+
+  if (tail === 'ping' && request.method === 'GET') {
+    action = 'admin.ping';
+    response = json({ ok: true });
+  } else if (tail === 'trainer-applications' && request.method === 'GET') {
+    action = 'admin.read.trainer_applications';
+    targetTable = 'trainer_applications';
+    const r = await supabaseSelect(
+      env,
+      'trainer_applications',
+      'select=id,user_id,submitted_at,status,application&order=submitted_at.desc&limit=100',
+      { serviceRole: true }
+    );
+    response = json({ rows: r.ok ? r.data : [] });
+  } else if (tail === 'users' && request.method === 'GET') {
+    action = 'admin.read.user_profiles';
+    targetTable = 'user_profiles';
+    const r = await supabaseSelect(
+      env,
+      'user_profiles',
+      'select=user_id,role,status,display_name,email,created_at&order=created_at.desc&limit=200',
+      { serviceRole: true }
+    );
+    response = json({ rows: r.ok ? r.data : [] });
+  } else {
+    return json({ error: 'not_found' }, 404);
+  }
+
+  // 4. Audit (best-effort; don't fail the request if the log write fails).
+  try {
+    await supabaseInsert(env, 'audit_log', {
+      actor_id: actorId,
+      actor_role: 'silver_lining',
+      action,
+      target_table: targetTable,
+      ip: clientIp(request),
+      user_agent: request.headers.get('user-agent') || null,
+    });
+  } catch (err) {
+    console.warn('[audit] insert failed:', err?.message);
+  }
+
+  return response;
+}
 
 /* =============================================================
    Feature flags
@@ -76,11 +430,6 @@ async function handleFlags(request, env) {
     return new Response('method not allowed', { status: 405 });
   }
 
-  // Default behaviour: v2 signup is enabled UNLESS the KV key is present
-  // AND set to the literal string "false". This is the operator opt-out
-  // model — flipping to v1 is a one-liner:
-  //
-  //   wrangler kv key put --binding=FLAGS feature:signup_v2 false --remote
   let signupV2 = true;
   try {
     if (env.FLAGS) {
@@ -90,82 +439,13 @@ async function handleFlags(request, env) {
       }
     }
   } catch (err) {
-    // KV is down / binding missing → fail open to the modern flow.
     console.warn('[flags] KV read failed, defaulting signup_v2=true:', err?.message);
   }
 
   return new Response(JSON.stringify({ signup_v2: signupV2 }), {
     headers: {
       'content-type': 'application/json; charset=utf-8',
-      // Short TTL so operator flips are visible within a minute.
       'cache-control': 'public, max-age=30',
-    },
-  });
-}
-
-/* =============================================================
-   /api/_integrations-health — Phase 0 smoke test
-   -------------------------------------------------------------
-   Reports the status of every placeholder integration and which
-   non-secret env keys are present. NEVER returns secret values —
-   only whether they exist.
-
-   Each integration is marked "mock" today. When we flip one to
-   real in its Phase, swap the value to "live" (or a version tag)
-   here AND in the corresponding src/integrations/* module.
-   ============================================================= */
-async function handleIntegrationsHealth(request, env) {
-  if (request.method !== 'GET') {
-    return new Response('method not allowed', { status: 405 });
-  }
-
-  // Non-secret env keys — safe to echo back.
-  const PUBLIC_ENV_KEYS = ['SUPABASE_URL', 'SUPABASE_ANON_KEY'];
-
-  // Secret keys — we only report presence (true/false), never values.
-  const SECRET_KEYS = [
-    'SUPABASE_WEBHOOK_SECRET',
-    'GOOGLE_APPS_SCRIPT_URL',
-    'GOOGLE_APPS_SCRIPT_SECRET',
-    'SHOPIFY_STORE_DOMAIN',
-    'SHOPIFY_STOREFRONT_TOKEN',
-    'SHOPIFY_ADMIN_API_TOKEN',
-    'HUBSPOT_PRIVATE_APP_TOKEN',
-    'HUBSPOT_PORTAL_ID',
-    'STRIPE_SECRET_KEY',
-    'STRIPE_WEBHOOK_SECRET',
-  ];
-
-  const publicEnv = {};
-  for (const k of PUBLIC_ENV_KEYS) {
-    publicEnv[k] = typeof env[k] === 'string' && env[k].length > 0;
-  }
-
-  const secretsPresent = {};
-  for (const k of SECRET_KEYS) {
-    secretsPresent[k] = typeof env[k] === 'string' && env[k].length > 0;
-  }
-
-  const body = {
-    shopify:    'mock',   // flips in Phase 3
-    hubspot:    'mock',   // flips in Phase 5
-    workersAi:  'mock',   // flips in Phase 4
-    stripe:     'mock',   // flips in Phase 2
-    bindings: {
-      FLAGS:              Boolean(env.FLAGS),
-      ASSETS:             Boolean(env.ASSETS),
-      AI:                 Boolean(env.AI),
-      VECTORIZE_PROTOCOLS: Boolean(env.VECTORIZE_PROTOCOLS),
-    },
-    env: publicEnv,
-    secrets_present: secretsPresent,
-    generated_at: new Date().toISOString(),
-  };
-
-  return new Response(JSON.stringify(body, null, 2), {
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
     },
   });
 }
@@ -179,7 +459,7 @@ async function handleSheetsWebhook(request, env) {
   }
 
   const got = request.headers.get('x-webhook-secret') || '';
-  if (!env.SUPABASE_WEBHOOK_SECRET || got !== env.SUPABASE_WEBHOOK_SECRET) {
+  if (!env.SUPABASE_WEBHOOK_SECRET || !timingSafeEqual(got, env.SUPABASE_WEBHOOK_SECRET)) {
     return new Response('unauthorized', { status: 401 });
   }
 
@@ -214,225 +494,1158 @@ async function handleSheetsWebhook(request, env) {
 }
 
 /* =============================================================
-   Legacy /join HTML (v1 single-step waitlist)
-   -------------------------------------------------------------
-   This is the original Mane Line waitlist form. It posts to Supabase
-   with the shape the handle_new_user() trigger expects
-   (role defaults to 'owner', first_horse object for the barn_name/etc).
-   Kept as a permanent fallback route so:
-     - Existing inbound traffic to /join keeps working.
-     - The `feature:signup_v2 = false` KV flip tells the SPA to redirect
-       users here (see SignupPage.tsx).
-   Reads Supabase config at runtime from window.__MANELINE__ — wired via
-   the <script> block below using the same public env as the SPA.
+   /api/_integrations-health — Phase 0 smoke test
    ============================================================= */
-const LEGACY_JOIN_HTML = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Join the Waitlist — Mane Line</title>
-<meta name="description" content="Mane Line is the Horse OS. Join the waitlist to pre-populate your barn." />
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-  :root{
-    --primary:#1E3A5F; --accent:#C9A24C; --bg:#FAF8F3; --sage:#8BA678;
-    --ink:#1A1A1A; --muted:#5c6160; --line:rgba(30,58,95,.15); --surface:#fff;
+async function handleIntegrationsHealth(request, env) {
+  if (request.method !== 'GET') {
+    return new Response('method not allowed', { status: 405 });
   }
-  *{box-sizing:border-box;margin:0;padding:0}
-  html,body{height:100%}
-  body{font-family:'Inter',sans-serif;color:var(--ink);background:var(--bg);line-height:1.55;-webkit-font-smoothing:antialiased}
-  .container{max-width:760px;margin:0 auto;padding:0 24px}
-  .nav{display:flex;align-items:center;justify-content:space-between;padding:20px 24px;max-width:1100px;margin:0 auto}
-  .brand{font-family:'Playfair Display',serif;font-size:22px;font-weight:700;color:var(--primary);text-decoration:none}
-  .nav-links{display:flex;gap:18px;align-items:center}
-  .nav-links a{color:var(--primary);font-size:14px;font-weight:500;text-decoration:none}
-  h1{font-family:'Playfair Display',serif;color:var(--primary);letter-spacing:-.5px;line-height:1.04}
-  h2{font-family:'Playfair Display',serif;color:var(--primary)}
-  .eyebrow{display:inline-block;font-size:12px;letter-spacing:.2em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:18px}
-  .lede{margin-top:22px;font-size:17px;color:#2a3130;max-width:56ch}
-  .card{background:var(--surface);border-radius:16px;padding:28px;border:1px solid var(--line);box-shadow:0 10px 30px -18px rgba(30,58,95,.35)}
-  label{display:block;font-size:13px;font-weight:600;color:var(--primary);margin-bottom:6px}
-  input,select{width:100%;padding:12px 14px;font-size:15px;border-radius:10px;border:1.5px solid var(--line);background:var(--bg);color:var(--ink);outline:none;font-family:inherit}
-  input:focus,select:focus{border-color:var(--primary);background:var(--surface)}
-  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-  @media (max-width:520px){.grid-2{grid-template-columns:1fr}}
-  .field{margin-bottom:14px}
-  .radio-row{display:flex;gap:10px;flex-wrap:wrap}
-  .radio-row label{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;background:var(--bg);border:1.5px solid var(--line);border-radius:10px;cursor:pointer;font-weight:500;color:var(--ink);margin-bottom:0}
-  .radio-row input{width:auto;margin:0}
-  .radio-row label:has(input:checked){border-color:var(--primary);background:var(--surface);box-shadow:0 0 0 3px rgba(30,58,95,.12)}
-  .btn{display:inline-block;padding:13px 22px;font-size:15px;font-weight:600;background:var(--primary);color:#fff;border:0;border-radius:10px;cursor:pointer;font-family:inherit;text-decoration:none}
-  .btn:hover{opacity:.94}
-  .btn.ghost{background:transparent;color:var(--primary);padding:10px 0}
-  .msg{padding:12px 14px;border-radius:10px;font-size:14px;margin-bottom:14px;display:none}
-  .msg.on{display:block}
-  .msg.err{background:#fbe9e6;color:#7a1d10;border:1px solid #e9bdb5}
-  .hint{font-size:12px;color:var(--muted);margin-top:4px}
-  footer{text-align:center;padding:30px 20px;color:var(--muted);font-size:13px}
-</style>
-</head>
-<body>
-<header class="nav">
-  <a class="brand" href="/">Mane Line</a>
-  <div class="nav-links">
-    <a href="/login">Sign In</a>
-  </div>
-</header>
 
-<main class="container" style="padding-top:12px;padding-bottom:60px">
-  <a href="/" class="btn ghost">&larr; Back</a>
-  <span class="eyebrow">Join the Waitlist</span>
-  <h1 style="font-size:clamp(32px,4.4vw,46px)">Ride in the first wave.</h1>
-  <p class="lede">Sign up with you and your horse. We'll pre-populate your barn so when Mane Line opens, your profile is ready. Fields marked with <strong>*</strong> are required.</p>
+  const PUBLIC_ENV_KEYS = ['SUPABASE_URL', 'SUPABASE_ANON_KEY'];
+  const SECRET_KEYS = [
+    'SUPABASE_WEBHOOK_SECRET',
+    'SUPABASE_SERVICE_ROLE_KEY',
+    'GOOGLE_APPS_SCRIPT_URL',
+    'GOOGLE_APPS_SCRIPT_SECRET',
+    'R2_ACCOUNT_ID',
+    'R2_ACCESS_KEY_ID',
+    'R2_SECRET_ACCESS_KEY',
+    'SHOPIFY_STORE_DOMAIN',
+    'SHOPIFY_STOREFRONT_TOKEN',
+    'SHOPIFY_ADMIN_API_TOKEN',
+    'HUBSPOT_PRIVATE_APP_TOKEN',
+    'HUBSPOT_PORTAL_ID',
+    'STRIPE_SECRET_KEY',
+    'STRIPE_WEBHOOK_SECRET',
+  ];
 
-  <form id="join-form" class="card" style="margin-top:28px" novalidate>
-    <div id="msg" class="msg"></div>
+  const publicEnv = {};
+  for (const k of PUBLIC_ENV_KEYS) {
+    publicEnv[k] = typeof env[k] === 'string' && env[k].length > 0;
+  }
+  const secretsPresent = {};
+  for (const k of SECRET_KEYS) {
+    secretsPresent[k] = typeof env[k] === 'string' && env[k].length > 0;
+  }
 
-    <h2 style="font-size:20px;margin-bottom:14px">About you</h2>
-    <div class="grid-2">
-      <div class="field">
-        <label for="full_name">Your name *</label>
-        <input id="full_name" name="full_name" type="text" required autocomplete="name" placeholder="Sherry Cervi" />
-      </div>
-      <div class="field">
-        <label for="email">Email *</label>
-        <input id="email" name="email" type="email" required autocomplete="email" placeholder="you@yourranch.com" />
-      </div>
-      <div class="field">
-        <label for="phone">Phone <span style="color:var(--muted);font-weight:400">(optional)</span></label>
-        <input id="phone" name="phone" type="tel" autocomplete="tel" />
-      </div>
-      <div class="field">
-        <label for="location">State / Region *</label>
-        <input id="location" name="location" type="text" required placeholder="Texas, Wyoming, Alberta..." />
-      </div>
-    </div>
-    <div class="field">
-      <label for="owner_discipline">What do you do with horses? <span style="color:var(--muted);font-weight:400">(optional)</span></label>
-      <select id="owner_discipline" name="owner_discipline">
-        <option value="">Choose one</option>
-        <option>Barrel racing</option><option>Roping / team roping</option><option>Ranch work</option>
-        <option>Cutting / reining</option><option>Trail / pleasure</option><option>Breeding / foaling</option>
-        <option>Show / hunter-jumper</option><option>Dressage / eventing</option><option>Endurance</option>
-        <option>Other</option>
-      </select>
-    </div>
+  // R2 status is 'live' when the binding exists AND all three S3-compat
+  // secrets are populated. Presign-only paths would technically work
+  // without the binding, but /api/uploads/commit does a binding-side HEAD,
+  // so we require both halves to call it live.
+  const r2BindingPresent = Boolean(env.MANELINE_R2);
+  const r2CredsPresent =
+    secretsPresent.R2_ACCOUNT_ID &&
+    secretsPresent.R2_ACCESS_KEY_ID &&
+    secretsPresent.R2_SECRET_ACCESS_KEY;
+  const r2 = r2BindingPresent && r2CredsPresent ? 'live' : 'mock';
 
-    <hr style="margin:24px 0;border:0;border-top:1px solid var(--line)">
-
-    <h2 style="font-size:20px;margin-bottom:4px">Your first horse</h2>
-    <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">You can add more once you're in.</p>
-    <div class="grid-2">
-      <div class="field">
-        <label for="barn_name">Barn name *</label>
-        <input id="barn_name" name="barn_name" type="text" required placeholder="Stingray" />
-      </div>
-      <div class="field">
-        <label for="breed">Breed *</label>
-        <select id="breed" name="breed" required>
-          <option value="">Choose breed</option>
-          <option>Quarter Horse</option><option>Paint</option><option>Appaloosa</option>
-          <option>Thoroughbred</option><option>Arabian</option><option>Warmblood</option>
-          <option>Morgan</option><option>Tennessee Walker</option><option>Mustang</option>
-          <option>Draft</option><option>Pony</option><option>Mixed / unknown</option><option>Other</option>
-        </select>
-      </div>
-    </div>
-    <div class="field">
-      <label>Sex *</label>
-      <div class="radio-row">
-        <label><input type="radio" name="sex" value="mare" required> Mare</label>
-        <label><input type="radio" name="sex" value="gelding"> Gelding</label>
-        <label><input type="radio" name="sex" value="stallion"> Stallion</label>
-      </div>
-    </div>
-    <div class="grid-2">
-      <div class="field">
-        <label for="year_born">Year born *</label>
-        <input id="year_born" name="year_born" type="number" min="1990" max="2026" required placeholder="2018" />
-        <div class="hint">Approximate is fine</div>
-      </div>
-      <div class="field">
-        <label for="horse_discipline">Primary discipline *</label>
-        <select id="horse_discipline" name="horse_discipline" required>
-          <option value="">Choose one</option>
-          <option>Barrel racing</option><option>Roping</option><option>Ranch work</option>
-          <option>Cutting / reining</option><option>Trail / pleasure</option><option>Breeding</option>
-          <option>Show</option><option>Dressage / eventing</option><option>Endurance</option>
-          <option>Retired / companion</option><option>Other</option>
-        </select>
-      </div>
-    </div>
-
-    <hr style="margin:24px 0;border:0;border-top:1px solid var(--line)">
-    <label style="display:flex;gap:10px;align-items:flex-start;font-weight:500">
-      <input type="checkbox" id="opt_in" name="opt_in" checked style="width:auto;margin-top:3px">
-      <span style="font-size:13.5px;color:#2a3130">Send me product updates from Mane Line. Unsubscribe anytime.</span>
-    </label>
-
-    <button type="submit" class="btn" id="join-submit" style="margin-top:20px;width:100%">Send Me the Magic Link</button>
-    <div class="hint" style="margin-top:10px;text-align:center">We'll email a one-tap sign-in link. No passwords.</div>
-  </form>
-</main>
-
-<footer>&copy; <span id="y"></span> Mane Line &middot; <a href="/" style="color:var(--primary)">maneline.co</a></footer>
-
-<script>
-  window.__MANELINE__ = {
-    SUPABASE_URL: "https://vvzasinqfirzxfduenjx.supabase.co",
-    SUPABASE_ANON_KEY: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ2emFzaW5xZmlyenhmZHVlbmp4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYyNzcyMTksImV4cCI6MjA5MTg1MzIxOX0.25G0D11vS6M5JqMC_Z2jE69RKfXsR_I9NAEMwxMPR4o"
+  const body = {
+    shopify:    'mock',
+    hubspot:    'mock',
+    workersAi:  'mock',
+    stripe:     'mock',
+    r2,
+    bindings: {
+      FLAGS:               Boolean(env.FLAGS),
+      ML_RL:               Boolean(env.ML_RL),
+      ASSETS:              Boolean(env.ASSETS),
+      AI:                  Boolean(env.AI),
+      VECTORIZE_PROTOCOLS: Boolean(env.VECTORIZE_PROTOCOLS),
+      MANELINE_R2:         r2BindingPresent,
+    },
+    env: publicEnv,
+    secrets_present: secretsPresent,
+    generated_at: new Date().toISOString(),
   };
-  document.getElementById('y').textContent = new Date().getFullYear();
-</script>
-<script type="module">
-  import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-  const sb = createClient(window.__MANELINE__.SUPABASE_URL, window.__MANELINE__.SUPABASE_ANON_KEY);
-  const form = document.getElementById('join-form');
-  const msg  = document.getElementById('msg');
-  const btn  = document.getElementById('join-submit');
-  function show(kind, text){ msg.className='msg on '+kind; msg.textContent=text; window.scrollTo({top:0,behavior:'smooth'}); }
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const d = new FormData(form);
-    const email = (d.get('email')||'').toString().trim().toLowerCase();
-    if (!email) return show('err','Please enter your email.');
-    const full_name = (d.get('full_name')||'').toString().trim();
-    btn.disabled = true; btn.textContent = 'Sending...';
-    try {
-      const { error } = await sb.auth.signInWithOtp({
-        email,
-        options: {
-          emailRedirectTo: window.location.origin + '/auth/callback?next=%2Fapp',
-          data: {
-            role: 'owner',
-            full_name,
-            display_name: full_name,
-            phone: (d.get('phone')||'').toString().trim(),
-            location: (d.get('location')||'').toString().trim(),
-            owner_discipline: (d.get('owner_discipline')||'').toString().trim(),
-            marketing_opt_in: !!document.getElementById('opt_in').checked,
-            first_horse: {
-              barn_name: (d.get('barn_name')||'').toString().trim(),
-              breed: (d.get('breed')||'').toString().trim(),
-              sex: (d.get('sex')||'').toString().trim(),
-              year_born: (d.get('year_born')||'').toString().trim(),
-              discipline: (d.get('horse_discipline')||'').toString().trim()
-            }
-          }
-        }
-      });
-      if (error) throw error;
-      sessionStorage.setItem('ml_pending_email', email);
-      sessionStorage.setItem('ml_signup_role', 'owner');
-      window.location.href = '/check-email';
-    } catch (err) {
-      btn.disabled = false; btn.textContent = 'Send Me the Magic Link';
-      show('err', err.message || 'Something went wrong. Please try again.');
-    }
+
+  return new Response(JSON.stringify(body, null, 2), {
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    },
   });
-</script>
-</body>
-</html>`;
+}
+
+/* =============================================================
+   Phase 1 — R2 uploads
+   -------------------------------------------------------------
+   Three endpoints, all authenticated via Supabase JWT:
+
+     POST /api/uploads/sign       — browser gets a presigned PUT URL
+     POST /api/uploads/commit     — Worker verifies PUT + writes rows
+     GET  /api/uploads/read-url   — browser gets a presigned GET URL
+
+   The signed PUT URL is bound to the caller's user id via the
+   object_key convention (<user_id>/<kind>/<uuid>.<ext>); commit
+   re-checks ownership before inserting r2_objects and the typed row.
+   ============================================================= */
+
+const UPLOAD_SIGN_RATE       = { limit: 20, windowSec: 60 };
+const UPLOAD_READ_URL_RATE   = { limit: 60, windowSec: 60 };
+
+// Allowed content types per upload kind. We intentionally whitelist —
+// no "/*" wildcards — to keep the bucket boring and predictable.
+const ALLOWED_CONTENT_TYPES = {
+  vet_record: {
+    'application/pdf':  'pdf',
+    'image/jpeg':       'jpg',
+    'image/png':        'png',
+    'image/heic':       'heic',
+    'image/webp':       'webp',
+  },
+  animal_photo: {
+    'image/jpeg': 'jpg',
+    'image/png':  'png',
+    'image/heic': 'heic',
+    'image/webp': 'webp',
+  },
+  animal_video: {
+    'video/mp4':        'mp4',
+    'video/quicktime':  'mov',
+  },
+};
+
+// Max bytes we'll presign for. Hard cap here and at commit time so a
+// leaked signed URL can't be used to dump a 2 GB file into the bucket.
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB
+
+/**
+ * Resolve the Supabase JWT on the request to a user id. Returns
+ * { actorId, jwt } on success; throws a `Response` on any failure so
+ * the caller can `return err` directly.
+ */
+async function requireOwner(request, env) {
+  if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) {
+    throw json({ error: 'not_configured' }, 500);
+  }
+  const authHeader = request.headers.get('authorization') || '';
+  const jwt = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  if (!jwt) {
+    throw json({ error: 'unauthorized' }, 401);
+  }
+
+  const who = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+    headers: {
+      apikey: env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${jwt}`,
+    },
+  });
+  if (!who.ok) {
+    throw json({ error: 'unauthorized' }, 401);
+  }
+  const whoData = await who.json().catch(() => null);
+  const actorId = whoData?.id;
+  if (!actorId) {
+    throw json({ error: 'unauthorized' }, 401);
+  }
+  return { actorId, jwt };
+}
+
+/**
+ * KV-bound rate limit (mirror of the older rateLimit() helper, but
+ * keyed off whichever KV binding the caller passes — we use ML_RL for
+ * upload paths so the bucket doesn't contend with feature-flag reads).
+ */
+async function rateLimitKv(kv, bucketKey, { limit, windowSec }) {
+  if (!kv) return { ok: true, remaining: limit, resetSec: windowSec };
+
+  const now = Math.floor(Date.now() / 1000);
+  const raw = await kv.get(bucketKey);
+  let state = raw ? safeParse(raw) : null;
+
+  if (!state || typeof state.resetAt !== 'number' || state.resetAt <= now) {
+    state = { count: 0, resetAt: now + windowSec };
+  }
+  state.count += 1;
+  const ok = state.count <= limit;
+
+  const ttl = Math.max(state.resetAt - now + 5, 10);
+  await kv.put(bucketKey, JSON.stringify(state), { expirationTtl: ttl });
+
+  return {
+    ok,
+    remaining: Math.max(0, limit - state.count),
+    resetSec: Math.max(1, state.resetAt - now),
+  };
+}
+
+function uuidv4() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  // Fallback — Workers runtime has randomUUID, but keep this safe.
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = Array.from(b).map((x) => x.toString(16).padStart(2, '0'));
+  return `${h.slice(0, 4).join('')}-${h.slice(4, 6).join('')}-${h.slice(6, 8).join('')}-${h.slice(8, 10).join('')}-${h.slice(10, 16).join('')}`;
+}
+
+/**
+ * Thin Worker-side ownership check. Calls am_i_owner_of(animal_id) via
+ * RPC with the CALLER's JWT so RLS and the function's own security
+ * barrier do the work for us. Returns true/false; throws `Response` on
+ * auth failure so callers can bail cleanly.
+ */
+async function assertCallerOwnsAnimal(env, userJwt, animalId) {
+  const r = await supabaseRpc(
+    env,
+    'am_i_owner_of',
+    { animal_id: animalId },
+    { userJwt }
+  );
+  if (!r.ok) {
+    throw json({ error: 'ownership_check_failed' }, 500);
+  }
+  return r.data === true;
+}
+
+/**
+ * POST /api/uploads/sign
+ *   Body: { kind, content_type, byte_size_estimate, animal_id? }
+ *   Resp: { put_url, object_key, expires_in }
+ */
+async function handleUploadSign(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.R2_ACCOUNT_ID || !env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
+    return json({ error: 'r2_not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (errResp) {
+    return errResp;
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const kind        = String(body?.kind || '');
+  const contentType = String(body?.content_type || '').toLowerCase();
+  const byteEstimate = Number(body?.byte_size_estimate || 0);
+  const animalId    = body?.animal_id ? String(body.animal_id) : null;
+
+  const kindTypes = ALLOWED_CONTENT_TYPES[kind];
+  if (!kindTypes) {
+    return json({ error: 'bad_kind', detail: 'kind must be vet_record, animal_photo, or animal_video' }, 400);
+  }
+  const ext = kindTypes[contentType];
+  if (!ext) {
+    return json({ error: 'bad_content_type', detail: `content_type ${contentType} not allowed for kind ${kind}` }, 415);
+  }
+  if (!Number.isFinite(byteEstimate) || byteEstimate <= 0 || byteEstimate > MAX_UPLOAD_BYTES) {
+    return json({ error: 'bad_byte_size', detail: `byte_size_estimate must be 1..${MAX_UPLOAD_BYTES}` }, 413);
+  }
+
+  // Records uploads must always attach to an animal the caller owns;
+  // /sign rejects early so we don't waste a signature on an orphan object.
+  if (animalId) {
+    const ownsIt = await assertCallerOwnsAnimal(env, jwt, animalId);
+    if (!ownsIt) {
+      return json({ error: 'forbidden', detail: 'not the owner of that animal' }, 403);
+    }
+  } else if (kind !== 'records_export') {
+    return json({ error: 'bad_request', detail: 'animal_id required for this kind' }, 400);
+  }
+
+  const rl = await rateLimitKv(env.ML_RL, `ratelimit:upload_sign:${actorId}`, UPLOAD_SIGN_RATE);
+  if (!rl.ok) {
+    return json(
+      { error: 'rate_limited', retry_after: rl.resetSec },
+      429,
+      { 'retry-after': String(rl.resetSec) }
+    );
+  }
+
+  const objectId  = uuidv4();
+  const objectKey = `${actorId}/${kind}/${objectId}.${ext}`;
+
+  let putUrl;
+  try {
+    putUrl = await presignPut({
+      bucket: 'maneline-records',
+      key: objectKey,
+      contentType,
+      accountId: env.R2_ACCOUNT_ID,
+      accessKeyId: env.R2_ACCESS_KEY_ID,
+      secretKey: env.R2_SECRET_ACCESS_KEY,
+      expiresSec: 300,
+    });
+  } catch (err) {
+    return json({ error: 'presign_failed', detail: err?.message ?? 'unknown' }, 500);
+  }
+
+  // Audit-log the signing intent. If the browser never follows through
+  // with a PUT, r2_objects stays empty — this row is how we reconcile.
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'upload.sign',
+    target_table: 'r2_objects',
+    target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { kind, object_key: objectKey, animal_id: animalId, content_type: contentType },
+  });
+
+  return json({ put_url: putUrl, object_key: objectKey, expires_in: 300 });
+}
+
+/**
+ * POST /api/uploads/commit
+ *   Body: { object_key, kind, animal_id?, record_type?, issued_on?,
+ *           expires_on?, issuing_provider?, caption?, taken_on? }
+ *   Resp: { id, r2_object_id }
+ *
+ * The Worker HEADs the object via the R2 binding (not via the signed
+ * URL — we trust the binding and it doesn't need SigV4). If present,
+ * we write r2_objects + the typed row in two service_role inserts.
+ */
+async function handleUploadCommit(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.MANELINE_R2) {
+    return json({ error: 'r2_not_configured' }, 500);
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'supabase_not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (errResp) {
+    return errResp;
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const objectKey = String(body?.object_key || '');
+  const kind      = String(body?.kind || '');
+  const animalId  = body?.animal_id ? String(body.animal_id) : null;
+
+  if (!objectKey || !ALLOWED_CONTENT_TYPES[kind]) {
+    return json({ error: 'bad_request' }, 400);
+  }
+  // object_key is <actorId>/<kind>/<uuid>.<ext> — enforce the actor prefix
+  // so a caller can't commit someone else's upload.
+  if (!objectKey.startsWith(`${actorId}/${kind}/`)) {
+    return json({ error: 'forbidden', detail: 'object_key does not belong to caller' }, 403);
+  }
+
+  if (animalId) {
+    const ownsIt = await assertCallerOwnsAnimal(env, jwt, animalId);
+    if (!ownsIt) return json({ error: 'forbidden' }, 403);
+  } else if (kind !== 'records_export') {
+    return json({ error: 'bad_request', detail: 'animal_id required' }, 400);
+  }
+
+  // HEAD via binding — confirms the PUT succeeded and gives us the real
+  // byte_size + content_type (don't trust the browser's self-report).
+  const head = await env.MANELINE_R2.head(objectKey);
+  if (!head) {
+    return json({ error: 'not_uploaded', detail: 'object not in R2; PUT first' }, 409);
+  }
+  if (head.size > MAX_UPLOAD_BYTES) {
+    // Belt-and-suspenders — presign already caps, but if an attacker
+    // finds a way to upload more, we still refuse to record it.
+    await env.MANELINE_R2.delete(objectKey).catch(() => {});
+    return json({ error: 'too_large' }, 413);
+  }
+  const contentType = head.httpMetadata?.contentType || 'application/octet-stream';
+
+  // 1. Insert r2_objects (service_role — clients are revoked INSERT).
+  const r2Insert = await supabaseInsertReturning(env, 'r2_objects', {
+    owner_id:     actorId,
+    bucket:       'maneline-records',
+    object_key:   objectKey,
+    kind,
+    content_type: contentType,
+    byte_size:    head.size,
+  });
+  if (!r2Insert.ok || !r2Insert.data?.id) {
+    return json({ error: 'db_write_failed', detail: r2Insert.data || 'r2_objects insert' }, 500);
+  }
+  const r2ObjectId = r2Insert.data.id;
+
+  // 2. Insert the typed row.
+  let typedInsert = { ok: true, data: null };
+  if (kind === 'vet_record') {
+    const recordType = String(body?.record_type || '');
+    const allowed = ['coggins', 'vaccine', 'dental', 'farrier', 'other'];
+    if (!allowed.includes(recordType)) {
+      // Rollback r2_objects so we don't leave orphans.
+      await supabaseDelete(env, 'r2_objects', `id=eq.${r2ObjectId}`);
+      await env.MANELINE_R2.delete(objectKey).catch(() => {});
+      return json({ error: 'bad_record_type' }, 400);
+    }
+    typedInsert = await supabaseInsertReturning(env, 'vet_records', {
+      owner_id:         actorId,
+      animal_id:        animalId,
+      r2_object_id:     r2ObjectId,
+      record_type:      recordType,
+      issued_on:        body?.issued_on || null,
+      expires_on:       body?.expires_on || null,
+      issuing_provider: body?.issuing_provider || null,
+      notes:            body?.notes || null,
+    });
+  } else if (kind === 'animal_photo' || kind === 'animal_video') {
+    typedInsert = await supabaseInsertReturning(env, 'animal_media', {
+      owner_id:     actorId,
+      animal_id:    animalId,
+      r2_object_id: r2ObjectId,
+      kind:         kind === 'animal_photo' ? 'photo' : 'video',
+      caption:      body?.caption || null,
+      taken_on:     body?.taken_on || null,
+    });
+  }
+
+  if (!typedInsert.ok || !typedInsert.data?.id) {
+    await supabaseDelete(env, 'r2_objects', `id=eq.${r2ObjectId}`);
+    await env.MANELINE_R2.delete(objectKey).catch(() => {});
+    return json({ error: 'db_write_failed', detail: typedInsert.data || 'typed insert' }, 500);
+  }
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'records.upload',
+    target_table: kind === 'vet_record' ? 'vet_records' : 'animal_media',
+    target_id: typedInsert.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { r2_object_id: r2ObjectId, object_key: objectKey, kind },
+  });
+
+  return json({ id: typedInsert.data.id, r2_object_id: r2ObjectId });
+}
+
+/**
+ * GET /api/uploads/read-url?object_key=<url-encoded>
+ *   Resp: { get_url, expires_in }
+ */
+async function handleUploadReadUrl(request, env, url) {
+  if (request.method !== 'GET') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.R2_ACCOUNT_ID || !env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
+    return json({ error: 'r2_not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (errResp) {
+    return errResp;
+  }
+
+  const objectKey = url.searchParams.get('object_key') || '';
+  if (!objectKey) {
+    return json({ error: 'bad_request', detail: 'object_key required' }, 400);
+  }
+
+  const rl = await rateLimitKv(env.ML_RL, `ratelimit:read_url:${actorId}`, UPLOAD_READ_URL_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+  }
+
+  // Resolve the r2_objects row (service_role — lets us reach both
+  // owner-owned and trainer-accessible objects in one query).
+  const r = await supabaseSelect(
+    env,
+    'r2_objects',
+    `select=id,owner_id,kind,bucket,object_key&object_key=eq.${encodeURIComponent(objectKey)}&limit=1`,
+    { serviceRole: true }
+  );
+  const row = Array.isArray(r.data) ? r.data[0] : null;
+  if (!row) {
+    return json({ error: 'not_found' }, 404);
+  }
+
+  // Access check. Owners pass trivially. Trainers must hold an active
+  // grant on the linked animal — we look up the animal via the typed
+  // table and call do_i_have_access_to_animal() with the caller's JWT.
+  let allowed = row.owner_id === actorId;
+  if (!allowed) {
+    let animalId = null;
+    if (row.kind === 'vet_record') {
+      const vr = await supabaseSelect(
+        env,
+        'vet_records',
+        `select=animal_id&r2_object_id=eq.${row.id}&limit=1`,
+        { serviceRole: true }
+      );
+      animalId = Array.isArray(vr.data) ? vr.data[0]?.animal_id : null;
+    } else if (row.kind === 'animal_photo' || row.kind === 'animal_video') {
+      const am = await supabaseSelect(
+        env,
+        'animal_media',
+        `select=animal_id&r2_object_id=eq.${row.id}&limit=1`,
+        { serviceRole: true }
+      );
+      animalId = Array.isArray(am.data) ? am.data[0]?.animal_id : null;
+    }
+    if (animalId) {
+      const ok = await supabaseRpc(
+        env,
+        'do_i_have_access_to_animal',
+        { animal_id: animalId },
+        { userJwt: jwt }
+      );
+      allowed = ok.ok && ok.data === true;
+    }
+  }
+  if (!allowed) {
+    return json({ error: 'forbidden' }, 403);
+  }
+
+  let getUrl;
+  try {
+    getUrl = await presignGet({
+      bucket: row.bucket,
+      key: row.object_key,
+      accountId: env.R2_ACCOUNT_ID,
+      accessKeyId: env.R2_ACCESS_KEY_ID,
+      secretKey: env.R2_SECRET_ACCESS_KEY,
+      expiresSec: 300,
+    });
+  } catch (err) {
+    return json({ error: 'presign_failed', detail: err?.message ?? 'unknown' }, 500);
+  }
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: row.owner_id === actorId ? 'owner' : 'trainer',
+    action: 'records.read_url',
+    target_table: 'r2_objects',
+    target_id: row.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { object_key: row.object_key, kind: row.kind },
+  });
+
+  return json({ get_url: getUrl, expires_in: 300 });
+}
+
+/* =============================================================
+   Supabase helpers — returning inserts + delete + audit
+   (The basic select/insert/rpc variants are defined earlier.)
+   ============================================================= */
+
+async function supabaseInsertReturning(env, table, row) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify(row),
+  });
+  const text = await res.text();
+  let parsed;
+  try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+  const data = Array.isArray(parsed) ? parsed[0] : parsed;
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function supabaseDelete(env, table, filterQuery) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}?${filterQuery}`, {
+    method: 'DELETE',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+  });
+  return { ok: res.ok, status: res.status };
+}
+
+/**
+ * Fire-and-forget audit_log insert. Does not block the response path —
+ * failures are logged but never surface to the client.
+ */
+function ctx_audit(env, row) {
+  supabaseInsert(env, 'audit_log', row).catch((err) =>
+    console.warn('[audit] insert failed:', err?.message)
+  );
+}
+
+async function supabaseUpdateReturning(env, table, filterQuery, patch) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}?${filterQuery}`, {
+    method: 'PATCH',
+    headers: {
+      'content-type': 'application/json',
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify(patch),
+  });
+  const text = await res.text();
+  let parsed;
+  try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+  const data = Array.isArray(parsed) ? parsed[0] : parsed;
+  return { ok: res.ok, status: res.status, data };
+}
+
+/* =============================================================
+   /api/animals/archive   and   /api/animals/unarchive
+   -------------------------------------------------------------
+   Atomic archive toggle + audit event, so animals.archived_at
+   and animal_archive_events never diverge. OAG §8.
+
+   Flow:
+     1. requireOwner — caller must hold a valid Supabase JWT.
+     2. assertCallerOwnsAnimal — RPC check (am_i_owner_of) so
+        trainers/other owners can't toggle archive state.
+     3. service_role UPDATE animals.archived_at (= now() | null).
+     4. service_role INSERT animal_archive_events row.
+     5. audit_log fire-and-forget.
+   ============================================================= */
+const ARCHIVE_RATE = { limit: 10, windowSec: 60 };
+
+async function handleAnimalArchive(request, env) {
+  return handleAnimalArchiveToggle(request, env, 'archive');
+}
+
+async function handleAnimalUnarchive(request, env) {
+  return handleAnimalArchiveToggle(request, env, 'unarchive');
+}
+
+async function handleAnimalArchiveToggle(request, env, action) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const rl = await rateLimitKv(
+    env.ML_RL,
+    `ratelimit:animal_archive:${actorId}`,
+    ARCHIVE_RATE
+  );
+  if (!rl.ok) {
+    return json(
+      { error: 'rate_limited', retry_after: rl.resetSec },
+      429,
+      { 'retry-after': String(rl.resetSec) }
+    );
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'bad_request' }, 400);
+  }
+
+  const animalId = typeof body?.animal_id === 'string' ? body.animal_id : '';
+  const reasonRaw = typeof body?.reason === 'string' ? body.reason.trim() : '';
+  if (!animalId) {
+    return json({ error: 'animal_id required' }, 400);
+  }
+  if (action === 'archive' && reasonRaw.length === 0) {
+    // Required so the audit trail is worth reading a year from now.
+    return json({ error: 'reason_required' }, 400);
+  }
+
+  let ownsIt;
+  try {
+    ownsIt = await assertCallerOwnsAnimal(env, jwt, animalId);
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+  if (!ownsIt) {
+    return json({ error: 'forbidden' }, 403);
+  }
+
+  const patch =
+    action === 'archive'
+      ? { archived_at: new Date().toISOString() }
+      : { archived_at: null };
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'animals',
+    `id=eq.${encodeURIComponent(animalId)}`,
+    patch
+  );
+  if (!upd.ok || !upd.data) {
+    return json({ error: 'animal_update_failed', status: upd.status }, 500);
+  }
+
+  const evt = await supabaseInsertReturning(env, 'animal_archive_events', {
+    animal_id: animalId,
+    actor_id:  actorId,
+    action,
+    reason:    action === 'archive' ? reasonRaw : null,
+  });
+  if (!evt.ok) {
+    // The timestamp UPDATE already succeeded. We still return the fresh
+    // animal — audit coverage is a soft failure that will show up in
+    // logs, and the animals table remains the source of truth.
+    console.warn('[archive] audit event insert failed', { status: evt.status });
+  }
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'owner',
+    action:       action === 'archive' ? 'animal.archive' : 'animal.unarchive',
+    target_table: 'animals',
+    target_id:    animalId,
+    ip:           clientIp(request),
+    user_agent:   request.headers.get('user-agent') || null,
+    metadata:     action === 'archive' ? { reason: reasonRaw } : {},
+  });
+
+  return json({ animal: upd.data });
+}
+
+/* =============================================================
+   /api/records/export-pdf
+   -------------------------------------------------------------
+   Renders a single-animal, N-day records PDF server-side, uploads
+   it to R2 under kind='records_export', returns a 15-minute signed
+   GET URL so the owner can download + send.
+
+   Body: { animal_id, window_days: 30 | 90 | 365 }
+
+   Rate: 5 req / 5 min per caller — PDF render is not cheap.
+   ============================================================= */
+const RECORDS_EXPORT_RATE = { limit: 5, windowSec: 300 };
+const RECORDS_EXPORT_ALLOWED_WINDOWS = new Set([30, 90, 365]);
+
+async function handleRecordsExport(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.MANELINE_R2 || !env.R2_ACCOUNT_ID || !env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
+    return json({ error: 'r2_not_configured' }, 500);
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'supabase_not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const rl = await rateLimitKv(
+    env.ML_RL,
+    `ratelimit:records_export:${actorId}`,
+    RECORDS_EXPORT_RATE
+  );
+  if (!rl.ok) {
+    return json(
+      { error: 'rate_limited', retry_after: rl.resetSec },
+      429,
+      { 'retry-after': String(rl.resetSec) }
+    );
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const animalId = typeof body?.animal_id === 'string' ? body.animal_id : '';
+  const windowDays = Number(body?.window_days ?? 365);
+  if (!animalId) return json({ error: 'animal_id required' }, 400);
+  if (!RECORDS_EXPORT_ALLOWED_WINDOWS.has(windowDays)) {
+    return json({ error: 'bad_window_days', allowed: [30, 90, 365] }, 400);
+  }
+
+  try {
+    const ok = await assertCallerOwnsAnimal(env, jwt, animalId);
+    if (!ok) return json({ error: 'forbidden' }, 403);
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  // ---- Gather source rows via service_role ----
+  const since = new Date();
+  since.setDate(since.getDate() - windowDays);
+  const sinceIso = since.toISOString();
+
+  const [animalR, ownerR, vetR, r2R, mediaCountR] = await Promise.all([
+    supabaseSelect(
+      env,
+      'animals',
+      `select=id,barn_name,species,breed,year_born,discipline,owner_id&id=eq.${encodeURIComponent(animalId)}&limit=1`,
+      { serviceRole: true }
+    ),
+    // We use the animals row's owner_id to look up display_name.
+    // Parallelizing means we don't wait for the animal lookup first —
+    // the owner lookup runs speculatively against the caller's id and
+    // turns out to be the same row (owner uploading their own).
+    supabaseSelect(
+      env,
+      'user_profiles',
+      `select=display_name&user_id=eq.${encodeURIComponent(actorId)}&limit=1`,
+      { serviceRole: true }
+    ),
+    supabaseSelect(
+      env,
+      'vet_records',
+      `select=id,record_type,issued_on,expires_on,issuing_provider,notes,created_at,r2_object_id` +
+        `&animal_id=eq.${encodeURIComponent(animalId)}&archived_at=is.null&created_at=gte.${encodeURIComponent(sinceIso)}` +
+        `&order=issued_on.desc.nullslast,created_at.desc`,
+      { serviceRole: true }
+    ),
+    // We'll resolve filenames via a follow-up query once we know the ids.
+    Promise.resolve(null),
+    supabaseSelect(
+      env,
+      'animal_media',
+      `select=id&animal_id=eq.${encodeURIComponent(animalId)}&archived_at=is.null`,
+      { serviceRole: true }
+    ),
+  ]);
+
+  const animal = Array.isArray(animalR.data) ? animalR.data[0] : null;
+  if (!animal) return json({ error: 'animal_not_found' }, 404);
+  const ownerName = Array.isArray(ownerR.data) ? ownerR.data[0]?.display_name : null;
+  const vetRows = Array.isArray(vetR.data) ? vetR.data : [];
+  const mediaCount = Array.isArray(mediaCountR.data) ? mediaCountR.data.length : 0;
+
+  // Resolve object_key → filename ("coggins-2026-04-02.pdf"-style) for
+  // each vet record. We only print the basename — the file itself is
+  // never embedded, so this is just a pointer for the vet/buyer.
+  let fileNameByObjectId = new Map();
+  if (vetRows.length > 0) {
+    const ids = Array.from(new Set(vetRows.map((r) => r.r2_object_id)));
+    const r2 = await supabaseSelect(
+      env,
+      'r2_objects',
+      `select=id,object_key&id=in.(${ids.map((x) => encodeURIComponent(x)).join(',')})`,
+      { serviceRole: true }
+    );
+    for (const row of r2.data || []) {
+      const key = row.object_key || '';
+      const base = key.split('/').pop() || key;
+      fileNameByObjectId.set(row.id, base);
+    }
+  }
+  const vetRecords = vetRows.map((r) => ({
+    ...r,
+    filename: fileNameByObjectId.get(r.r2_object_id) || null,
+  }));
+  // Void the placeholder to keep lint happy.
+  void r2R;
+
+  // ---- Render PDF ----
+  let pdfBytes;
+  try {
+    pdfBytes = renderRecordsPdf({
+      animal,
+      ownerName,
+      windowDays,
+      vetRecords,
+      mediaCount,
+    });
+  } catch (err) {
+    return json({ error: 'render_failed', detail: err?.message ?? 'unknown' }, 500);
+  }
+
+  // ---- Upload to R2 ----
+  const objectId  = uuidv4();
+  const objectKey = `${actorId}/records_export/${objectId}.pdf`;
+  try {
+    await env.MANELINE_R2.put(objectKey, pdfBytes, {
+      httpMetadata: { contentType: 'application/pdf' },
+    });
+  } catch (err) {
+    return json({ error: 'r2_put_failed', detail: err?.message ?? 'unknown' }, 500);
+  }
+
+  const r2Insert = await supabaseInsertReturning(env, 'r2_objects', {
+    owner_id:     actorId,
+    bucket:       'maneline-records',
+    object_key:   objectKey,
+    kind:         'records_export',
+    content_type: 'application/pdf',
+    byte_size:    pdfBytes.length,
+  });
+  if (!r2Insert.ok) {
+    await env.MANELINE_R2.delete(objectKey).catch(() => {});
+    return json({ error: 'db_write_failed' }, 500);
+  }
+
+  // 15-minute signed GET so the owner has time to download + forward.
+  let getUrl;
+  try {
+    getUrl = await presignGet({
+      bucket: 'maneline-records',
+      key: objectKey,
+      accountId: env.R2_ACCOUNT_ID,
+      accessKeyId: env.R2_ACCESS_KEY_ID,
+      secretKey: env.R2_SECRET_ACCESS_KEY,
+      expiresSec: 900,
+    });
+  } catch (err) {
+    return json({ error: 'presign_failed', detail: err?.message ?? 'unknown' }, 500);
+  }
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'owner',
+    action:       'records.export',
+    target_table: 'animals',
+    target_id:    animalId,
+    ip:           clientIp(request),
+    user_agent:   request.headers.get('user-agent') || null,
+    metadata:     { window_days: windowDays, object_key: objectKey, vet_count: vetRecords.length },
+  });
+
+  return json({
+    object_key:  objectKey,
+    get_url:     getUrl,
+    expires_in:  900,
+    record_count: vetRecords.length,
+  });
+}
+
+/* =============================================================
+   /api/access/grant   and   /api/access/revoke
+   -------------------------------------------------------------
+   Owners choose who sees their animals (§2.2 of the feature
+   map). Grants are scoped to a single animal, a whole ranch, or
+   every animal the owner has. Revocation is soft — revoked_at +
+   grace_period_ends_at keep the trainer's read access alive
+   through a countdown visible in the UI.
+
+   Both endpoints audit under action='access.grant' /
+   'access.revoke' with the grant id + scope.
+   ============================================================= */
+const ACCESS_RATE = { limit: 10, windowSec: 60 };
+const ACCESS_SCOPES = new Set(['animal', 'ranch', 'owner_all']);
+const GRACE_DAYS_DEFAULT = 7;
+const GRACE_DAYS_MAX = 30;
+
+async function handleAccessGrant(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const rl = await rateLimitKv(env.ML_RL, `ratelimit:access_grant:${actorId}`, ACCESS_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, {
+      'retry-after': String(rl.resetSec),
+    });
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const trainerEmail = typeof body?.trainer_email === 'string'
+    ? body.trainer_email.trim().toLowerCase()
+    : '';
+  const scope = typeof body?.scope === 'string' ? body.scope : '';
+  const animalId = typeof body?.animal_id === 'string' && body.animal_id ? body.animal_id : null;
+  const ranchId  = typeof body?.ranch_id  === 'string' && body.ranch_id  ? body.ranch_id  : null;
+  const notes    = typeof body?.notes     === 'string' ? body.notes.trim() : null;
+
+  if (!trainerEmail)      return json({ error: 'trainer_email required' }, 400);
+  if (!ACCESS_SCOPES.has(scope)) return json({ error: 'bad_scope', allowed: [...ACCESS_SCOPES] }, 400);
+  if (scope === 'animal' && !animalId) return json({ error: 'animal_id required for scope=animal' }, 400);
+  if (scope === 'ranch'  && !ranchId)  return json({ error: 'ranch_id required for scope=ranch' }, 400);
+
+  if (scope === 'animal') {
+    let ok;
+    try {
+      ok = await assertCallerOwnsAnimal(env, jwt, animalId);
+    } catch (resp) {
+      if (resp instanceof Response) return resp;
+      throw resp;
+    }
+    if (!ok) return json({ error: 'forbidden' }, 403);
+  } else if (scope === 'ranch') {
+    const r = await supabaseSelect(
+      env,
+      'ranches',
+      `select=id&id=eq.${encodeURIComponent(ranchId)}&owner_id=eq.${encodeURIComponent(actorId)}&limit=1`,
+      { serviceRole: true }
+    );
+    if (!r.ok) return json({ error: 'ranch_check_failed' }, 500);
+    if (!Array.isArray(r.data) || r.data.length === 0) return json({ error: 'forbidden' }, 403);
+  }
+
+  // Resolve the trainer by email. Must exist in user_profiles as an
+  // active trainer AND have an approved trainer_profiles row.
+  const userLookup = await supabaseSelect(
+    env,
+    'user_profiles',
+    `select=user_id,role,status,display_name&email=eq.${encodeURIComponent(trainerEmail)}&limit=1`,
+    { serviceRole: true }
+  );
+  if (!userLookup.ok) return json({ error: 'trainer_lookup_failed' }, 500);
+  const profile = Array.isArray(userLookup.data) ? userLookup.data[0] : null;
+  if (!profile || profile.role !== 'trainer' || profile.status !== 'active') {
+    return json({ error: 'trainer_not_found' }, 404);
+  }
+
+  const tpLookup = await supabaseSelect(
+    env,
+    'trainer_profiles',
+    `select=application_status&user_id=eq.${encodeURIComponent(profile.user_id)}&limit=1`,
+    { serviceRole: true }
+  );
+  if (!tpLookup.ok) return json({ error: 'trainer_lookup_failed' }, 500);
+  const tp = Array.isArray(tpLookup.data) ? tpLookup.data[0] : null;
+  if (!tp || tp.application_status !== 'approved') {
+    return json({ error: 'trainer_not_approved' }, 404);
+  }
+
+  const insert = await supabaseInsertReturning(env, 'animal_access_grants', {
+    owner_id:   actorId,
+    trainer_id: profile.user_id,
+    scope,
+    animal_id:  scope === 'animal' ? animalId : null,
+    ranch_id:   scope === 'ranch'  ? ranchId  : null,
+    notes:      notes || null,
+  });
+  if (!insert.ok || !insert.data) {
+    return json({ error: 'grant_insert_failed', status: insert.status }, 500);
+  }
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'owner',
+    action:       'access.grant',
+    target_table: 'animal_access_grants',
+    target_id:    insert.data.id,
+    ip:           clientIp(request),
+    user_agent:   request.headers.get('user-agent') || null,
+    metadata:     {
+      scope,
+      trainer_id: profile.user_id,
+      trainer_email: trainerEmail,
+      animal_id: animalId,
+      ranch_id:  ranchId,
+    },
+  });
+
+  // TECH_DEBT(phase-2): wire the Gmail relay here. Until the
+  // integration is live, the audit row above is the notification
+  // trail; the trainer will see the grant appear in their dashboard
+  // on next sign-in.
+
+  return json({
+    grant: insert.data,
+    trainer: {
+      user_id: profile.user_id,
+      display_name: profile.display_name,
+      email: trainerEmail,
+    },
+  });
+}
+
+async function handleAccessRevoke(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId;
+  try {
+    ({ actorId } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const rl = await rateLimitKv(env.ML_RL, `ratelimit:access_revoke:${actorId}`, ACCESS_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, {
+      'retry-after': String(rl.resetSec),
+    });
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const grantId = typeof body?.grant_id === 'string' ? body.grant_id : '';
+  if (!grantId) return json({ error: 'grant_id required' }, 400);
+
+  let graceDays = Number(body?.grace_days ?? GRACE_DAYS_DEFAULT);
+  if (!Number.isFinite(graceDays) || graceDays < 0) graceDays = GRACE_DAYS_DEFAULT;
+  if (graceDays > GRACE_DAYS_MAX) graceDays = GRACE_DAYS_MAX;
+
+  // Confirm the grant belongs to the caller. We scope the PATCH by
+  // owner_id below too so a wrong id can never flip someone else's
+  // grant — the pre-read just lets us return a clean 404.
+  const precheck = await supabaseSelect(
+    env,
+    'animal_access_grants',
+    `select=id,owner_id,trainer_id,scope&id=eq.${encodeURIComponent(grantId)}&limit=1`,
+    { serviceRole: true }
+  );
+  if (!precheck.ok) return json({ error: 'grant_lookup_failed' }, 500);
+  const existing = Array.isArray(precheck.data) ? precheck.data[0] : null;
+  if (!existing) return json({ error: 'not_found' }, 404);
+  if (existing.owner_id !== actorId) return json({ error: 'forbidden' }, 403);
+
+  const now = new Date();
+  const graceEnds = new Date(now.getTime() + graceDays * 24 * 60 * 60 * 1000);
+  const patch = {
+    revoked_at: now.toISOString(),
+    grace_period_ends_at: graceEnds.toISOString(),
+  };
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'animal_access_grants',
+    `id=eq.${encodeURIComponent(grantId)}&owner_id=eq.${encodeURIComponent(actorId)}`,
+    patch
+  );
+  if (!upd.ok || !upd.data) {
+    return json({ error: 'grant_update_failed', status: upd.status }, 500);
+  }
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'owner',
+    action:       'access.revoke',
+    target_table: 'animal_access_grants',
+    target_id:    grantId,
+    ip:           clientIp(request),
+    user_agent:   request.headers.get('user-agent') || null,
+    metadata:     {
+      scope:      existing.scope,
+      trainer_id: existing.trainer_id,
+      grace_days: graceDays,
+    },
+  });
+
+  return json({ grant: upd.data });
+}
+

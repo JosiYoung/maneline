@@ -1,22 +1,34 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import type { Database } from './database.types';
 
-const url = import.meta.env.VITE_SUPABASE_URL;
-const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const url = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
 
-if (!url || !anonKey) {
-  // Fail loudly at module load time so we don't ship a half-configured bundle.
-  // Build & dev will both surface this as a clear error instead of silent 401s.
-  throw new Error(
-    'Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY. ' +
-      'Copy app/.env.example to app/.env.local and fill in the values.'
-  );
+const isConfigured = typeof url === 'string' && url.length > 0
+  && typeof anonKey === 'string' && anonKey.length > 0;
+
+/**
+ * Whether the bundle was built with Supabase env vars. Call this at
+ * app mount to decide whether to render the real tree or a friendly
+ * config-missing screen. We intentionally do NOT throw at module load
+ * anymore — a blank white page is worse than a small inline error.
+ */
+export function isSupabaseConfigured(): boolean {
+  return isConfigured;
 }
 
-export const supabase: SupabaseClient = createClient(url, anonKey, {
-  auth: {
-    persistSession: true,
-    autoRefreshToken: true,
-    detectSessionInUrl: true,
-    flowType: 'pkce',
-  },
-});
+// When not configured we still export a client so that imports don't
+// explode at the call site. Calls against it will fail; the app is
+// expected to have rendered the <ConfigMissing> screen instead.
+export const supabase: SupabaseClient<Database> = createClient<Database>(
+  url ?? 'http://invalid.local',
+  anonKey ?? 'invalid',
+  {
+    auth: {
+      persistSession: isConfigured,
+      autoRefreshToken: isConfigured,
+      detectSessionInUrl: isConfigured,
+      flowType: 'pkce',
+    },
+  }
+);

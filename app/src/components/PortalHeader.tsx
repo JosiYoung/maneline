@@ -40,7 +40,7 @@ export function PortalHeader({ portal }: PortalHeaderProps) {
         <span style={{ fontFamily: 'var(--font-display)', fontSize: 20, fontWeight: 700, color: 'var(--color-primary)' }}>
           {PORTAL_LABELS[portal]}
         </span>
-        <span style={{ fontSize: 12, color: 'var(--color-muted)' }}>
+        <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
           Logged in as <strong style={{ color: 'var(--color-ink)' }}>{email || 'unknown'}</strong>{' '}
           <span style={{ padding: '2px 8px', marginLeft: 6, borderRadius: 999, background: 'var(--color-bg)', border: '1px solid var(--color-line)' }}>
             role: {role}

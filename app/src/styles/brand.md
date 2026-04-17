@@ -1,53 +1,63 @@
-# Mane Line — Brand Tokens (PLACEHOLDERS)
+# Mane Line — Brand Tokens (Cream / Green / Black)
 
-> **Status:** PLACEHOLDER — Phase 0 only.
-> These values are stand-ins so the portal shells render coherently during
-> build-out. **Do not treat any value here as final.** Silver Lining Herbs
-> will supply the canonical Mane Line brand (palette, type system, logo lockup)
-> in a later phase. When that lands, update this file _and_
-> `src/styles/index.css` in the same commit.
+> **Status:** Working palette pulled from the Silver Lining Herbs reference
+> storefront (logo leaf + "Take the Quiz" action button + packaging cream).
+> Published to `src/styles/index.css` 2026-04-17. Will be re-confirmed or
+> replaced once Silver Lining supplies a formal brand guide.
 
-## Current placeholder palette
+## Palette
 
-| Token               | Value       | Intent                                               |
-|---------------------|-------------|------------------------------------------------------|
-| `--color-primary`   | `#1E3A5F`   | Primary chrome (navy — placeholder for brand primary) |
-| `--color-accent`    | `#C9A24C`   | Accent / CTAs (warm gold — placeholder)              |
-| `--color-bg`        | `#FAF8F3`   | App background (warm cream — placeholder)            |
-| `--color-sage`      | `#8BA678`   | Supporting accent (sage — placeholder)               |
-| `--color-ink`       | `#1A1A1A`   | Body copy                                            |
-| `--color-muted`     | `#5c6160`   | Secondary copy                                       |
-| `--color-line`      | `rgba(30,58,95,.15)` | Hairlines / borders                         |
-| `--color-surface`   | `#ffffff`   | Cards / elevated surfaces                            |
+| Token              | Value                        | Intent                                      |
+|--------------------|------------------------------|---------------------------------------------|
+| `--primary`        | `#3D7A3D`                    | Herb green — brand chrome, headings, links  |
+| `--accent`         | `#67B04A`                    | Action green — CTAs, highlights, success    |
+| `--secondary`      | `#E4EAD5`                    | Soft sage-cream — pill backgrounds, chips   |
+| `--color-sage`     | `#A8C49A`                    | Supporting sage — badges, illustrations     |
+| `--background`     | `#F5EFE0`                    | Cream — app background                      |
+| `--card`           | `#FFFDF5`                    | Warm white — cards, elevated surfaces       |
+| `--foreground`     | `#1A1A1A`                    | Near-black — body copy                      |
+| `--muted`          | `#ECE4D0`                    | Muted cream surface (shadcn)                |
+| `--muted-foreground` | `#5A5F5A`                  | Secondary text                              |
+| `--border`         | `rgba(61,122,61,.22)`        | Hairlines derived from `--primary`          |
+| `--destructive`    | `#C13A3A`                    | Warn / revoke / errors                      |
 
-## Typography (placeholders)
+## How tokens are wired
 
-- **Display** — `Playfair Display` (serif). Placeholder pending brand direction.
-- **Sans** — `Inter`. Likely to remain; confirm during brand pass.
+Two token families live in `src/styles/index.css`:
 
-## Chrome rules (binding, not placeholder)
+1. **Legacy literal tokens** — `--color-primary`, `--color-bg`,
+   `--color-ink`, `--color-surface`, `--text-muted`, `--color-line`,
+   `--color-sage`. Phase 0 pages (Home, Login, portal shells, signup)
+   use these directly via inline `style={{...}}`. Keep until Phase 1
+   migrates each page to shadcn + Tailwind utilities.
+2. **shadcn/ui semantic tokens** — `--background`, `--foreground`,
+   `--primary`, `--card`, `--border`, etc. New components (Phase 1+)
+   reach these through Tailwind utilities: `bg-background`,
+   `text-primary`, `border-border`. The `@theme inline` block in
+   `index.css` publishes each as a Tailwind v4 color utility.
 
-These are governance rules, not visual guesses, and they do not change with
-the brand pass:
+## Typography
+
+- **Display** — `Playfair Display` (serif). Used on `h1–h3`.
+- **Sans** — `Inter`. Used for body + forms.
+
+Both are load-on-demand Google Fonts; wire the `<link>` in `index.html`
+when the design polish pass lands in Phase 1.
+
+## Chrome rules (binding — do not change with palette)
 
 1. **Owner / Trainer / Vet** portal chrome displays **"Mane Line"** only.
-   No "Silver Lining Herbs" co-branding in headers, footers, or auth emails
-   for these audiences.
-2. **Admin (Silver Lining)** portal chrome may display full Silver Lining
-   identity — this portal is internal to the client.
-3. The public marketing site (root `/`, `/login`, `/signup`) uses Mane Line
-   chrome only. Silver Lining co-branding was removed per the post-2026-04-15
-   call.
+   No "Silver Lining Herbs" co-branding in headers, footers, or auth
+   emails for these audiences.
+2. **Admin (Silver Lining)** portal chrome may display full Silver
+   Lining identity — this portal is internal to the client.
+3. The public marketing site (`/`, `/login`, `/signup`) uses Mane Line
+   chrome only.
 
-## When the real brand lands
+## When the brand guide arrives
 
-Ping whoever supplies the brand for:
-- Final hex values for primary / accent / neutrals (+ dark variant if applicable)
-- Logo lockup (SVG, monochrome + full color)
-- Typography license (Google Fonts is acceptable today — verify in brand pass)
-- Shadow / radius / motion tokens
-
-Then update:
-1. This file (replace the placeholder table; change the status banner)
-2. `src/styles/index.css` `@theme { ... }` block
-3. Any hard-coded color literals in components (`grep -r "#1E3A5F" src/` etc.)
+Update in this order:
+1. This file (palette table + provenance note).
+2. The `:root` + `@theme inline` blocks in `src/styles/index.css`.
+3. `grep -rn "#3D7A3D\|#67B04A\|#F5EFE0\|#FFFDF5\|#1A1A1A" app/src`
+   and replace any hard-coded literals that sneaked in.

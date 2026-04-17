@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
+import { mapSupabaseError } from '../lib/errors';
 
 /**
  * Legacy single-step signup — the v1 waitlist flow, preserved in the SPA
@@ -13,6 +14,7 @@ import { supabase } from '../lib/supabase';
  * is the default in handle_new_user()).
  */
 export default function SignupV1() {
+  const navigate = useNavigate();
   const [status, setStatus] = useState<'idle' | 'sending' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -56,18 +58,18 @@ export default function SignupV1() {
 
     if (error) {
       setStatus('error');
-      setErrorMessage(error.message);
+      setErrorMessage(mapSupabaseError(error));
       return;
     }
 
     sessionStorage.setItem('ml_pending_email', email);
     sessionStorage.setItem('ml_signup_role', 'owner');
-    window.location.href = '/check-email';
+    navigate('/check-email');
   }
 
   return (
     <main style={{ maxWidth: 760, margin: '0 auto', padding: '32px 24px 80px' }}>
-      <Link to="/" style={{ fontSize: 13, color: 'var(--color-muted)' }}>&larr; Back</Link>
+      <Link to="/" style={{ fontSize: 13, color: 'var(--text-muted)' }}>&larr; Back</Link>
       <div style={eyebrow}>Join the Waitlist</div>
       <h1 style={{ fontSize: 'clamp(32px, 4.4vw, 46px)', margin: '8px 0 16px' }}>Ride in the first wave.</h1>
       <p style={{ fontSize: 17, color: '#2a3130', maxWidth: '56ch', marginBottom: 28 }}>
@@ -98,7 +100,7 @@ export default function SignupV1() {
         <hr style={hr} />
 
         <h2 style={h2Style}>Your first horse</h2>
-        <p style={{ color: 'var(--color-muted)', fontSize: 13.5, marginBottom: 14 }}>
+        <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginBottom: 14 }}>
           You can add more once you're in.
         </p>
         <div style={grid2}>
@@ -144,7 +146,7 @@ export default function SignupV1() {
         <button type="submit" disabled={status === 'sending'} style={{ ...primaryBtn, marginTop: 20, width: '100%' }}>
           {status === 'sending' ? 'Sending…' : 'Send Me the Magic Link'}
         </button>
-        <p style={{ fontSize: 12, color: 'var(--color-muted)', marginTop: 10, textAlign: 'center' }}>
+        <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 10, textAlign: 'center' }}>
           We'll email a one-tap sign-in link. No passwords.
         </p>
       </form>

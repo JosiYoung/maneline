@@ -66,7 +66,7 @@ export default function CheckEmail() {
         {c.body}
       </p>
       {c.aside ? (
-        <p style={{ fontSize: 13.5, color: 'var(--color-muted)', marginBottom: 28, lineHeight: 1.5 }}>
+        <p style={{ fontSize: 13.5, color: 'var(--text-muted)', marginBottom: 28, lineHeight: 1.5 }}>
           {c.aside}
         </p>
       ) : null}
@@ -81,7 +81,7 @@ export default function CheckEmail() {
         color: 'var(--color-ink)',
       }}>
         <strong style={{ display: 'block', marginBottom: 8 }}>Not seeing it?</strong>
-        <ul style={{ margin: 0, paddingLeft: 18, color: 'var(--color-muted)' }}>
+        <ul style={{ margin: 0, paddingLeft: 18, color: 'var(--text-muted)' }}>
           <li>Check your spam / promotions folder</li>
           <li>Links expire after 1 hour — just request a new one</li>
           <li>Typo in the email? <Link to="/signup">Start over</Link></li>
@@ -89,7 +89,7 @@ export default function CheckEmail() {
       </div>
 
       <p style={{ marginTop: 28 }}>
-        <Link to="/" style={{ fontSize: 14, color: 'var(--color-muted)' }}>&larr; Back to home</Link>
+        <Link to="/" style={{ fontSize: 14, color: 'var(--text-muted)' }}>&larr; Back to home</Link>
       </p>
     </main>
   );

@@ -1,20 +1,11 @@
-// Shared types that mirror the shapes introduced in
-// supabase/migrations/00002_phase0_multirole_foundation.sql.
-// Keep this file narrow — only types the SPA actually reads.
+// Re-exports for the SPA — all schema shapes live in database.types.ts
+// (the hand-rolled mirror of the Supabase schema). Keeping this file thin
+// so there's one canonical `UserProfile` type instead of two that can drift.
 
-export type UserRole = 'owner' | 'trainer' | 'silver_lining';
+import type { Database, UserRole, UserStatus } from './database.types';
 
-export type UserStatus = 'active' | 'pending_review' | 'suspended' | 'archived';
+export type { UserRole, UserStatus };
 
-export interface UserProfile {
-  // Matches public.user_profiles.user_id — the FK into auth.users(id),
-  // NOT the user_profiles row PK (that column is `id` and we ignore it).
-  user_id: string;
-  role: UserRole;
-  status: UserStatus;
-  display_name: string | null;
-  email: string | null;
-  has_pin: boolean;
-  created_at: string;
-  updated_at: string;
-}
+// Row shape straight out of the DB types, re-exported with the historical
+// name the rest of the SPA already imports.
+export type UserProfile = Database['public']['Tables']['user_profiles']['Row'];

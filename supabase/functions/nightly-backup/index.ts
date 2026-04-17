@@ -24,6 +24,8 @@
 //           + user_profiles, animals, ranches,
 //             animal_access_grants, trainer_profiles,
 //             trainer_applications  (Phase 0 / Prompt 9.2)
+//           + vet_records, animal_media, r2_objects,
+//             animal_archive_events  (Phase 1 / Prompt 1.9)
 //
 // Layer 2 guarantee: open-format (JSON + CSV), standard Git,
 // zero ManeLine tooling required to read. If Supabase AND
@@ -147,7 +149,10 @@ Deno.serve(async (_req) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    // Layer 2 contents — original tables + Phase 0 multi-role tables.
+    // Layer 2 contents — original + Phase 0 multi-role + Phase 1 owner
+    // portal tables. Note: r2_objects is metadata only (object_key,
+    // kind, content_type, byte_size) — the actual R2 files stay in
+    // Cloudflare, covered by R2 object versioning + bucket policy.
     const TABLES = [
       "profiles",
       "horses",
@@ -157,6 +162,10 @@ Deno.serve(async (_req) => {
       "animal_access_grants",
       "trainer_profiles",
       "trainer_applications",
+      "vet_records",
+      "animal_media",
+      "r2_objects",
+      "animal_archive_events",
     ] as const;
 
     const tableData: Record<string, Record<string, unknown>[]> = {};

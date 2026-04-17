@@ -1,30 +1,116 @@
 @import "tailwindcss";
+@plugin "tailwindcss-animate";
 
 /* ---------------------------------------------------------------
- * Mane Line brand tokens (PLACEHOLDERS — see src/styles/brand.md)
+ * Mane Line brand tokens — cream / green / black
  *
- * These values are NOT final. They exist so the portal shells render
- * with a coherent look during Phase 0. Silver Lining Herbs will supply
- * the canonical brand in a later phase; update both this file and
- * brand.md when that happens.
+ * Pulled from the Silver Lining Herbs storefront reference:
+ *   • Herb-leaf green    → primary (logo mark, buttons, headings)
+ *   • "Take the Quiz"    → accent / action green
+ *   • Warm cream         → background + packaging surfaces
+ *   • Near-black ink     → body copy
+ *
+ * Two token families live side-by-side so both rendering styles work:
+ *
+ *   1. Legacy literals (`--color-bg`, `--color-ink`, `--text-muted`,
+ *      `--color-surface`, `--color-line`, `--color-sage`).
+ *      Phase 0 pages (Home, Login, portal shells, signup) address
+ *      these via inline `style={{ color: 'var(--color-ink)' }}`.
+ *      Keep them until Phase 1 migrates each page to shadcn + Tailwind.
+ *
+ *   2. shadcn/ui semantic tokens (`--background`, `--foreground`,
+ *      `--primary`, `--card`, `--border`, etc.). Phase 1+ components
+ *      reach these through Tailwind utilities (`bg-background`,
+ *      `text-primary`, `border-border`) thanks to the `@theme inline`
+ *      block below.
+ *
+ * Change rule (non-negotiable): touch this file and this file only
+ * when the palette shifts. No hex literals in JSX/TSX.
  * --------------------------------------------------------------- */
-@theme {
-  --color-primary: #1E3A5F;
-  --color-accent:  #C9A24C;
-  --color-bg:      #FAF8F3;
-  --color-sage:    #8BA678;
-
-  --color-ink:          #1A1A1A;
-  --color-muted:        #5c6160;
-  --color-line:         rgba(30, 58, 95, 0.15);
-  --color-surface:      #ffffff;
-
-  --font-display: "Playfair Display", ui-serif, Georgia, serif;
-  --font-sans:    "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-}
 
 :root {
   color-scheme: light;
+
+  /* ── Legacy literal tokens (inline-style code paths) ───────── */
+  --color-primary:  #3D7A3D;                    /* herb green */
+  --color-accent:   #67B04A;                    /* action green */
+  --color-bg:       #F5EFE0;                    /* cream */
+  --color-sage:     #A8C49A;                    /* soft sage */
+  --color-ink:      #1A1A1A;                    /* near-black copy */
+  --text-muted:     #5A5F5A;                    /* secondary copy (renamed 2026-04-17) */
+  --color-line:     rgba(61, 122, 61, 0.18);    /* hairline from primary */
+  --color-surface:  #FFFDF5;                    /* warm white */
+
+  /* ── shadcn/ui semantic tokens ─────────────────────────────── */
+  --background:              #F5EFE0;
+  --foreground:              #1A1A1A;
+
+  --card:                    #FFFDF5;
+  --card-foreground:         #1A1A1A;
+
+  --popover:                 #FFFDF5;
+  --popover-foreground:      #1A1A1A;
+
+  --primary:                 #3D7A3D;
+  --primary-foreground:      #FFFDF5;
+
+  --secondary:               #E4EAD5;   /* soft sage-cream */
+  --secondary-foreground:    #1A2A1A;
+
+  --muted:                   #ECE4D0;   /* muted cream surface */
+  --muted-foreground:        #5A5F5A;
+
+  --accent:                  #67B04A;
+  --accent-foreground:       #1A1A1A;
+
+  --destructive:             #C13A3A;
+  --destructive-foreground:  #FFFDF5;
+
+  --border:                  rgba(61, 122, 61, 0.22);
+  --input:                   rgba(61, 122, 61, 0.22);
+  --ring:                    #3D7A3D;
+
+  --radius:                  0.6rem;
+}
+
+/* Expose the shadcn semantic tokens as Tailwind v4 theme colors so
+   utilities like `bg-primary`, `text-muted-foreground`, `border-border`
+   exist. Anything referenced here becomes a utility class. */
+@theme inline {
+  --color-background:             var(--background);
+  --color-foreground:             var(--foreground);
+
+  --color-card:                   var(--card);
+  --color-card-foreground:        var(--card-foreground);
+
+  --color-popover:                var(--popover);
+  --color-popover-foreground:     var(--popover-foreground);
+
+  --color-primary:                var(--primary);
+  --color-primary-foreground:     var(--primary-foreground);
+
+  --color-secondary:              var(--secondary);
+  --color-secondary-foreground:   var(--secondary-foreground);
+
+  --color-muted:                  var(--muted);
+  --color-muted-foreground:       var(--muted-foreground);
+
+  --color-accent:                 var(--accent);
+  --color-accent-foreground:      var(--accent-foreground);
+
+  --color-destructive:            var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+
+  --color-border:                 var(--border);
+  --color-input:                  var(--input);
+  --color-ring:                   var(--ring);
+
+  --radius-lg:                    var(--radius);
+  --radius-md:                    calc(var(--radius) - 2px);
+  --radius-sm:                    calc(var(--radius) - 4px);
+
+  --font-sans:    "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Playfair Display", ui-serif, Georgia, serif;
 }
 
 html, body, #root {
@@ -33,19 +119,19 @@ html, body, #root {
 
 body {
   margin: 0;
-  background: var(--color-bg);
-  color: var(--color-ink);
-  font-family: var(--font-sans);
+  background: var(--background);
+  color: var(--foreground);
+  font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 
 h1, h2, h3 {
-  font-family: var(--font-display);
-  color: var(--color-primary);
+  font-family: "Playfair Display", ui-serif, Georgia, serif;
+  color: var(--primary);
   letter-spacing: -0.01em;
 }
 
 a {
-  color: var(--color-primary);
+  color: var(--primary);
 }

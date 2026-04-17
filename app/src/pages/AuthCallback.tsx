@@ -9,7 +9,9 @@ import { homeForRole } from '../components/ProtectedRoute';
 export default function AuthCallback() {
   const navigate = useNavigate();
   const [params] = useSearchParams();
-  const { session, profile, loading } = useAuthStore();
+  const session = useAuthStore((s) => s.session);
+  const profile = useAuthStore((s) => s.profile);
+  const loading = useAuthStore((s) => s.loading);
 
   useEffect(() => {
     if (loading) return;
@@ -35,7 +37,7 @@ export default function AuthCallback() {
   }, [loading, session, profile, params, navigate]);
 
   return (
-    <main style={{ padding: '80px 24px', textAlign: 'center', color: 'var(--color-muted)' }}>
+    <main style={{ padding: '80px 24px', textAlign: 'center', color: 'var(--text-muted)' }}>
       Signing you in…
     </main>
   );

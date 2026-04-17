@@ -8,7 +8,7 @@ export default function TrainerPendingReview() {
       <PortalHeader portal="trainer" />
       <main style={{ maxWidth: 640, margin: '0 auto', padding: '48px 24px' }}>
         <h1 style={{ fontSize: 32, marginBottom: 12 }}>Application under review</h1>
-        <p style={{ color: 'var(--color-muted)', marginBottom: 24 }}>
+        <p style={{ color: 'var(--text-muted)', marginBottom: 24 }}>
           Thanks for applying to join Mane Line as a trainer. Our vetting team
           is reviewing your details — we'll email you the moment you're approved.
         </p>
@@ -19,7 +19,7 @@ export default function TrainerPendingReview() {
           borderRadius: 12,
           background: 'var(--color-surface)',
           fontSize: 14,
-          color: 'var(--color-muted)',
+          color: 'var(--text-muted)',
         }}>
           <strong style={{ color: 'var(--color-ink)', display: 'block', marginBottom: 6 }}>
             What happens next

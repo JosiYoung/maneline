@@ -7,61 +7,67 @@ interface AuthGateProps {
 }
 
 /**
- * AuthGate is the top-level routing hinge.
+ * Routes that do NOT require a session.
  *
- * Responsibilities:
+ * Exact matches are used for root/single-page paths; prefix matches
+ * ("/vet/") catch parametric routes. Keep this list narrow — adding
+ * an entry opens a hole in the auth wall.
+ */
+const PUBLIC_EXACT = new Set<string>([
+  '/',
+  '/login',
+  '/signup',
+  '/check-email',
+  '/auth/callback',
+]);
+const PUBLIC_PREFIXES = ['/vet/'];
+
+function isPublicPath(pathname: string): boolean {
+  if (PUBLIC_EXACT.has(pathname)) return true;
+  return PUBLIC_PREFIXES.some((p) => pathname.startsWith(p));
+}
+
+/**
+ * AuthGate — top-level routing hinge.
+ *
  *   1. Kick off the auth store init on first mount.
- *   2. While the session + profile are loading, render a neutral splash so
- *      child routes don't flash unauthenticated content.
- *   3. For paths that require no session (/, /login, /signup, /vet/:token,
- *      /auth/callback), pass the children through untouched.
- *   4. For any other path, if we have a session but no user_profiles row,
- *      redirect to /signup/complete-profile.
- *   5. If the session's role doesn't match the portal prefix, redirect
- *      to the role's home. Role-level authorization is re-checked in
- *      ProtectedRoute.
+ *   2. While the session + profile are loading, render a neutral splash
+ *      so child routes don't flash unauthenticated content.
+ *   3. For paths in PUBLIC_EXACT / PUBLIC_PREFIXES, pass children through.
+ *   4. For any other path, if we have a session but no user_profiles
+ *      row, redirect to /signup/complete-profile.
  *
- * This component does NOT enforce the trainer pending-review gate — that
- * lives in ProtectedRoute so it can bypass for /trainer/pending-review.
+ * Role-level authorization is re-checked in ProtectedRoute.
  */
 export function AuthGate({ children }: AuthGateProps) {
   const location = useLocation();
-  const { session, profile, loading, init } = useAuthStore();
+  const session = useAuthStore((s) => s.session);
+  const profile = useAuthStore((s) => s.profile);
+  const loading = useAuthStore((s) => s.loading);
+  const init = useAuthStore((s) => s.init);
 
   useEffect(() => {
     void init();
   }, [init]);
 
-  const pathname = location.pathname;
-  const isPublic =
-    pathname === '/' ||
-    pathname === '/login' ||
-    pathname === '/signup' ||
-    pathname === '/check-email' ||
-    pathname === '/auth/callback' ||
-    pathname.startsWith('/vet/');
-
   if (loading) {
     return (
-      <div style={{ padding: '80px 24px', textAlign: 'center', color: 'var(--color-muted)' }}>
+      <div style={{ padding: '80px 24px', textAlign: 'center', color: 'var(--text-muted)' }}>
         Loading…
       </div>
     );
   }
 
-  if (isPublic) {
+  if (isPublicPath(location.pathname)) {
     return <>{children}</>;
   }
 
-  // From here down, the route is "app-scoped" and requires a session.
   if (!session) {
-    const target = encodeURIComponent(pathname + location.search);
+    const target = encodeURIComponent(location.pathname + location.search);
     return <Navigate to={`/login?next=${target}`} replace />;
   }
 
-  // Signed in but no user_profiles row — hand off to complete-profile.
-  // Pre-Phase-0 users will land here.
-  const isCompleteProfile = pathname === '/signup/complete-profile';
+  const isCompleteProfile = location.pathname === '/signup/complete-profile';
   if (!profile && !isCompleteProfile) {
     return <Navigate to="/signup/complete-profile" replace />;
   }

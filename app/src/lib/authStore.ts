@@ -10,25 +10,31 @@ interface AuthState {
   profile: UserProfile | null;
   /** True until we've done the first getSession + profile fetch. */
   loading: boolean;
+
+  // ----- internals (exposed so tests / HMR can reset them) -----
+  /** Set to true once init() has completed — guards against double-subscribe. */
+  initialized: boolean;
+  /**
+   * While > 0, onAuthStateChange skips the profile re-fetch so in-flight
+   * async flows (e.g. PIN save, which triggers updateUser → auth event)
+   * don't unmount components mid-operation.
+   */
+  pauseDepth: number;
+
   /** One-time initialization — safe to call multiple times. */
   init: () => Promise<void>;
   /** Pull a fresh user_profiles row for the current session's user. */
   refreshProfile: () => Promise<void>;
-  /** Sign out and redirect logic is handled by the caller. */
+  /** Sign out and clear local state. Redirect is the caller's responsibility. */
   signOut: () => Promise<void>;
+
+  /**
+   * Run `fn` with auth-state-change refreshes paused. Guaranteed to decrement
+   * the pause counter even if `fn` throws. Prefer this over the raw
+   * pause/resume calls exported below.
+   */
+  withAuthPause: <T>(fn: () => Promise<T>) => Promise<T>;
 }
-
-let initialized = false;
-
-// When > 0, onAuthStateChange skips profile re-fetch to avoid
-// unmounting components mid-async-flow (e.g. PIN save).
-let pauseDepth = 0;
-
-/** Call before an operation that triggers onAuthStateChange (e.g. updateUser). */
-export function pauseAuthRefresh() { pauseDepth++; }
-
-/** Call when the operation is done (in a finally block). */
-export function resumeAuthRefresh() { pauseDepth = Math.max(0, pauseDepth - 1); }
 
 async function fetchProfile(userId: string): Promise<UserProfile | null> {
   // `user_profiles.user_id` is the FK to auth.users(id). The row's own
@@ -51,10 +57,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   session: null,
   profile: null,
   loading: true,
+  initialized: false,
+  pauseDepth: 0,
 
   init: async () => {
-    if (initialized) return;
-    initialized = true;
+    if (get().initialized) return;
+    set({ initialized: true });
 
     const { data } = await supabase.auth.getSession();
     const session = data.session;
@@ -62,9 +70,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ session, profile, loading: false });
 
     supabase.auth.onAuthStateChange(async (_event, nextSession) => {
-      if (pauseDepth > 0) {
-        // Only update the session token, keep the existing profile stable
-        // so in-flight component async flows aren't disrupted.
+      if (get().pauseDepth > 0) {
+        // Only update the session token. Keeping the existing profile stable
+        // means in-flight component async flows aren't disrupted.
         set({ session: nextSession });
         return;
       }
@@ -86,5 +94,14 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   signOut: async () => {
     await supabase.auth.signOut();
     set({ session: null, profile: null });
+  },
+
+  withAuthPause: async (fn) => {
+    set({ pauseDepth: get().pauseDepth + 1 });
+    try {
+      return await fn();
+    } finally {
+      set({ pauseDepth: Math.max(0, get().pauseDepth - 1) });
+    }
   },
 }));

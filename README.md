@@ -18,6 +18,7 @@ A full waitlist app for **Mane Line by Silver Lining Herbs**: a beautiful multi-
 | `client-context/CLIENT-ENGAGEMENT-SETUP-GUIDE.md` | Triple-redundancy ownership claim + verification drill | &mdash; |
 | `playbooks/CLIENT-ONBOARDING-PHASE-0-PREFLIGHT.md` | Reusable consultant playbook: Intelligence &rarr; Phase 0 &rarr; Coming Soon | &mdash; |
 | `playbooks/CLIENT-PRE-FLIGHT-CHECKLIST.md` | Client-facing checklist &mdash; hand to every new client at kickoff | &mdash; |
+| `docs/TECH_DEBT.md` | Grep-friendly `TECH_DEBT(phase-N)` marker convention &mdash; every knowing shortcut gets tagged in-source and listed in this file | &mdash; |
 | `README.md` | This file | &mdash; |
 
 Architecture in one picture:

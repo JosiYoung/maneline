@@ -10,9 +10,9 @@ import SignupV2 from './SignupV2';
  *   - SignupV1 (single-step legacy waitlist form) when flag = false
  *
  * Both flows submit via Supabase magic-link auth and end on /check-email.
- * The live /join route in the Worker remains unchanged either way — this
- * flag only governs the SPA's /signup experience, not the legacy waitlist
- * page.
+ * As of Phase 0 hardening, the Worker's /join route is a 301 redirect to
+ * /signup (the legacy inline HTML signup was deleted), so this flag is the
+ * only thing that governs which signup UI the user sees.
  */
 export default function SignupPage() {
   const { flags } = useFeatureFlags();
