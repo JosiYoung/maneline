@@ -1,0 +1,120 @@
+name = "maneline-coming-soon"
+main = "worker.js"
+compatibility_date = "2025-10-01"
+
+# -----------------------------------------------------------------
+# ENVIRONMENT VARIABLES
+#
+# Non-secret (safe to commit): goes in [vars] below.
+# Secrets (never commit): set via `npx wrangler secret put NAME`.
+#
+# The Worker expects these at runtime:
+#
+# Phase 0 (live today):
+#   SUPABASE_URL               (public — set in [vars])
+#   SUPABASE_ANON_KEY          (public — set in [vars] — RLS protects data)
+#   SUPABASE_WEBHOOK_SECRET    (SECRET — `wrangler secret put ...`)
+#   GOOGLE_APPS_SCRIPT_URL     (SECRET — `wrangler secret put ...`)
+#   GOOGLE_APPS_SCRIPT_SECRET  (SECRET — must match SHARED_SECRET in .gs)
+#
+# Phase 2 — Stripe (payments + trainer payouts):
+#   STRIPE_SECRET_KEY          (SECRET — starts with sk_live_ / sk_test_)
+#   STRIPE_WEBHOOK_SECRET      (SECRET — starts with whsec_)
+#
+# Phase 3 — Shopify (product catalog + checkout):
+#   SHOPIFY_STORE_DOMAIN       (public — e.g. silver-lining-herbs.myshopify.com —
+#                               can live in [vars] when we flip)
+#   SHOPIFY_STOREFRONT_TOKEN   (SECRET — unauth'd storefront API, read-only catalog)
+#   SHOPIFY_ADMIN_API_TOKEN    (SECRET — admin API, ONLY set if server-side
+#                               order/inventory mutations are needed)
+#
+# Phase 5 — HubSpot (CRM lifecycle sync + product analytics):
+#   HUBSPOT_PRIVATE_APP_TOKEN  (SECRET — "pat-na1-..." private-app token)
+#   HUBSPOT_PORTAL_ID          (public — 8-digit hub id; can live in [vars])
+#
+# All Phase 2/3/5 keys are PLACEHOLDER — do NOT set values yet. The mock
+# integrations in app/src/integrations/ report everything as mock until the
+# real credentials are provisioned. See docs/INTEGRATIONS.md.
+# -----------------------------------------------------------------
+
+[vars]
+SUPABASE_URL       = "https://vvzasinqfirzxfduenjx.supabase.co"
+SUPABASE_ANON_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ2emFzaW5xZmlyenhmZHVlbmp4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYyNzcyMTksImV4cCI6MjA5MTg1MzIxOX0.25G0D11vS6M5JqMC_Z2jE69RKfXsR_I9NAEMwxMPR4o"
+
+# Secrets — never paste here. Set at the CLI:
+#   npx wrangler secret put SUPABASE_WEBHOOK_SECRET
+#   npx wrangler secret put GOOGLE_APPS_SCRIPT_URL
+#   npx wrangler secret put GOOGLE_APPS_SCRIPT_SECRET
+
+# -----------------------------------------------------------------
+# KV — feature flags
+#
+# Namespace: maneline-flags (id below, created 2026-04-16 in the
+# maneline-coming-soon Worker's account). An earlier provisioning
+# attempt landed a same-named namespace in a different CF account; that
+# one is orphaned and can be ignored.
+# Keys the Worker reads:
+#   feature:signup_v2   — "false" disables the v2 two-step signup and
+#                         makes SignupPage fall back to the v1 single-step
+#                         form. Any other value (or missing key) = enabled.
+#
+# Flip the flag:
+#   npx wrangler kv key put --binding=FLAGS feature:signup_v2 false --remote
+#   npx wrangler kv key put --binding=FLAGS feature:signup_v2 true  --remote
+#   npx wrangler kv key delete --binding=FLAGS feature:signup_v2    --remote
+# -----------------------------------------------------------------
+
+[[kv_namespaces]]
+binding = "FLAGS"
+id      = "27bb09d5d64944e8be2a2b0733f542e7"
+
+# -----------------------------------------------------------------
+# STATIC ASSETS (Mane Line SPA)
+#
+# The React SPA lives in ./app and builds to ./app/dist. Workers Assets
+# serves that directory:
+#
+#   - `run_worker_first = true` makes the Worker handle EVERY request, so
+#     we can own specific paths like /webhook/sheets, /api/flags, /join,
+#     and /healthz, then delegate everything else to
+#     env.ASSETS.fetch(request).
+#   - `not_found_handling = "single-page-application"` makes the asset
+#     binding fall back to index.html for client-side routes (/app/*,
+#     /trainer/*, /admin/*, etc.).
+#   - `binding = "ASSETS"` exposes env.ASSETS inside the Worker.
+#
+# Before deploying: `cd app && npm run build` to produce app/dist.
+# -----------------------------------------------------------------
+
+[assets]
+directory = "./app/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = true
+
+# -----------------------------------------------------------------
+# WORKERS AI — binding for Phase 4 (Protocol Brain).
+#
+# The binding is live from Phase 0 so the skeleton compiles and the
+# /api/_integrations-health endpoint can report presence. Real usage
+# (classifySymptom, embedText, chatComplete) is wired in Phase 4;
+# today the src/integrations/workers-ai.ts wrappers return mocks.
+# -----------------------------------------------------------------
+[ai]
+binding = "AI"
+
+# -----------------------------------------------------------------
+# VECTORIZE — protocol/document embedding index for Phase 4.
+#
+# NOTE: `wrangler deploy` will FAIL until the index exists. Create it
+# before the next deploy:
+#
+#   npx wrangler vectorize create maneline-protocols \
+#     --dimensions=768 --metric=cosine
+#
+# 768 dims matches @cf/baai/bge-base-en-v1.5 (the default embedding
+# model used in workers-ai.ts). Revisit if we swap models.
+# -----------------------------------------------------------------
+[[vectorize]]
+binding    = "VECTORIZE_PROTOCOLS"
+index_name = "maneline-protocols"
