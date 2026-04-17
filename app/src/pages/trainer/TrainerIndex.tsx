@@ -1,31 +1,28 @@
-import { PortalHeader } from '../../components/PortalHeader';
-import { PinSettings } from '../../components/PinSettings';
+import { Routes, Route, Navigate } from "react-router-dom";
+import { TrainerLayout } from "../../components/trainer/TrainerLayout";
+import TrainerDashboard from "./TrainerDashboard";
+import TrainerAccount from "./TrainerAccount";
+import ClientsIndex from "./ClientsIndex";
+import TrainerComingSoon from "./TrainerComingSoon";
 
+// TrainerIndex — the trainer portal's route shell. Mounted under
+// <ProtectedRoute allow="trainer"> in App.tsx, so every child route here
+// is already role-gated; we don't re-check.
+//
+// Phase 2 Prompt 2.2 wires the shell + Dashboard. The remaining tabs
+// (Clients / Sessions / Payouts / Account) render TrainerComingSoon
+// until 2.3-2.6 swap each route target to its real feature component.
 export default function TrainerIndex() {
   return (
-    <>
-      <PortalHeader portal="trainer" />
-      <main style={{ maxWidth: 1000, margin: '0 auto', padding: '32px 24px' }}>
-        <h1 style={{ fontSize: 30, marginBottom: 8 }}>Trainer portal</h1>
-        <p style={{ color: 'var(--text-muted)', marginBottom: 24 }}>
-          Clients who've granted you access will show up here.
-        </p>
-
-        <div style={{
-          padding: 24,
-          border: '1px solid var(--color-line)',
-          borderRadius: 12,
-          background: 'var(--color-surface)',
-        }}>
-          <strong style={{ display: 'block', marginBottom: 6 }}>Phase 0 placeholder</strong>
-          <p style={{ color: 'var(--text-muted)', fontSize: 14, margin: 0 }}>
-            Routes like <code>/trainer/clients</code> and <code>/trainer/animals/:id</code>{' '}
-            will hang off this index. Access is governed by
-            <code>animal_access_grants</code> rows in the database.
-          </p>
-        </div>
-        <PinSettings />
-      </main>
-    </>
+    <TrainerLayout>
+      <Routes>
+        <Route index element={<TrainerDashboard />} />
+        <Route path="clients"  element={<ClientsIndex />} />
+        <Route path="sessions" element={<TrainerComingSoon title="Sessions" />} />
+        <Route path="payouts"  element={<TrainerComingSoon title="Payouts" />} />
+        <Route path="account"  element={<TrainerAccount />} />
+        <Route path="*" element={<Navigate to="/trainer" replace />} />
+      </Routes>
+    </TrainerLayout>
   );
 }
