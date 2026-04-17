@@ -85,8 +85,12 @@ SUPABASE_ANON_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 # -----------------------------------------------------------------
 
 [[kv_namespaces]]
+binding = "FLAGS"
+id      = "27bb09d5d64944e8be2a2b0733f542e7"
+
+[[kv_namespaces]]
 binding = "ML_RL"
-id      = "c324ea72ead849faa55e7b372fe97cc1"
+id      = "27bb09d5d64944e8be2a2b0733f542e7"
 
 # -----------------------------------------------------------------
 # R2 — private records bucket (Phase 1)
