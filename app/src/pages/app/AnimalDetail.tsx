@@ -21,6 +21,11 @@ import {
 import { readUrlFor } from "@/lib/uploads";
 import { notify } from "@/lib/toast";
 import { mapSupabaseError } from "@/lib/errors";
+import { SessionsList } from "@/components/trainer/SessionsList";
+import {
+  SESSIONS_QUERY_KEY,
+  listSessionsForAnimal,
+} from "@/lib/sessions";
 
 // AnimalDetail — /app/animals/:id
 //
@@ -75,11 +80,47 @@ export default function AnimalDetail() {
             unarchiving={unarchive.isPending}
           />
           {query.data.archived_at == null ? (
-            <RecentRecords animalId={query.data.id} animalName={query.data.barn_name} />
+            <>
+              <RecentRecords animalId={query.data.id} animalName={query.data.barn_name} />
+              <SessionsSection animalId={query.data.id} />
+            </>
           ) : null}
         </>
       )}
     </div>
+  );
+}
+
+function SessionsSection({ animalId }: { animalId: string }) {
+  // Owner-side session feed. RLS scopes rows to owner_id = auth.uid().
+  // Owners don't create sessions — trainers do — so there's no "log"
+  // CTA here. Approve-and-pay lands in Prompt 2.7.
+  const q = useQuery({
+    queryKey: [...SESSIONS_QUERY_KEY, "animal", animalId],
+    queryFn: () => listSessionsForAnimal(animalId),
+  });
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Sessions</CardTitle>
+      </CardHeader>
+      <CardContent>
+        {q.isLoading ? (
+          <div className="h-20 animate-pulse rounded-md bg-muted/40" />
+        ) : q.isError ? (
+          <p className="text-sm text-destructive">
+            Couldn't load sessions. Try refreshing the page.
+          </p>
+        ) : (
+          <SessionsList
+            sessions={q.data ?? []}
+            emptyText="No training sessions logged on this animal yet."
+            showAnimal={false}
+          />
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

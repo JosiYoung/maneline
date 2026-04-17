@@ -101,6 +101,9 @@ export default {
       if (url.pathname === '/api/animals/unarchive') {
         return handleAnimalUnarchive(request, env);
       }
+      if (url.pathname === '/api/sessions/archive') {
+        return handleSessionArchive(request, env);
+      }
       if (url.pathname === '/api/records/export-pdf') {
         return handleRecordsExport(request, env);
       }
@@ -1213,6 +1216,117 @@ async function handleAnimalArchiveToggle(request, env, action) {
   });
 
   return json({ animal: upd.data });
+}
+
+/* =============================================================
+   /api/sessions/archive
+   -------------------------------------------------------------
+   Trainer soft-archives one of their own training_sessions rows,
+   mirroring the animal archive flow. OAG §8 — no hard deletes.
+
+   Flow:
+     1. requireOwner — valid Supabase JWT.
+     2. Verify the caller is the trainer on the session AND still
+        has access to the animal — same contract RLS enforces on
+        writes, but we do it via service_role here so we can write
+        session_archive_events atomically (that table's RLS bars
+        client INSERT).
+     3. service_role UPDATE training_sessions.archived_at = now().
+     4. service_role INSERT session_archive_events audit row.
+     5. audit_log fire-and-forget.
+   ============================================================= */
+const SESSION_ARCHIVE_RATE = { limit: 20, windowSec: 60 };
+
+async function handleSessionArchive(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const rl = await rateLimitKv(
+    env.ML_RL,
+    `ratelimit:session_archive:${actorId}`,
+    SESSION_ARCHIVE_RATE
+  );
+  if (!rl.ok) {
+    return json(
+      { error: 'rate_limited', retry_after: rl.resetSec },
+      429,
+      { 'retry-after': String(rl.resetSec) }
+    );
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const sessionId = typeof body?.session_id === 'string' ? body.session_id : '';
+  const reasonRaw = typeof body?.reason === 'string' ? body.reason.trim() : '';
+  if (!sessionId) return json({ error: 'session_id required' }, 400);
+  if (reasonRaw.length === 0) return json({ error: 'reason_required' }, 400);
+
+  // Ownership check: trainer_id must match the caller AND the trainer
+  // must still have access to the animal. We use the caller's JWT on
+  // the SELECT so RLS narrows the read — if the row comes back, the
+  // trainer still holds a grant. An independent check avoids a TOCTOU
+  // where a service_role UPDATE would bypass the access helper.
+  const lookup = await supabaseSelect(
+    env,
+    'training_sessions',
+    `select=id,trainer_id,animal_id,status,archived_at&id=eq.${encodeURIComponent(sessionId)}`,
+    { userJwt: jwt }
+  );
+  const row = Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!row) return json({ error: 'not_found' }, 404);
+  if (row.trainer_id !== actorId) return json({ error: 'forbidden' }, 403);
+  if (row.archived_at) return json({ error: 'already_archived' }, 409);
+  if (row.status !== 'logged') {
+    // Archiving a session that's been approved/paid would strand a
+    // session_payment row pointing at an invisible session. Prompt 2.7
+    // +2.8 handle that lifecycle; for now, lock archive to 'logged'.
+    return json({ error: 'not_archivable', status: row.status }, 409);
+  }
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'training_sessions',
+    `id=eq.${encodeURIComponent(sessionId)}`,
+    { archived_at: new Date().toISOString() }
+  );
+  if (!upd.ok || !upd.data) {
+    return json({ error: 'session_update_failed', status: upd.status }, 500);
+  }
+
+  const evt = await supabaseInsertReturning(env, 'session_archive_events', {
+    session_id: sessionId,
+    actor_id:   actorId,
+    action:     'archive',
+    reason:     reasonRaw,
+  });
+  if (!evt.ok) {
+    console.warn('[session_archive] audit event insert failed', { status: evt.status });
+  }
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'trainer',
+    action:       'session.archive',
+    target_table: 'training_sessions',
+    target_id:    sessionId,
+    ip:           clientIp(request),
+    user_agent:   request.headers.get('user-agent') || null,
+    metadata:     { reason: reasonRaw },
+  });
+
+  return json({ session: upd.data });
 }
 
 /* =============================================================

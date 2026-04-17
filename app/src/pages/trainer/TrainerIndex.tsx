@@ -4,6 +4,9 @@ import TrainerDashboard from "./TrainerDashboard";
 import TrainerAccount from "./TrainerAccount";
 import ClientsIndex from "./ClientsIndex";
 import AnimalReadOnly from "./AnimalReadOnly";
+import SessionsIndex from "./SessionsIndex";
+import SessionNew from "./SessionNew";
+import SessionDetail from "./SessionDetail";
 import TrainerComingSoon from "./TrainerComingSoon";
 
 // TrainerIndex — the trainer portal's route shell. Mounted under
@@ -20,7 +23,9 @@ export default function TrainerIndex() {
         <Route index element={<TrainerDashboard />} />
         <Route path="clients"     element={<ClientsIndex />} />
         <Route path="animals/:id" element={<AnimalReadOnly />} />
-        <Route path="sessions"    element={<TrainerComingSoon title="Sessions" />} />
+        <Route path="sessions"          element={<SessionsIndex />} />
+        <Route path="sessions/new"      element={<SessionNew />} />
+        <Route path="sessions/:id"      element={<SessionDetail />} />
         <Route path="payouts"     element={<TrainerComingSoon title="Payouts" />} />
         <Route path="account"     element={<TrainerAccount />} />
         <Route path="*" element={<Navigate to="/trainer" replace />} />

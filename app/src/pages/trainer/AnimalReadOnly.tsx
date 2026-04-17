@@ -1,13 +1,19 @@
 import { Link, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ChevronLeft } from "lucide-react";
+import { ChevronLeft, Plus } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 import { VetRecordsList } from "@/components/trainer/VetRecordsList";
 import { MediaGallery } from "@/components/trainer/MediaGallery";
+import { SessionsList } from "@/components/trainer/SessionsList";
+import {
+  SESSIONS_QUERY_KEY,
+  listSessionsForAnimal,
+} from "@/lib/sessions";
 import {
   TRAINER_ANIMAL_MEDIA_QUERY_KEY,
   TRAINER_ANIMAL_QUERY_KEY,
@@ -51,6 +57,12 @@ export default function AnimalReadOnly() {
   const mediaQ = useQuery({
     queryKey: [...TRAINER_ANIMAL_MEDIA_QUERY_KEY, id],
     queryFn: () => listMediaForTrainer(id),
+    enabled: Boolean(id) && animalQ.isSuccess,
+  });
+
+  const sessionsQ = useQuery({
+    queryKey: [...SESSIONS_QUERY_KEY, "animal", id],
+    queryFn: () => listSessionsForAnimal(id),
     enabled: Boolean(id) && animalQ.isSuccess,
   });
 
@@ -122,14 +134,33 @@ export default function AnimalReadOnly() {
               {mediaQ.isSuccess && <MediaGallery media={mediaQ.data} />}
             </TabsContent>
 
-            <TabsContent value="sessions">
-              <Card>
-                <CardContent className="py-8 text-center text-sm text-muted-foreground">
-                  Session logging ships in the next drop. You'll be able
-                  to log rides, groundwork, and bodywork here — with or
-                  without payments wired up.
-                </CardContent>
-              </Card>
+            <TabsContent value="sessions" className="space-y-4">
+              <div className="flex justify-end">
+                <Button asChild size="sm">
+                  <Link to={`/trainer/sessions/new?animal=${id}`}>
+                    <Plus size={14} />
+                    Log a session
+                  </Link>
+                </Button>
+              </div>
+              {sessionsQ.isLoading && (
+                <div className="h-24 animate-pulse rounded-md bg-muted/40" />
+              )}
+              {sessionsQ.isError && (
+                <Card>
+                  <CardContent className="py-6 text-sm text-destructive">
+                    Couldn't load sessions. Try refreshing the page.
+                  </CardContent>
+                </Card>
+              )}
+              {sessionsQ.isSuccess && (
+                <SessionsList
+                  sessions={sessionsQ.data}
+                  detailHref={(sid) => `/trainer/sessions/${sid}`}
+                  emptyText="No sessions logged on this animal yet."
+                  showAnimal={false}
+                />
+              )}
             </TabsContent>
           </Tabs>
         </>
