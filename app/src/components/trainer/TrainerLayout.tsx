@@ -2,6 +2,7 @@ import { type ReactNode } from "react";
 import { PortalHeader } from "../PortalHeader";
 import { SidebarNav } from "./SidebarNav";
 import { MobileSidebar } from "./MobileSidebar";
+import { SupportWidget } from "../shared/SupportWidget";
 
 // TrainerLayout — wraps every /trainer/* route.
 //
@@ -32,6 +33,7 @@ export function TrainerLayout({ children }: { children: ReactNode }) {
           </main>
         </div>
       </div>
+      <SupportWidget />
     </div>
   );
 }

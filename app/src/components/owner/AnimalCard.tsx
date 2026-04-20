@@ -17,6 +17,7 @@ export type AnimalCardProps = {
   todaysSnapshot: {
     protocolCount: number;
     recentRecords: number;
+    dosesDueToday?: number;
   };
   hasFlag: boolean;
   onPress: (id: string) => void;
@@ -64,10 +65,20 @@ export function AnimalCard(props: AnimalCardProps) {
             {[capitalize(species), breed].filter(Boolean).join(" · ")}
           </p>
 
-          <div className="mt-2 flex items-center gap-2">
+          <div className="mt-2 flex flex-wrap items-center gap-2">
             <Chip size="sm" variant="flat" className="bg-muted text-foreground">
               Protocols: {todaysSnapshot.protocolCount} active
             </Chip>
+            {todaysSnapshot.dosesDueToday && todaysSnapshot.dosesDueToday > 0 ? (
+              <Chip
+                size="sm"
+                variant="flat"
+                className="bg-[#C4552B1A] text-[#C4552B]"
+              >
+                {todaysSnapshot.dosesDueToday} dose
+                {todaysSnapshot.dosesDueToday === 1 ? "" : "s"} due
+              </Chip>
+            ) : null}
             <Chip size="sm" variant="flat" className="bg-muted text-foreground">
               Records: {todaysSnapshot.recentRecords}
             </Chip>

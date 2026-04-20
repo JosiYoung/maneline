@@ -2,6 +2,9 @@ import { useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuthStore } from '../lib/authStore';
 import { homeForRole } from '../components/ProtectedRoute';
+import { claimInvitation } from '../lib/invitations';
+
+const PENDING_INVITE_KEY = 'maneline:pending-invite-token';
 
 // Where the magic-link redirects land. Supabase processes the URL fragment
 // via detectSessionInUrl=true in the createClient call; we just wait for the
@@ -19,8 +22,27 @@ export default function AuthCallback() {
     const next = params.get('next');
 
     if (!session) {
-      // Link was bad / expired — send them back to login with a hint.
       navigate('/login?error=invalid_link', { replace: true });
+      return;
+    }
+
+    // Phase 6.2 — consume a pending invite token if one was stashed before
+    // Supabase redirected us through the magic link. Claim-invite is
+    // idempotent; a stale token just errors and we continue to the portal.
+    const pendingInvite = sessionStorage.getItem(PENDING_INVITE_KEY);
+    if (pendingInvite) {
+      sessionStorage.removeItem(PENDING_INVITE_KEY);
+      void claimInvitation(pendingInvite)
+        .catch(() => { /* swallow — non-fatal */ })
+        .finally(() => {
+          if (next) {
+            navigate(next, { replace: true });
+          } else if (profile) {
+            navigate(homeForRole(profile.role), { replace: true });
+          } else {
+            navigate('/signup/complete-profile', { replace: true });
+          }
+        });
       return;
     }
 

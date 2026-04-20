@@ -4,6 +4,7 @@ import {
   Users,
   Calendar,
   DollarSign,
+  Receipt,
   User,
   type LucideIcon,
 } from "lucide-react";
@@ -23,6 +24,7 @@ const NAV_ITEMS: Item[] = [
   { to: "/trainer",          label: "Dashboard", Icon: LayoutDashboard, end: true },
   { to: "/trainer/clients",  label: "Clients",   Icon: Users },
   { to: "/trainer/sessions", label: "Sessions",  Icon: Calendar },
+  { to: "/trainer/expenses", label: "Expenses",  Icon: Receipt },
   { to: "/trainer/payouts",  label: "Payouts",   Icon: DollarSign },
   { to: "/trainer/account",  label: "Account",   Icon: User },
 ];

@@ -1,6 +1,14 @@
 import { NavLink } from "react-router-dom";
-import { Home, PawPrint, FileText, Users } from "lucide-react";
+import {
+  Home,
+  PawPrint,
+  FileText,
+  Users,
+  ShoppingBag,
+  MessageCircle,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useFeatureFlags } from "@/lib/featureFlags";
 
 // BottomNav — fixed bottom tab bar for the Owner Portal.
 //
@@ -15,14 +23,25 @@ type Tab = {
   end?: boolean;
 };
 
-const TABS: Tab[] = [
+const BASE_TABS: Tab[] = [
   { to: "/app",          label: "Today",    Icon: Home,     end: true },
   { to: "/app/animals",  label: "Animals",  Icon: PawPrint },
   { to: "/app/records",  label: "Records",  Icon: FileText },
   { to: "/app/trainers", label: "Trainers", Icon: Users },
+  { to: "/app/shop",     label: "Shop",     Icon: ShoppingBag },
 ];
 
+const CHAT_TAB: Tab = {
+  to: "/app/chat",
+  label: "Brain",
+  Icon: MessageCircle,
+};
+
 export function BottomNav() {
+  const { flags } = useFeatureFlags();
+  // Phase 4.4: chat tab is gated on feature:chat_v1 (fail-open).
+  const tabs: Tab[] = flags.chat_v1 ? [...BASE_TABS, CHAT_TAB] : BASE_TABS;
+
   return (
     <nav
       aria-label="Owner portal primary navigation"
@@ -33,7 +52,7 @@ export function BottomNav() {
       )}
     >
       <ul className="mx-auto flex max-w-screen-md items-stretch justify-around">
-        {TABS.map(({ to, label, Icon, end }) => (
+        {tabs.map(({ to, label, Icon, end }) => (
           <li key={to} className="flex-1">
             <NavLink
               to={to}

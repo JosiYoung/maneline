@@ -24,6 +24,7 @@ import {
   type FeesResponse,
   type TrainerFeeOverride,
 } from "@/lib/platformFees";
+import { searchAdminUsers } from "@/lib/admin";
 
 // PlatformFeesIndex — /admin/settings/fees
 //
@@ -175,18 +176,43 @@ function TrainerOverridesCard({
   onChanged: () => void;
 }) {
   const [editing, setEditing] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const existingIds = useMemo(
+    () => new Set(overrides.map((o) => o.trainer_id)),
+    [overrides],
+  );
 
   return (
     <Card>
-      <CardHeader>
+      <CardHeader className="flex flex-row items-center justify-between">
         <CardTitle>Trainer overrides</CardTitle>
+        <Button
+          size="sm"
+          onClick={() => setAdding(true)}
+          disabled={adding}
+        >
+          Add override
+        </Button>
       </CardHeader>
       <CardContent>
-        {overrides.length === 0 ? (
+        {adding ? (
+          <div className="mb-4">
+            <AddOverrideForm
+              excludeTrainerIds={existingIds}
+              onCancel={() => setAdding(false)}
+              onSaved={() => {
+                setAdding(false);
+                onChanged();
+              }}
+            />
+          </div>
+        ) : null}
+        {overrides.length === 0 && !adding ? (
           <p className="text-sm text-muted-foreground">
             No overrides set. Every trainer currently pays the default fee.
+            Use <strong>Add override</strong> above to carve out an exception.
           </p>
-        ) : (
+        ) : overrides.length === 0 ? null : (
           <Table>
             <TableHeader>
               <TableRow>
@@ -239,6 +265,131 @@ function TrainerOverridesCard({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function AddOverrideForm({
+  excludeTrainerIds,
+  onSaved,
+  onCancel,
+}: {
+  excludeTrainerIds: Set<string>;
+  onSaved: () => void;
+  onCancel: () => void;
+}) {
+  const [trainerId, setTrainerId] = useState("");
+  const [pct, setPct] = useState("");
+  const [reason, setReason] = useState("");
+
+  const trainersQ = useQuery({
+    queryKey: ["admin", "users", "trainers"] as const,
+    queryFn: () => searchAdminUsers({ role: "trainer" }),
+  });
+
+  const candidates = useMemo(() => {
+    const rows = trainersQ.data?.rows ?? [];
+    return rows.filter(
+      (u) => u.status === "active" && !excludeTrainerIds.has(u.user_id),
+    );
+  }, [trainersQ.data, excludeTrainerIds]);
+
+  const mutation = useMutation({
+    mutationFn: (input: { trainer_id: string; bps: number; reason: string }) =>
+      setTrainerOverride({
+        trainer_id: input.trainer_id,
+        fee_override_bps: input.bps,
+        reason: input.reason.trim() || null,
+      }),
+    onSuccess: () => {
+      notify.success("Override added.");
+      onSaved();
+    },
+    onError: (err) => notify.error(mapSupabaseError(err as Error)),
+  });
+
+  function onSave() {
+    if (!trainerId) {
+      notify.error("Pick a trainer.");
+      return;
+    }
+    const bps = percentStringToBps(pct);
+    if (bps === null) {
+      notify.error("Enter a percentage between 0 and 100.");
+      return;
+    }
+    mutation.mutate({ trainer_id: trainerId, bps, reason });
+  }
+
+  return (
+    <div className="rounded-md border border-border bg-muted/20 p-4">
+      <div className="grid gap-3 sm:grid-cols-[1fr_120px_1fr_auto]">
+        <div className="space-y-1.5">
+          <Label htmlFor="add-trainer">Trainer</Label>
+          <select
+            id="add-trainer"
+            value={trainerId}
+            onChange={(e) => setTrainerId(e.target.value)}
+            className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+            disabled={trainersQ.isLoading}
+          >
+            <option value="">
+              {trainersQ.isLoading
+                ? "Loading trainers…"
+                : candidates.length === 0
+                ? "No eligible trainers"
+                : "Select a trainer…"}
+            </option>
+            {candidates.map((u) => (
+              <option key={u.user_id} value={u.user_id}>
+                {u.display_name || u.email} ({u.email})
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="add-pct">Fee %</Label>
+          <div className="relative">
+            <Input
+              id="add-pct"
+              type="number"
+              inputMode="decimal"
+              step="0.01"
+              min={0}
+              max={100}
+              value={pct}
+              onChange={(e) => setPct(e.target.value)}
+              className="pr-7"
+            />
+            <span className="pointer-events-none absolute inset-y-0 right-2 flex items-center text-xs text-muted-foreground">
+              %
+            </span>
+          </div>
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="add-reason">Reason (optional)</Label>
+          <Input
+            id="add-reason"
+            type="text"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="VIP, launch partner, etc."
+          />
+        </div>
+        <div className="flex items-end gap-2">
+          <Button onClick={onSave} disabled={mutation.isPending}>
+            {mutation.isPending ? "Saving…" : "Save"}
+          </Button>
+          <Button variant="outline" onClick={onCancel} disabled={mutation.isPending}>
+            Cancel
+          </Button>
+        </div>
+      </div>
+      {trainersQ.isError ? (
+        <p className="mt-2 text-xs text-destructive">
+          Couldn't load trainer list. {mapSupabaseError(trainersQ.error as Error)}
+        </p>
+      ) : null}
+    </div>
   );
 }
 

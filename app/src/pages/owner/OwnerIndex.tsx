@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate } from "react-router-dom";
 import { OwnerLayout } from "../../components/owner/OwnerLayout";
+import { WelcomeTour } from "../../components/WelcomeTour";
 
 import TodayView     from "../app/TodayView";
 import AnimalsIndex  from "../app/AnimalsIndex";
@@ -12,6 +13,12 @@ import TrainersIndex from "../app/TrainersIndex";
 import TrainerInvite from "../app/TrainerInvite";
 import Settings      from "../app/Settings";
 import SessionApproveAndPay from "../app/SessionApproveAndPay";
+import ShopIndex     from "./shop/ShopIndex";
+import ProductDetail from "./shop/ProductDetail";
+import OrderReturn   from "./orders/OrderReturn";
+import OrdersIndex   from "./orders/OrdersIndex";
+import ChatIndex        from "../app/chat/ChatIndex";
+import ConversationView from "../app/chat/ConversationView";
 
 // OwnerIndex — /app/* dispatcher. Wraps every owner route in OwnerLayout
 // (HeroUIProvider + PortalHeader + BottomNav) and hands off to the page
@@ -31,10 +38,17 @@ export default function OwnerIndex() {
         <Route path="trainers"          element={<TrainersIndex />} />
         <Route path="trainers/invite"   element={<TrainerInvite />} />
         <Route path="sessions/:id/pay"  element={<SessionApproveAndPay />} />
+        <Route path="shop"              element={<ShopIndex />} />
+        <Route path="shop/:handle"      element={<ProductDetail />} />
+        <Route path="orders"            element={<OrdersIndex />} />
+        <Route path="orders/:id"        element={<OrderReturn />} />
+        <Route path="chat"                         element={<ChatIndex />} />
+        <Route path="chat/:conversationId"         element={<ConversationView />} />
         <Route path="settings"          element={<Settings />} />
         {/* Unknown /app/* path falls back to Today. */}
         <Route path="*"                 element={<Navigate to="/app" replace />} />
       </Routes>
+      <WelcomeTour />
     </OwnerLayout>
   );
 }

@@ -1,12 +1,14 @@
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronLeft, ExternalLink, FileText, Pencil } from "lucide-react";
+import { ChevronLeft, ExternalLink, FileText, Pencil, Plus } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ArchiveAnimalDialog } from "@/components/owner/ArchiveAnimalDialog";
 import { RecordsUploadDialog } from "@/components/owner/RecordsUploadDialog";
+import { ShareRecordDialog } from "@/components/owner/ShareRecordDialog";
 import {
   ANIMALS_QUERY_KEY,
   getAnimal,
@@ -26,6 +28,13 @@ import {
   SESSIONS_QUERY_KEY,
   listSessionsForAnimal,
 } from "@/lib/sessions";
+import { ExpensesList } from "@/components/expenses/ExpensesList";
+import { ExpenseForm } from "@/components/expenses/ExpenseForm";
+import {
+  EXPENSES_QUERY_KEY,
+  listExpensesForAnimal,
+} from "@/lib/expenses";
+import { ProtocolsSection } from "@/components/owner/ProtocolsSection";
 
 // AnimalDetail — /app/animals/:id
 //
@@ -82,7 +91,9 @@ export default function AnimalDetail() {
           {query.data.archived_at == null ? (
             <>
               <RecentRecords animalId={query.data.id} animalName={query.data.barn_name} />
+              <ProtocolsSection animalId={query.data.id} role="owner" />
               <SessionsSection animalId={query.data.id} />
+              <ExpensesSection animalId={query.data.id} />
             </>
           ) : null}
         </>
@@ -125,6 +136,57 @@ function SessionsSection({ animalId }: { animalId: string }) {
   );
 }
 
+function ExpensesSection({ animalId }: { animalId: string }) {
+  const [adding, setAdding] = useState(false);
+
+  const q = useQuery({
+    queryKey: [...EXPENSES_QUERY_KEY, "animal", animalId],
+    queryFn: () => listExpensesForAnimal(animalId, { includeArchived: true }),
+  });
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between gap-3 space-y-0">
+        <CardTitle>Expenses</CardTitle>
+        {!adding && (
+          <Button size="sm" onClick={() => setAdding(true)}>
+            <Plus size={14} />
+            Add expense
+          </Button>
+        )}
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {adding && (
+          <Card className="border-accent/40 bg-accent/5">
+            <CardContent className="py-4">
+              <ExpenseForm
+                animalId={animalId}
+                recorderRole="owner"
+                onCreated={() => setAdding(false)}
+                onCancel={() => setAdding(false)}
+              />
+            </CardContent>
+          </Card>
+        )}
+
+        {q.isLoading ? (
+          <div className="h-20 animate-pulse rounded-md bg-muted/40" />
+        ) : q.isError ? (
+          <p className="text-sm text-destructive">
+            Couldn't load expenses. Try refreshing the page.
+          </p>
+        ) : (
+          <ExpensesList
+            expenses={q.data ?? []}
+            showAnimal={false}
+            emptyText="No expenses logged on this animal yet."
+          />
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function RecentRecords({
   animalId,
   animalName,
@@ -145,6 +207,7 @@ function RecentRecords({
         <CardTitle>Recent records</CardTitle>
         <div className="flex items-center gap-2">
           <RecordsUploadDialog initialAnimalId={animalId} />
+          <ShareRecordDialog animalId={animalId} />
           <Button asChild size="sm" variant="outline">
             <Link to={`/app/records?animal=${animalId}`}>See all</Link>
           </Button>

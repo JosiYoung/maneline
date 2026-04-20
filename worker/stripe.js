@@ -207,3 +207,61 @@ export async function createPaymentIntent(env, {
 export function retrievePaymentIntent(env, paymentIntentId) {
   return stripeFetch(env, 'GET', `/payment_intents/${encodeURIComponent(paymentIntentId)}`);
 }
+
+/**
+ * POST /v1/refunds — Phase 5.5 admin refund action. The shop orders are
+ * destination charges (`transfer_data.destination` on the PaymentIntent),
+ * so the refund is created on the platform account with
+ * `reverse_transfer=true` + `refund_application_fee=true`. No
+ * `Stripe-Account` header is used here (that would target the Connect
+ * account, which does NOT own the underlying charge for destination
+ * charges). Idempotency-Key keyed on `refund:{order_id}:{attempt_n}`
+ * makes retries safe.
+ */
+export async function createRefund(env, {
+  chargeId,
+  paymentIntentId,
+  amountCents,
+  idempotencyKey,
+  reverseTransfer = true,
+  refundApplicationFee = true,
+  metadata = {},
+}) {
+  if (!isStripeConfigured(env)) {
+    return { ok: false, status: 501, data: null, error: 'stripe_not_configured' };
+  }
+  const body = {};
+  if (paymentIntentId) body.payment_intent = paymentIntentId;
+  else if (chargeId) body.charge = chargeId;
+  else return { ok: false, status: 400, data: null, error: 'missing_charge_target' };
+  if (amountCents !== undefined && amountCents !== null) body.amount = amountCents;
+  if (reverseTransfer) body.reverse_transfer = 'true';
+  if (refundApplicationFee) body.refund_application_fee = 'true';
+  if (metadata && Object.keys(metadata).length) body.metadata = metadata;
+
+  const headers = {
+    Authorization: basicAuthHeader(env.STRIPE_SECRET_KEY),
+    'Stripe-Version': STRIPE_API_VERSION,
+    'content-type': 'application/x-www-form-urlencoded',
+  };
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+
+  const res = await fetch(`${STRIPE_API_BASE}/refunds`, {
+    method: 'POST',
+    headers,
+    body: encodeForm(body),
+  });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      data,
+      error: data?.error?.code || data?.error?.type || 'stripe_request_failed',
+      message: data?.error?.message ?? null,
+    };
+  }
+  return { ok: true, status: res.status, data };
+}

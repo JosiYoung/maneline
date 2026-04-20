@@ -15,6 +15,10 @@ import {
   attentionAnimalIds,
   listAnimals,
 } from "@/lib/animals";
+import {
+  SUPPLEMENT_DOSES_QUERY_KEY,
+  countDosesDueToday,
+} from "@/lib/protocols";
 import { notify } from "@/lib/toast";
 import { mapSupabaseError } from "@/lib/errors";
 
@@ -52,7 +56,16 @@ export default function TodayView() {
   });
 
   const animals = animalsQuery.data ?? [];
+  const animalIds = useMemo(() => animals.map((a) => a.id), [animals]);
+
+  const dosesDueQuery = useQuery({
+    queryKey: [...SUPPLEMENT_DOSES_QUERY_KEY, "due-today", animalIds],
+    queryFn: () => countDosesDueToday(animalIds),
+    enabled: animalIds.length > 0,
+  });
+
   const attentionSet = attentionQuery.data ?? new Set<string>();
+  const dosesDueMap = dosesDueQuery.data ?? {};
   const attentionCount = useMemo(
     () => animals.filter((a) => attentionSet.has(a.id)).length,
     [animals, attentionSet]
@@ -105,7 +118,11 @@ export default function TodayView() {
                 species={a.species}
                 breed={a.breed}
                 photoUrl={null}
-                todaysSnapshot={{ protocolCount: 0, recentRecords: 0 }}
+                todaysSnapshot={{
+                  protocolCount: 0,
+                  recentRecords: 0,
+                  dosesDueToday: dosesDueMap[a.id] ?? 0,
+                }}
                 hasFlag={attentionSet.has(a.id)}
                 onPress={(id) => navigate(`/app/animals/${id}`)}
               />

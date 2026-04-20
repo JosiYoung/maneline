@@ -30,6 +30,14 @@
 //             stripe_connect_accounts, platform_settings,
 //             stripe_webhook_events, session_archive_events
 //                                    (Phase 2 / Prompt 2.9)
+//           + products, shopify_sync_cursor, orders,
+//             order_line_items, expenses, expense_archive_events
+//                                    (Phase 3 / Prompt 3.9)
+//             Zero card data. Stripe ids are opaque strings;
+//             Shopify image URLs are public CDN links.
+//           + invitations, on_call_schedule, sms_dispatches,
+//             stripe_subscriptions   (Phase 6 / Prompt 6.7)
+//             Manifest version bumps to "6.0".
 //
 // Layer 2 guarantee: open-format (JSON + CSV), standard Git,
 // zero ManeLine tooling required to read. If Supabase AND
@@ -78,8 +86,8 @@ function toCsv(rows: Record<string, unknown>[]): string {
   return `${header}\n${body}\n`;
 }
 
-async function loadTable(client: SupabaseClient, table: string) {
-  const { data, error } = await client.from(table).select("*").order("created_at", { ascending: true });
+async function loadTable(client: SupabaseClient, table: string, sortBy = "created_at") {
+  const { data, error } = await client.from(table).select("*").order(sortBy, { ascending: true });
   if (error) throw new Error(`Supabase read failed for ${table}: ${error.message}`);
   return data ?? [];
 }
@@ -180,10 +188,77 @@ Deno.serve(async (_req) => {
       "platform_settings",
       "stripe_webhook_events",
       "session_archive_events",
+      // Phase 3 (Prompt 3.9) — Silver Lining marketplace + expenses.
+      // Zero card data here too: `orders` stores opaque Stripe session /
+      // payment_intent / charge ids + amounts, `products` stores
+      // Shopify variant ids + public image URLs. `expenses` is a
+      // plain ledger of owner/trainer-reported charges.
+      "products",
+      "shopify_sync_cursor",
+      "orders",
+      "order_line_items",
+      "expenses",
+      "expense_archive_events",
+      // Phase 3.5 (P0 catch-up) — supplement protocol tracker.
+      // protocols is seeded from supabase/seeds/protocols.sql; the
+      // catalog will grow once SLH's real content replaces placeholders
+      // before Phase 4 launch. animal_protocols + supplement_doses
+      // carry per-animal dosing + append-only dose confirmations.
+      "protocols",
+      "animal_protocols",
+      "supplement_doses",
+      // Phase 4 — Protocol Brain (Workers AI + Vectorize).
+      // conversations groups owner chat threads; chatbot_runs is the
+      // append-only per-turn audit row (user text, assistant text,
+      // retrieved protocol ids, fallback/emergency flags, latency).
+      "conversations",
+      "chatbot_runs",
+      // Phase 5 — Admin portal + Vet View + HubSpot sync.
+      // audit_log is append-only (OAG §3) — every admin read and
+      // every scoped vet_view fetch stamps a row. support_tickets
+      // also mirrors to Sheets L1 for triple redundancy.
+      // order_refunds is service_role-only; owners see refund state
+      // joined onto their own orders. vet_share_tokens carries the
+      // 32-byte opaque token + scope jsonb + usage counters.
+      // hubspot_sync_log is the successful-send audit; the
+      // pending_hubspot_syncs queue carries attempts + dead-letters.
+      "audit_log",
+      "support_tickets",
+      "order_refunds",
+      "vet_share_tokens",
+      "hubspot_sync_log",
+      "pending_hubspot_syncs",
+      // Phase 6 — closed-beta onboarding + emergency paging + auto-ship.
+      // invitations carries the 32-byte magic-link token; on_call_schedule
+      // is the admin-only paging roster; sms_dispatches is the append-only
+      // Twilio log (message_sid, status, cost_cents); stripe_subscriptions
+      // is the read-through cache of Stripe auto-ship subs (source of truth
+      // stays in Stripe). No card data in any of these — Twilio cost is
+      // denormalized cents only; Stripe ids are opaque strings.
+      "invitations",
+      "on_call_schedule",
+      "sms_dispatches",
+      "stripe_subscriptions",
     ] as const;
 
+    // Per-table sort override. Most tables sort by created_at (default).
+    // - shopify_sync_cursor + platform_settings are singleton rows with no
+    //   created_at — sort by `id` so the query succeeds.
+    // - stripe_webhook_events uses `received_at` (when Stripe first delivered
+    //   the webhook) rather than created_at; see Phase 2 migration.
+    const SORT_BY: Partial<Record<(typeof TABLES)[number], string>> = {
+      shopify_sync_cursor: "id",
+      platform_settings: "id",
+      stripe_webhook_events: "received_at",
+      // audit_log uses `occurred_at` (see 00013 migration). The other five
+      // Phase 5 tables use the default created_at.
+      audit_log: "occurred_at",
+    };
+
     const tableData: Record<string, Record<string, unknown>[]> = {};
-    const results = await Promise.all(TABLES.map((t) => loadTable(client, t)));
+    const results = await Promise.all(
+      TABLES.map((t) => loadTable(client, t, SORT_BY[t] ?? "created_at")),
+    );
     for (let i = 0; i < TABLES.length; i++) tableData[TABLES[i]] = results[i];
 
     const yyyy = startedAt.getUTCFullYear();
@@ -197,7 +272,7 @@ Deno.serve(async (_req) => {
       source: "supabase",
       tables: [...TABLES],
       generator: "maneline-nightly-backup",
-      version: "2.0",
+      version: "6.0",
     };
     for (const t of TABLES) manifest[`${t}_count`] = tableData[t].length;
 

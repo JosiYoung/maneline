@@ -2,6 +2,7 @@ import { type ReactNode } from "react";
 import { HeroUIProvider } from "@heroui/react";
 import { PortalHeader } from "../PortalHeader";
 import { BottomNav } from "./BottomNav";
+import { SupportWidget } from "../shared/SupportWidget";
 
 // OwnerLayout — wraps every /app/* route.
 //
@@ -18,6 +19,7 @@ export function OwnerLayout({ children }: { children: ReactNode }) {
           {children}
         </main>
         <BottomNav />
+        <SupportWidget />
       </div>
     </HeroUIProvider>
   );

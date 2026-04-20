@@ -27,6 +27,18 @@ env.*.txt
 supabase/.temp/
 supabase/.branches/
 
+# --- Closed-beta onboarding CSV ---
+# Contains real invitee emails + phones. Copy from the .example
+# file, fill in rows locally, and run scripts/import-beta-invites.mjs.
+supabase/seed/beta-invites.csv
+scripts/.env
+scripts/.env.*
+
+# --- Sibling prototype project (separate repo) ---
+# Scroll-scrub hero prototype for silverliningherbs.com — lives in its
+# own standalone repo; only scratch-present here during local work.
+horse-nutrition-hero/
+
 # --- Node / npm (in case you ever add a package.json) ---
 node_modules/
 npm-debug.log*

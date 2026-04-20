@@ -51,6 +51,7 @@ export interface Database {
           email: string;
           status: UserStatus;
           has_pin: boolean;
+          welcome_tour_seen_at: string | null;  // Phase 6 — 00016 migration
           created_at: string;
           updated_at: string;
         };
@@ -62,6 +63,7 @@ export interface Database {
           email: string;
           status?: UserStatus;
           has_pin?: boolean;
+          welcome_tour_seen_at?: string | null;
           created_at?: string;
           updated_at?: string;
         };
@@ -78,6 +80,7 @@ export interface Database {
           sex: AnimalSex | null;
           year_born: number | null;
           discipline: string | null;
+          vet_phone: string | null;      // Phase 4 — 00012 migration
           archived_at: string | null;   // Phase 1 — 00005 migration
           created_at: string;
           updated_at: string;
@@ -91,6 +94,7 @@ export interface Database {
           sex?: AnimalSex | null;
           year_born?: number | null;
           discipline?: string | null;
+          vet_phone?: string | null;
           archived_at?: string | null;
           created_at?: string;
           updated_at?: string;
@@ -440,6 +444,336 @@ export interface Database {
       // omitted — both are service_role-only (no client policy grants
       // select to authenticated). Adding Row types would invite the SPA
       // to query tables it cannot read.
+
+      // =====================================================
+      // Phase 3 — marketplace + expenses (00009, 00010)
+      // =====================================================
+      products: {
+        Row: {
+          id: string;
+          shopify_product_id: string;
+          shopify_variant_id: string;
+          handle: string;
+          sku: string;
+          title: string;
+          description: string | null;
+          image_url: string | null;
+          price_cents: number;
+          currency: string;
+          category: string | null;
+          inventory_qty: number | null;
+          available: boolean;
+          protocol_mapping: Json | null;
+          last_synced_at: string;
+          created_at: string;
+          updated_at: string;
+          archived_at: string | null;
+        };
+        Insert: {
+          id?: string;
+          shopify_product_id: string;
+          shopify_variant_id: string;
+          handle: string;
+          sku: string;
+          title: string;
+          description?: string | null;
+          image_url?: string | null;
+          price_cents: number;
+          currency?: string;
+          category?: string | null;
+          inventory_qty?: number | null;
+          available?: boolean;
+          protocol_mapping?: Json | null;
+          last_synced_at?: string;
+          created_at?: string;
+          updated_at?: string;
+          archived_at?: string | null;
+        };
+        Update: Partial<Database['public']['Tables']['products']['Insert']>;
+        Relationships: [];
+      };
+      orders: {
+        Row: {
+          id: string;
+          owner_id: string;
+          stripe_checkout_session_id: string | null;
+          stripe_payment_intent_id: string | null;
+          stripe_charge_id: string | null;
+          stripe_receipt_url: string | null;
+          shopify_order_id: string | null;
+          subtotal_cents: number;
+          tax_cents: number;
+          shipping_cents: number;
+          total_cents: number;
+          currency: string;
+          status:
+            | 'pending_payment'
+            | 'paid'
+            | 'failed'
+            | 'refunded'
+            | 'awaiting_merchant_setup';
+          failure_code: string | null;
+          failure_message: string | null;
+          source: 'shop' | 'in_expense' | 'chat';
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          owner_id: string;
+          stripe_checkout_session_id?: string | null;
+          stripe_payment_intent_id?: string | null;
+          stripe_charge_id?: string | null;
+          stripe_receipt_url?: string | null;
+          shopify_order_id?: string | null;
+          subtotal_cents: number;
+          tax_cents?: number;
+          shipping_cents?: number;
+          total_cents: number;
+          currency?: string;
+          status?:
+            | 'pending_payment'
+            | 'paid'
+            | 'failed'
+            | 'refunded'
+            | 'awaiting_merchant_setup';
+          failure_code?: string | null;
+          failure_message?: string | null;
+          source?: 'shop' | 'in_expense' | 'chat';
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Database['public']['Tables']['orders']['Insert']>;
+        Relationships: [];
+      };
+      order_line_items: {
+        Row: {
+          id: string;
+          order_id: string;
+          product_id: string | null;
+          shopify_variant_id: string;
+          sku_snapshot: string;
+          title_snapshot: string;
+          unit_price_cents: number;
+          quantity: number;
+          line_total_cents: number;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          order_id: string;
+          product_id?: string | null;
+          shopify_variant_id: string;
+          sku_snapshot: string;
+          title_snapshot: string;
+          unit_price_cents: number;
+          quantity: number;
+          line_total_cents: number;
+          created_at?: string;
+        };
+        Update: Partial<Database['public']['Tables']['order_line_items']['Insert']>;
+        Relationships: [];
+      };
+      expenses: {
+        Row: {
+          id: string;
+          animal_id: string;
+          recorder_id: string;
+          recorder_role: 'owner' | 'trainer';
+          category:
+            | 'feed' | 'tack' | 'vet' | 'board' | 'farrier'
+            | 'supplement' | 'travel' | 'show' | 'other';
+          occurred_on: string;
+          amount_cents: number;
+          currency: string;
+          vendor: string | null;
+          notes: string | null;
+          order_id: string | null;
+          product_id: string | null;
+          receipt_r2_object_id: string | null;
+          created_at: string;
+          updated_at: string;
+          archived_at: string | null;
+        };
+        Insert: {
+          id?: string;
+          animal_id: string;
+          recorder_id: string;
+          recorder_role: 'owner' | 'trainer';
+          category:
+            | 'feed' | 'tack' | 'vet' | 'board' | 'farrier'
+            | 'supplement' | 'travel' | 'show' | 'other';
+          occurred_on: string;
+          amount_cents: number;
+          currency?: string;
+          vendor?: string | null;
+          notes?: string | null;
+          order_id?: string | null;
+          product_id?: string | null;
+          receipt_r2_object_id?: string | null;
+          created_at?: string;
+          updated_at?: string;
+          archived_at?: string | null;
+        };
+        Update: Partial<Database['public']['Tables']['expenses']['Insert']>;
+        Relationships: [];
+      };
+
+      // =====================================================
+      // Phase 3.5 + Phase 4 — protocols + chat (00012)
+      // =====================================================
+      protocols: {
+        Row: {
+          id: string;
+          number: string | null;
+          name: string;
+          description: string | null;
+          use_case: string | null;
+          body_md: string | null;
+          associated_sku_placeholder: string | null;
+          product_id: string | null;
+          category: string | null;
+          keywords: string[];
+          linked_sku_codes: string[];
+          published: boolean;
+          embed_status: 'pending' | 'synced' | 'failed';
+          embed_synced_at: string | null;
+          created_at: string;
+          updated_at: string;
+          archived_at: string | null;
+        };
+        Insert: {
+          id?: string;
+          number?: string | null;
+          name: string;
+          description?: string | null;
+          use_case?: string | null;
+          body_md?: string | null;
+          associated_sku_placeholder?: string | null;
+          product_id?: string | null;
+          category?: string | null;
+          keywords?: string[];
+          linked_sku_codes?: string[];
+          published?: boolean;
+          embed_status?: 'pending' | 'synced' | 'failed';
+          embed_synced_at?: string | null;
+          created_at?: string;
+          updated_at?: string;
+          archived_at?: string | null;
+        };
+        Update: Partial<Database['public']['Tables']['protocols']['Insert']>;
+        Relationships: [];
+      };
+      animal_protocols: {
+        Row: {
+          id: string;
+          animal_id: string;
+          protocol_id: string;
+          started_on: string;
+          ended_on: string | null;
+          dose_instructions: string | null;
+          notes: string | null;
+          created_by: string;
+          created_at: string;
+          updated_at: string;
+          archived_at: string | null;
+        };
+        Insert: {
+          id?: string;
+          animal_id: string;
+          protocol_id: string;
+          started_on: string;
+          ended_on?: string | null;
+          dose_instructions?: string | null;
+          notes?: string | null;
+          created_by: string;
+          created_at?: string;
+          updated_at?: string;
+          archived_at?: string | null;
+        };
+        Update: Partial<Database['public']['Tables']['animal_protocols']['Insert']>;
+        Relationships: [];
+      };
+      supplement_doses: {
+        Row: {
+          id: string;
+          animal_protocol_id: string;
+          animal_id: string;
+          dosed_on: string;
+          dosed_at_time: string | null;
+          confirmed_by: string;
+          confirmed_role: 'owner' | 'trainer';
+          notes: string | null;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          animal_protocol_id: string;
+          animal_id: string;
+          dosed_on?: string;
+          dosed_at_time?: string | null;
+          confirmed_by: string;
+          confirmed_role: 'owner' | 'trainer';
+          notes?: string | null;
+          created_at?: string;
+        };
+        Update: Partial<Database['public']['Tables']['supplement_doses']['Insert']>;
+        Relationships: [];
+      };
+      conversations: {
+        Row: {
+          id: string;
+          owner_id: string;
+          title: string | null;
+          created_at: string;
+          updated_at: string;
+          archived_at: string | null;
+        };
+        Insert: {
+          id?: string;
+          owner_id: string;
+          title?: string | null;
+          created_at?: string;
+          updated_at?: string;
+          archived_at?: string | null;
+        };
+        Update: Partial<Database['public']['Tables']['conversations']['Insert']>;
+        Relationships: [];
+      };
+      chatbot_runs: {
+        Row: {
+          id: string;
+          conversation_id: string;
+          turn_index: number;
+          role: 'user' | 'assistant' | 'system';
+          user_text: string | null;
+          response_text: string | null;
+          retrieved_protocol_ids: string[];
+          model_id: string | null;
+          latency_ms: number | null;
+          fallback: 'none' | 'kv_keyword' | 'emergency';
+          emergency_triggered: boolean;
+          rate_limit_remaining: number | null;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          conversation_id: string;
+          turn_index: number;
+          role: 'user' | 'assistant' | 'system';
+          user_text?: string | null;
+          response_text?: string | null;
+          retrieved_protocol_ids?: string[];
+          model_id?: string | null;
+          latency_ms?: number | null;
+          fallback?: 'none' | 'kv_keyword' | 'emergency';
+          emergency_triggered?: boolean;
+          rate_limit_remaining?: number | null;
+          created_at?: string;
+        };
+        Update: Partial<Database['public']['Tables']['chatbot_runs']['Insert']>;
+        Relationships: [];
+      };
     };
     Functions: {
       // NOTE: check_has_pin's EXECUTE grant to anon/authenticated was revoked

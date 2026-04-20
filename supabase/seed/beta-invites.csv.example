@@ -1,0 +1,19 @@
+email,role,barn_name,phone
+# Closed-beta onboarding CSV — copy to beta-invites.csv (gitignored).
+# SLH fills one row per trainer or owner in the 2026-05-25 launch batch.
+#
+# Columns:
+#   email      (required) — recipient address; magic-link invite lands here.
+#   role       (required) — 'owner' or 'trainer'. Trainers are auto-approved
+#                           at claim time (admin.trainer.auto_approve audit).
+#   barn_name  (optional) — stamped onto the invitation row; owner UI uses
+#                           it as a default when the owner first loads /app.
+#   phone      (optional) — for the on-call / PagerDuty-lite admin roster
+#                           only. Not used for end-user SMS in closed beta.
+#
+# Rows beginning with '#' are treated as comments by scripts/import-beta-invites.mjs.
+# Blank lines are ignored.
+#
+# Sample rows (delete before importing):
+trainer1@example.com,trainer,,+15555550100
+owner1@example.com,owner,"Windrose Stables",

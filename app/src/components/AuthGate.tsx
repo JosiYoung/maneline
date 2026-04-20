@@ -19,6 +19,7 @@ const PUBLIC_EXACT = new Set<string>([
   '/signup',
   '/check-email',
   '/auth/callback',
+  '/welcome',
 ]);
 const PUBLIC_PREFIXES = ['/vet/'];
 

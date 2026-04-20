@@ -72,11 +72,81 @@ import {
   createAccountLink,
   createExpressAccount,
   createPaymentIntent,
+  createRefund,
   isStripeConfigured,
   retrieveAccount,
   retrievePaymentIntent,
 } from './worker/stripe.js';
 import { verifyStripeSignature } from './worker/stripe-webhook.js';
+import { createCheckoutSession, retrieveCheckoutSession } from './worker/stripe-checkout.js';
+import { adjustInventory } from './worker/shopify-admin.js';
+import {
+  fetchProductByHandle,
+  shopifyConfigured,
+  shopifyNodeToProductRow,
+} from './worker/shopify.js';
+import {
+  CHAT_MODEL,
+  EMBED_DIMS,
+  embedText,
+  queryProtocolVectors,
+  upsertProtocolVector,
+} from './worker/workers-ai.js';
+import {
+  FALLBACK_CANNED_MESSAGE,
+  RAG_TOP_K,
+  composeMessages,
+  detectEmergency,
+  getOrCreateConversation,
+  getRecentHistory,
+  hydrateProtocols,
+  incrementDailyRateLimit,
+  insertChatbotRun,
+  kvKeywordFallback,
+  nextTurnIndex,
+  runChatModelWithTimeout,
+  teeAndAccumulate,
+  touchConversation,
+} from './worker/chat.js';
+import {
+  isHubspotConfigured,
+  sendBehavioralEvent,
+  toHubspotPayload,
+  upsertContact,
+} from './worker/hubspot.js';
+import {
+  adminInvitationsArchive,
+  adminInvitationsBulk,
+  adminInvitationsCreate,
+  adminInvitationsList,
+  adminInvitationsResend,
+  claimInvite,
+  dismissWelcomeTour,
+  invitationLookup,
+} from './worker/invitations.js';
+import {
+  adminOnCallArchive,
+  adminOnCallCreate,
+  adminOnCallList,
+  adminSmsDispatchesList,
+  dispatchEmergencyPage,
+  handleTwilioStatusCallback,
+} from './worker/on-call.js';
+import {
+  adminSubscriptionsCancel,
+  adminSubscriptionsGet,
+  adminSubscriptionsList,
+  adminSubscriptionsPause,
+  adminSubscriptionsResume,
+  handleInvoicePaymentFailed,
+  handleInvoicePaymentSucceeded,
+  handleSubscriptionLifecycle,
+} from './worker/stripe-subscriptions.js';
+
+// Phase 6.3 — Durable Object rate limiter. Class MUST be re-exported
+// from the Worker entry so `[[durable_objects.bindings]]` can resolve
+// it by name. env.RATE_LIMITER is the DO namespace binding.
+export { RateLimiter } from './worker/durable-objects/rate-limiter.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -113,6 +183,9 @@ export default {
       if (url.pathname === '/api/sessions/archive') {
         return handleSessionArchive(request, env);
       }
+      if (url.pathname === '/api/expenses/archive') {
+        return handleExpenseArchive(request, env);
+      }
       if (url.pathname === '/api/sessions/approve') {
         return handleSessionApprove(request, env);
       }
@@ -142,6 +215,71 @@ export default {
       }
       if (url.pathname === '/api/stripe/connect/return') {
         return handleStripeConnectReturn(request, env, url);
+      }
+      if (url.pathname === '/api/shop/products') {
+        return handleShopProductsList(request, env);
+      }
+      if (url.pathname.startsWith('/api/shop/products/')) {
+        const handle = url.pathname.slice('/api/shop/products/'.length);
+        return handleShopProductByHandle(request, env, handle);
+      }
+      if (url.pathname === '/api/_internal/shop/cache-invalidate') {
+        return handleShopCacheInvalidate(request, env);
+      }
+      if (url.pathname === '/api/shop/checkout') {
+        return handleShopCheckout(request, env, url);
+      }
+      if (url.pathname === '/api/orders') {
+        return handleOrdersList(request, env);
+      }
+      if (url.pathname.startsWith('/api/orders/')) {
+        const rest = url.pathname.slice('/api/orders/'.length);
+        if (rest && !rest.includes('/')) {
+          return handleOrderGet(request, env, rest);
+        }
+      }
+      if (url.pathname === '/api/_internal/hubspot-drain') {
+        return handleHubspotDrain(request, env);
+      }
+      if (url.pathname === '/api/ai/embed') {
+        return handleAiEmbed(request, env);
+      }
+      if (url.pathname === '/api/protocols/embed-index') {
+        return handleProtocolEmbedIndex(request, env);
+      }
+      if (url.pathname === '/api/chat') {
+        return handleChat(request, env, ctx);
+      }
+      if (url.pathname === '/api/support-tickets') {
+        return handleSupportTicketCreate(request, env, ctx);
+      }
+      if (url.pathname === '/webhooks/twilio-status') {
+        return handleTwilioStatusCallback(request, env);
+      }
+      if (url.pathname === '/api/vet-share-tokens') {
+        if (request.method === 'POST') return handleVetShareCreate(request, env, ctx);
+        if (request.method === 'GET')  return handleVetShareList(request, env, url);
+        return new Response('method not allowed', { status: 405 });
+      }
+      if (url.pathname.startsWith('/api/vet-share-tokens/')) {
+        const rest = url.pathname.slice('/api/vet-share-tokens/'.length);
+        const m = /^([0-9a-f-]{36})\/revoke$/i.exec(rest);
+        if (m) return handleVetShareRevoke(request, env, m[1], ctx);
+      }
+      if (url.pathname.startsWith('/api/vet/')) {
+        const token = url.pathname.slice('/api/vet/'.length);
+        if (token && !token.includes('/')) {
+          return handleVetTokenGet(request, env, token, ctx);
+        }
+      }
+      if (url.pathname === '/api/invitations/lookup' && request.method === 'GET') {
+        return invitationLookup(env, url);
+      }
+      if (url.pathname === '/api/auth/claim-invite' && request.method === 'POST') {
+        return handleClaimInvite(request, env);
+      }
+      if (url.pathname === '/api/profiles/dismiss-welcome-tour' && request.method === 'POST') {
+        return handleDismissWelcomeTour(request, env);
       }
       if (url.pathname === '/api/_integrations-health') {
         return handleIntegrationsHealth(request, env);
@@ -202,40 +340,11 @@ function clientIp(request) {
   );
 }
 
-/**
- * Simple per-key token bucket in KV.
- *
- * Not distributed-exact — KV has eventual consistency across regions —
- * but easily tight enough to defeat scripted enumeration from a single
- * endpoint. Callers that need hard guarantees should layer Cloudflare
- * rate-limiting rules in front.
- *
- * Returns { ok: boolean, remaining: number, resetSec: number }.
- */
-async function rateLimit(env, bucketKey, { limit, windowSec }) {
-  if (!env.FLAGS) return { ok: true, remaining: limit, resetSec: windowSec };
-
-  const now = Math.floor(Date.now() / 1000);
-  const raw = await env.FLAGS.get(bucketKey);
-  let state = raw ? safeParse(raw) : null;
-
-  if (!state || typeof state.resetAt !== 'number' || state.resetAt <= now) {
-    state = { count: 0, resetAt: now + windowSec };
-  }
-
-  state.count += 1;
-  const ok = state.count <= limit;
-
-  // TTL so stale buckets self-expire even if the next request never comes.
-  const ttl = Math.max(state.resetAt - now + 5, 10);
-  await env.FLAGS.put(bucketKey, JSON.stringify(state), { expirationTtl: ttl });
-
-  return {
-    ok,
-    remaining: Math.max(0, limit - state.count),
-    resetSec: Math.max(1, state.resetAt - now),
-  };
-}
+// Phase 6.3 — the legacy FLAGS-backed rateLimit() used by /api/has-pin
+// has been folded into the unified rateLimit() dispatcher further down
+// (see rateLimit / rateLimitDO / rateLimitKv). The DO path now handles
+// every rate-limited endpoint, including has-pin, so scripted enumeration
+// from a single IP hits a deterministic 429 instead of a best-effort cap.
 
 function safeParse(s) {
   try { return JSON.parse(s); } catch { return null; }
@@ -410,10 +519,21 @@ async function handleAdmin(request, env, url) {
   let response;
   let action;
   let targetTable = null;
+  let metadata = null;
 
   if (tail === 'ping' && request.method === 'GET') {
     action = 'admin.ping';
     response = json({ ok: true });
+  } else if (tail === 'kpis' && request.method === 'GET') {
+    action = 'admin.kpis.read';
+    const r = await supabaseRpc(env, 'admin_kpi_snapshot', {}, { serviceRole: true });
+    if (!r.ok) {
+      response = json({ error: 'kpi_snapshot_failed' }, 500);
+      metadata = { ok: false, status: r.status };
+    } else {
+      response = json({ kpis: r.data });
+      metadata = { ok: true };
+    }
   } else if (tail === 'fees' && request.method === 'GET') {
     action = 'admin.read.platform_fees';
     targetTable = 'platform_settings';
@@ -426,26 +546,447 @@ async function handleAdmin(request, env, url) {
     action = 'admin.update.platform_fees_trainer_override';
     targetTable = 'stripe_connect_accounts';
     response = await adminFeesSetTrainerOverride(request, env, actorId);
+  } else if (tail === 'invitations' && request.method === 'GET') {
+    action = 'admin.read.invitations';
+    targetTable = 'invitations';
+    response = await adminInvitationsList(env, url);
+    metadata = { status: (url.searchParams.get('status') || '').trim() || 'all' };
+  } else if (tail === 'invitations' && request.method === 'POST') {
+    action = 'admin.invitation.create';
+    targetTable = 'invitations';
+    response = await adminInvitationsCreate(env, request, actorId);
+  } else if (tail === 'invitations/bulk' && request.method === 'POST') {
+    action = 'admin.invitation.bulk_create';
+    targetTable = 'invitations';
+    response = await adminInvitationsBulk(env, request, actorId);
+  } else if (
+    request.method === 'POST' &&
+    tail.startsWith('invitations/') &&
+    (tail.endsWith('/resend') || tail.endsWith('/archive'))
+  ) {
+    const m = tail.match(/^invitations\/([^/]+)\/(resend|archive)$/);
+    if (!m) {
+      return json({ error: 'not_found' }, 404);
+    }
+    const id = m[1];
+    const verb = m[2];
+    action = verb === 'resend' ? 'admin.invitation.resend' : 'admin.invitation.archive';
+    targetTable = 'invitations';
+    metadata = { id };
+    response = verb === 'resend'
+      ? await adminInvitationsResend(env, request, actorId, id)
+      : await adminInvitationsArchive(env, actorId, id);
+  } else if (tail === 'on-call' && request.method === 'GET') {
+    action = 'admin.read.on_call_schedule';
+    targetTable = 'on_call_schedule';
+    response = await adminOnCallList(env, url);
+  } else if (tail === 'on-call' && request.method === 'POST') {
+    action = 'admin.on_call.create';
+    targetTable = 'on_call_schedule';
+    response = await adminOnCallCreate(env, request, actorId);
+  } else if (
+    request.method === 'POST' &&
+    tail.startsWith('on-call/') &&
+    tail.endsWith('/archive')
+  ) {
+    const m = tail.match(/^on-call\/([^/]+)\/archive$/);
+    if (!m) return json({ error: 'not_found' }, 404);
+    action = 'admin.on_call.archive';
+    targetTable = 'on_call_schedule';
+    metadata = { id: m[1] };
+    response = await adminOnCallArchive(env, actorId, m[1]);
+  } else if (tail === 'sms-dispatches' && request.method === 'GET') {
+    action = 'admin.read.sms_dispatches';
+    targetTable = 'sms_dispatches';
+    response = await adminSmsDispatchesList(env, url);
+    metadata = {
+      ticket_id: (url.searchParams.get('ticket_id') || '').trim() || null,
+      status:    (url.searchParams.get('status') || '').trim() || null,
+    };
+  } else if (tail === 'subscriptions' && request.method === 'GET') {
+    action = 'admin.read.subscriptions';
+    targetTable = 'stripe_subscriptions';
+    response = await adminSubscriptionsList(env, url);
+    metadata = { status: (url.searchParams.get('status') || '').trim() || 'all' };
+  } else if (
+    request.method === 'GET' &&
+    tail.startsWith('subscriptions/') &&
+    !tail.endsWith('/cancel') &&
+    !tail.endsWith('/pause') &&
+    !tail.endsWith('/resume')
+  ) {
+    const m = tail.match(/^subscriptions\/([A-Za-z0-9_]+)$/);
+    if (!m) return json({ error: 'not_found' }, 404);
+    action = 'admin.read.subscription';
+    targetTable = 'stripe_subscriptions';
+    metadata = { id: m[1] };
+    response = await adminSubscriptionsGet(env, m[1]);
+  } else if (
+    request.method === 'POST' &&
+    tail.startsWith('subscriptions/') &&
+    (tail.endsWith('/cancel') || tail.endsWith('/pause') || tail.endsWith('/resume'))
+  ) {
+    const m = tail.match(/^subscriptions\/([A-Za-z0-9_]+)\/(cancel|pause|resume)$/);
+    if (!m) return json({ error: 'not_found' }, 404);
+    const [, subId, verb] = m;
+    action = `admin.subscription.${verb}`;
+    targetTable = 'stripe_subscriptions';
+    metadata = { id: subId };
+    if (verb === 'cancel')      response = await adminSubscriptionsCancel(env, request, actorId, subId);
+    else if (verb === 'pause')  response = await adminSubscriptionsPause(env, request, actorId, subId);
+    else                        response = await adminSubscriptionsResume(env, request, actorId, subId);
   } else if (tail === 'trainer-applications' && request.method === 'GET') {
     action = 'admin.read.trainer_applications';
     targetTable = 'trainer_applications';
-    const r = await supabaseSelect(
+    const statusFilter = (url.searchParams.get('status') || '').trim();
+    const parts = [
+      'select=id,user_id,submitted_at,status,application',
+      'order=submitted_at.desc',
+      'limit=200',
+    ];
+    if (['submitted', 'approved', 'rejected', 'withdrawn', 'archived'].includes(statusFilter)) {
+      parts.push(`status=eq.${statusFilter}`);
+    }
+    const apps = await supabaseSelect(env, 'trainer_applications', parts.join('&'), { serviceRole: true });
+    const appRows = apps.ok && Array.isArray(apps.data) ? apps.data : [];
+    let rows = [];
+    if (appRows.length) {
+      const ids = [...new Set(appRows.map((a) => a.user_id))];
+      const inList = ids.map((i) => `"${i}"`).join(',');
+      const [usersRes, profilesRes] = await Promise.all([
+        supabaseSelect(
+          env,
+          'user_profiles',
+          `select=user_id,email,display_name,status&user_id=in.(${inList})`,
+          { serviceRole: true }
+        ),
+        supabaseSelect(
+          env,
+          'trainer_profiles',
+          `select=user_id,application_status,reviewed_by,reviewed_at,review_notes&user_id=in.(${inList})`,
+          { serviceRole: true }
+        ),
+      ]);
+      const userMap = new Map(
+        (usersRes.ok && Array.isArray(usersRes.data) ? usersRes.data : []).map((u) => [u.user_id, u])
+      );
+      const profMap = new Map(
+        (profilesRes.ok && Array.isArray(profilesRes.data) ? profilesRes.data : []).map((p) => [p.user_id, p])
+      );
+      rows = appRows.map((a) => {
+        const u = userMap.get(a.user_id) || {};
+        const p = profMap.get(a.user_id) || {};
+        return {
+          id: a.id,
+          user_id: a.user_id,
+          submitted_at: a.submitted_at,
+          status: a.status,
+          application: a.application,
+          email: u.email || null,
+          display_name: u.display_name || null,
+          user_status: u.status || null,
+          application_status: p.application_status || null,
+          reviewed_by: p.reviewed_by || null,
+          reviewed_at: p.reviewed_at || null,
+          review_notes: p.review_notes || null,
+        };
+      });
+    }
+    response = json({ rows });
+    metadata = { status: statusFilter || null, rows: rows.length };
+  } else if (
+    request.method === 'POST' &&
+    (tail.endsWith('/approve') || tail.endsWith('/reject')) &&
+    tail.startsWith('trainer-applications/')
+  ) {
+    const match = tail.match(/^trainer-applications\/([^/]+)\/(approve|reject)$/);
+    if (!match) {
+      return json({ error: 'not_found' }, 404);
+    }
+    const id = match[1];
+    const decision = match[2] === 'approve' ? 'approved' : 'rejected';
+    action = decision === 'approved' ? 'admin.trainer.approve' : 'admin.trainer.reject';
+    targetTable = 'trainer_applications';
+    let body = {};
+    try { body = await request.json(); } catch { body = {}; }
+    const reviewNotes = typeof body?.review_notes === 'string' && body.review_notes.trim()
+      ? body.review_notes.trim().slice(0, 2000)
+      : null;
+    const r = await supabaseRpc(
       env,
-      'trainer_applications',
-      'select=id,user_id,submitted_at,status,application&order=submitted_at.desc&limit=100',
+      'admin_decide_trainer',
+      { app_id: id, decision, reviewer: actorId, p_review_notes: reviewNotes },
       { serviceRole: true }
     );
-    response = json({ rows: r.ok ? r.data : [] });
+    if (!r.ok) {
+      const errText = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+      if (/app_not_found/.test(errText)) {
+        response = json({ error: 'not_found' }, 404);
+      } else if (/bad_decision/.test(errText)) {
+        response = json({ error: 'bad_decision' }, 400);
+      } else {
+        response = json({ error: 'decision_failed' }, 500);
+      }
+      metadata = { ok: false, decision, app_id: id, status: r.status };
+    } else {
+      const decisionPayload = r.data || {};
+      // Enqueue HubSpot sync (best-effort; drained by 5.6 cron)
+      try {
+        await supabaseInsert(env, 'pending_hubspot_syncs', {
+          event_name: 'maneline_trainer_decision',
+          payload: {
+            application_id: id,
+            user_id: decisionPayload.user_id,
+            email: decisionPayload.email,
+            display_name: decisionPayload.display_name,
+            decision: decisionPayload.decision,
+            review_notes: decisionPayload.review_notes,
+            decided_by: actorId,
+            decided_at: new Date().toISOString(),
+          },
+        });
+      } catch (err) {
+        console.warn('[hubspot] enqueue failed:', err?.message);
+      }
+      response = json({ application: decisionPayload });
+      metadata = {
+        ok: true,
+        decision,
+        app_id: id,
+        user_id: decisionPayload.user_id,
+        has_notes: !!reviewNotes,
+      };
+    }
+  } else if (tail === 'support-tickets' && request.method === 'GET') {
+    action = 'admin.read.support_tickets';
+    targetTable = 'support_tickets';
+    const statusFilter = (url.searchParams.get('status') || '').trim();
+    const parts = [
+      'select=id,owner_id,contact_email,category,subject,body,status,assignee_id,first_response_at,resolved_at,archived_at,created_at,updated_at',
+      'order=created_at.desc',
+      'limit=200',
+    ];
+    if (['open', 'claimed', 'resolved', 'archived'].includes(statusFilter)) {
+      parts.push(`status=eq.${statusFilter}`);
+    } else {
+      // Default queue view: hide archived.
+      parts.push('archived_at=is.null');
+    }
+    const r = await supabaseSelect(env, 'support_tickets', parts.join('&'), { serviceRole: true });
+    const tickets = r.ok && Array.isArray(r.data) ? r.data : [];
+    // Hydrate owner_id + assignee_id → email + display_name via user_profiles.
+    const ids = [...new Set(
+      tickets.flatMap((t) => [t.owner_id, t.assignee_id]).filter(Boolean)
+    )];
+    let userMap = new Map();
+    if (ids.length) {
+      const inList = ids.map((i) => `"${i}"`).join(',');
+      const usersRes = await supabaseSelect(
+        env,
+        'user_profiles',
+        `select=user_id,email,display_name&user_id=in.(${inList})`,
+        { serviceRole: true }
+      );
+      userMap = new Map(
+        (usersRes.ok && Array.isArray(usersRes.data) ? usersRes.data : []).map((u) => [u.user_id, u])
+      );
+    }
+    const rows = tickets.map((t) => ({
+      ...t,
+      owner_email: t.owner_id ? userMap.get(t.owner_id)?.email || null : null,
+      owner_display_name: t.owner_id ? userMap.get(t.owner_id)?.display_name || null : null,
+      assignee_email: t.assignee_id ? userMap.get(t.assignee_id)?.email || null : null,
+      assignee_display_name: t.assignee_id ? userMap.get(t.assignee_id)?.display_name || null : null,
+    }));
+    response = json({ rows });
+    metadata = { status: statusFilter || 'active', rows: rows.length };
+  } else if (
+    request.method === 'POST' &&
+    tail.startsWith('support-tickets/') &&
+    (tail.endsWith('/claim') || tail.endsWith('/resolve'))
+  ) {
+    const m = tail.match(/^support-tickets\/([^/]+)\/(claim|resolve)$/);
+    if (!m) {
+      return json({ error: 'not_found' }, 404);
+    }
+    const ticketId = m[1];
+    const verb = m[2];
+    action = verb === 'claim' ? 'admin.support.claim' : 'admin.support.resolve';
+    targetTable = 'support_tickets';
+    const now = new Date().toISOString();
+    const patch = verb === 'claim'
+      ? { status: 'claimed', assignee_id: actorId, first_response_at: now, updated_at: now }
+      : { status: 'resolved', resolved_at: now, updated_at: now };
+    const r = await supabaseUpdateReturning(
+      env,
+      'support_tickets',
+      `id=eq.${encodeURIComponent(ticketId)}`,
+      patch
+    );
+    if (!r.ok) {
+      response = json({ error: 'update_failed' }, 500);
+      metadata = { ok: false, ticket_id: ticketId, verb, status: r.status };
+    } else if (!r.data) {
+      response = json({ error: 'not_found' }, 404);
+      metadata = { ok: false, ticket_id: ticketId, verb, reason: 'not_found' };
+    } else {
+      response = json({ ticket: r.data });
+      metadata = { ok: true, ticket_id: ticketId, verb };
+    }
+  } else if (tail === 'shop/sync' && request.method === 'POST') {
+    action = 'admin.shop.sync_trigger';
+    targetTable = 'products';
+    response = await adminShopSync(env);
   } else if (tail === 'users' && request.method === 'GET') {
-    action = 'admin.read.user_profiles';
+    action = 'admin.user.search';
     targetTable = 'user_profiles';
+    const q = (url.searchParams.get('q') || '').trim();
+    const roleFilter = (url.searchParams.get('role') || '').trim();
+    const page = Math.max(0, Number.parseInt(url.searchParams.get('page') || '0', 10) || 0);
+    const limit = 50;
+    const offset = page * limit;
+    const parts = ['select=user_id,role,status,display_name,email,created_at'];
+    if (q) parts.push(`email=ilike.*${encodeURIComponent(q)}*`);
+    if (roleFilter && ['owner', 'trainer', 'silver_lining'].includes(roleFilter)) {
+      parts.push(`role=eq.${roleFilter}`);
+    }
+    parts.push('order=created_at.desc', `limit=${limit}`, `offset=${offset}`);
+    const r = await adminCountedSelect(env, 'user_profiles', parts.join('&'));
+    response = json({ rows: r.rows, total: r.total, page, limit });
+    metadata = { q, role: roleFilter || null, page, rows: r.rows.length, total: r.total };
+  } else if (tail === 'users.csv' && request.method === 'GET') {
+    action = 'admin.user.export_csv';
+    targetTable = 'user_profiles';
+    const cap = 10000;
     const r = await supabaseSelect(
       env,
       'user_profiles',
-      'select=user_id,role,status,display_name,email,created_at&order=created_at.desc&limit=200',
+      `select=user_id,role,status,display_name,email,created_at&order=created_at.desc&limit=${cap}`,
       { serviceRole: true }
     );
-    response = json({ rows: r.ok ? r.data : [] });
+    const rows = r.ok && Array.isArray(r.data) ? r.data : [];
+    const csv = toCsv(
+      ['user_id', 'role', 'status', 'display_name', 'email', 'created_at'],
+      rows
+    );
+    response = new Response(csv, {
+      status: 200,
+      headers: {
+        'content-type': 'text/csv; charset=utf-8',
+        'content-disposition': 'attachment; filename="users.csv"',
+        'cache-control': 'no-store',
+      },
+    });
+    metadata = { rows: rows.length, cap };
+  } else if (tail === 'orders' && request.method === 'GET') {
+    action = 'admin.read.orders';
+    targetTable = 'orders';
+    const q = (url.searchParams.get('q') || '').trim();
+    const statusFilter = (url.searchParams.get('status') || '').trim();
+    const page = Math.max(0, Number.parseInt(url.searchParams.get('page') || '0', 10) || 0);
+    const limit = 50;
+    const offset = page * limit;
+    const parts = [
+      'select=id,owner_id,status,source,subtotal_cents,tax_cents,shipping_cents,total_cents,currency,created_at',
+      'order=created_at.desc',
+      `limit=${limit}`,
+      `offset=${offset}`,
+    ];
+    if (['pending_payment', 'paid', 'failed', 'refunded', 'awaiting_merchant_setup'].includes(statusFilter)) {
+      parts.push(`status=eq.${statusFilter}`);
+    }
+    const listed = await adminCountedSelect(env, 'orders', parts.join('&'));
+    let orderRows = listed.rows;
+    // Email-scoped search: resolve email → owner_ids and filter.
+    if (q) {
+      const usersRes = await supabaseSelect(
+        env,
+        'user_profiles',
+        `select=user_id,email,display_name&email=ilike.*${encodeURIComponent(q)}*&limit=200`,
+        { serviceRole: true }
+      );
+      const ownerIds = new Set((usersRes.ok && Array.isArray(usersRes.data) ? usersRes.data : []).map((u) => u.user_id));
+      orderRows = orderRows.filter((o) => ownerIds.has(o.owner_id));
+    }
+    // Hydrate owner_id → email / display_name.
+    const ownerIds = [...new Set(orderRows.map((o) => o.owner_id).filter(Boolean))];
+    let ownerMap = new Map();
+    if (ownerIds.length) {
+      const inList = ownerIds.map((i) => `"${i}"`).join(',');
+      const ownersRes = await supabaseSelect(
+        env,
+        'user_profiles',
+        `select=user_id,email,display_name&user_id=in.(${inList})`,
+        { serviceRole: true }
+      );
+      ownerMap = new Map(
+        (ownersRes.ok && Array.isArray(ownersRes.data) ? ownersRes.data : []).map((u) => [u.user_id, u])
+      );
+    }
+    const hydrated = orderRows.map((o) => ({
+      ...o,
+      owner_email: ownerMap.get(o.owner_id)?.email || null,
+      owner_display_name: ownerMap.get(o.owner_id)?.display_name || null,
+    }));
+    response = json({ rows: hydrated, total: listed.total, page, limit });
+    metadata = { q: q || null, status: statusFilter || null, page, rows: hydrated.length, total: listed.total };
+  } else if (request.method === 'GET' && /^orders\/[^/]+$/.test(tail)) {
+    // GET /api/admin/orders/:id — detail
+    const orderId = tail.slice('orders/'.length);
+    action = 'admin.read.order';
+    targetTable = 'orders';
+    metadata = { order_id: orderId };
+    const orderRes = await supabaseSelect(
+      env,
+      'orders',
+      `select=id,owner_id,status,source,subtotal_cents,tax_cents,shipping_cents,total_cents,currency,created_at,stripe_checkout_session_id,stripe_payment_intent_id,stripe_charge_id,stripe_receipt_url,failure_code,failure_message&id=eq.${encodeURIComponent(orderId)}&limit=1`,
+      { serviceRole: true }
+    );
+    const order = Array.isArray(orderRes.data) ? orderRes.data[0] : null;
+    if (!order) {
+      response = json({ error: 'not_found' }, 404);
+    } else {
+      const [linesRes, refundsRes, ownerRes] = await Promise.all([
+        supabaseSelect(
+          env,
+          'order_line_items',
+          `select=id,product_id,shopify_variant_id,sku_snapshot,title_snapshot,unit_price_cents,quantity,line_total_cents&order_id=eq.${encodeURIComponent(orderId)}&order=created_at.asc`,
+          { serviceRole: true }
+        ),
+        supabaseSelect(
+          env,
+          'order_refunds',
+          `select=id,order_id,stripe_refund_id,amount_cents,reason,refunded_by,stripe_status,last_error,created_at,updated_at&order_id=eq.${encodeURIComponent(orderId)}&order=created_at.desc`,
+          { serviceRole: true }
+        ),
+        supabaseSelect(
+          env,
+          'user_profiles',
+          `select=user_id,email,display_name&user_id=eq.${encodeURIComponent(order.owner_id)}&limit=1`,
+          { serviceRole: true }
+        ),
+      ]);
+      const owner = Array.isArray(ownerRes.data) ? ownerRes.data[0] : null;
+      response = json({
+        order: {
+          ...order,
+          owner_email: owner?.email || null,
+          owner_display_name: owner?.display_name || null,
+        },
+        line_items: Array.isArray(linesRes.data) ? linesRes.data : [],
+        refunds: Array.isArray(refundsRes.data) ? refundsRes.data : [],
+      });
+    }
+  } else if (tail.startsWith('orders/') && tail.endsWith('/refund') && request.method === 'POST') {
+    const match = tail.match(/^orders\/([^/]+)\/refund$/);
+    if (!match) {
+      return json({ error: 'not_found' }, 404);
+    }
+    const orderId = match[1];
+    action = 'admin.order.refund';
+    targetTable = 'orders';
+    response = await adminOrderRefund(request, env, actorId, orderId);
+    metadata = { order_id: orderId, status: response.status };
   } else {
     return json({ error: 'not_found' }, 404);
   }
@@ -457,6 +998,7 @@ async function handleAdmin(request, env, url) {
       actor_role: 'silver_lining',
       action,
       target_table: targetTable,
+      metadata: metadata || {},
       ip: clientIp(request),
       user_agent: request.headers.get('user-agent') || null,
     });
@@ -465,6 +1007,771 @@ async function handleAdmin(request, env, url) {
   }
 
   return response;
+}
+
+// PostgREST "count=exact" wrapper — returns { rows, total } by parsing the
+// Content-Range header. Worker-side pagination for the admin directory.
+async function adminCountedSelect(env, table, query) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}?${query}`, {
+    method: 'GET',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      Prefer: 'count=exact',
+    },
+  });
+  const text = await res.text();
+  let rows = [];
+  try { rows = text ? JSON.parse(text) : []; } catch { rows = []; }
+  const range = res.headers.get('content-range') || '';
+  const total = Number.parseInt(range.split('/').pop() || '0', 10) || 0;
+  return { rows: Array.isArray(rows) ? rows : [], total };
+}
+
+/* =============================================================
+   Phase 5.5 — Admin refund action
+   -------------------------------------------------------------
+   POST /api/admin/orders/:id/refund { amount_cents, reason }
+
+   Shop orders are destination charges (PaymentIntent has
+   transfer_data.destination → Silver Lining Connect account), so
+   the refund is created on the platform with reverse_transfer +
+   refund_application_fee. Idempotency-Key is keyed to
+   refund:{order_id}:{attempt_n} so SPA retries don't double-charge.
+
+   Minimum refund is $1 (100 cents, Stripe's floor for USD).
+   Partial refunds are allowed; the orders row flips to status=
+   'refunded' only once the cumulative refund equals the order total.
+   ============================================================= */
+async function adminOrderRefund(request, env, actorId, orderId) {
+  let body = {};
+  try { body = await request.json(); } catch { body = {}; }
+  const amountCentsRaw = body?.amount_cents;
+  const amountCents = Number.isFinite(amountCentsRaw) ? Math.trunc(amountCentsRaw) : 0;
+  const reasonRaw = typeof body?.reason === 'string' ? body.reason.trim() : '';
+  if (amountCents < 100) {
+    return json({ error: 'amount_below_minimum' }, 400);
+  }
+  if (!reasonRaw) {
+    return json({ error: 'reason_required' }, 400);
+  }
+  const reason = reasonRaw.slice(0, 2000);
+
+  const orderRes = await supabaseSelect(
+    env,
+    'orders',
+    `select=id,owner_id,status,total_cents,stripe_payment_intent_id,stripe_charge_id&id=eq.${encodeURIComponent(orderId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const order = Array.isArray(orderRes.data) ? orderRes.data[0] : null;
+  if (!order) {
+    return json({ error: 'not_found' }, 404);
+  }
+  if (!order.stripe_payment_intent_id && !order.stripe_charge_id) {
+    return json({ error: 'order_not_charged' }, 409);
+  }
+  if (order.status !== 'paid' && order.status !== 'refunded') {
+    return json({ error: 'order_not_refundable', status: order.status }, 409);
+  }
+
+  // Compute remaining refundable amount from prior succeeded/pending rows.
+  const existingRes = await supabaseSelect(
+    env,
+    'order_refunds',
+    `select=id,amount_cents,stripe_status&order_id=eq.${encodeURIComponent(orderId)}`,
+    { serviceRole: true }
+  );
+  const existing = Array.isArray(existingRes.data) ? existingRes.data : [];
+  const alreadyRefunded = existing
+    .filter((r) => r.stripe_status === 'succeeded' || r.stripe_status === 'pending')
+    .reduce((s, r) => s + (Number.isFinite(r.amount_cents) ? r.amount_cents : 0), 0);
+  const remaining = Math.max(0, order.total_cents - alreadyRefunded);
+  if (amountCents > remaining) {
+    return json({ error: 'amount_exceeds_remaining', remaining_cents: remaining }, 400);
+  }
+
+  const attemptNumber = existing.length + 1;
+  const idempotencyKey = `refund:${orderId}:${attemptNumber}`;
+  const stripeRes = await createRefund(env, {
+    paymentIntentId: order.stripe_payment_intent_id || null,
+    chargeId:        order.stripe_payment_intent_id ? null : order.stripe_charge_id,
+    amountCents,
+    idempotencyKey,
+    metadata: {
+      ml_order_id:   orderId,
+      ml_refunded_by: actorId,
+      ml_reason:     reason.slice(0, 500),
+    },
+  });
+
+  if (!stripeRes.ok) {
+    if (stripeRes.error === 'stripe_not_configured') {
+      return json({ error: 'stripe_not_configured' }, 501);
+    }
+    // Record the failed attempt so the admin has an audit trail.
+    await supabaseInsertReturning(env, 'order_refunds', {
+      order_id:        orderId,
+      amount_cents:    amountCents,
+      reason,
+      refunded_by:     actorId,
+      stripe_status:   'failed',
+      last_error:      (stripeRes.message || stripeRes.error || 'stripe_error').slice(0, 500),
+    });
+    return json({
+      error: 'stripe_refund_failed',
+      code: stripeRes.error,
+      message: stripeRes.message || null,
+    }, stripeRes.status >= 400 && stripeRes.status < 600 ? stripeRes.status : 502);
+  }
+
+  const refund = stripeRes.data || {};
+  const stripeStatus = refund.status === 'succeeded'
+    ? 'succeeded'
+    : refund.status === 'failed' || refund.status === 'canceled'
+      ? refund.status
+      : 'pending';
+
+  const ins = await supabaseInsertReturning(env, 'order_refunds', {
+    order_id:         orderId,
+    stripe_refund_id: refund.id || null,
+    amount_cents:     amountCents,
+    reason,
+    refunded_by:      actorId,
+    stripe_status:    stripeStatus,
+    last_error:       stripeStatus === 'failed' ? (refund.failure_reason || null) : null,
+  });
+  if (!ins.ok) {
+    return json({ error: 'refund_insert_failed', status: ins.status }, 500);
+  }
+
+  // Flip orders.status='refunded' only when fully refunded (succeeded + pending
+  // both count against remaining so we don't over-refund mid-pending).
+  const newTotal = alreadyRefunded + (stripeStatus !== 'failed' ? amountCents : 0);
+  if (stripeStatus !== 'failed' && newTotal >= order.total_cents && order.status !== 'refunded') {
+    await supabaseUpdateReturning(
+      env,
+      'orders',
+      `id=eq.${encodeURIComponent(orderId)}`,
+      { status: 'refunded' }
+    );
+  }
+
+  // Best-effort HubSpot enqueue (drained by 5.6 cron).
+  try {
+    await supabaseInsert(env, 'pending_hubspot_syncs', {
+      event_name: 'maneline_refund_issued',
+      payload: {
+        order_id:     orderId,
+        owner_id:     order.owner_id,
+        refund_id:    ins.data?.id || null,
+        stripe_refund_id: refund.id || null,
+        amount_cents: amountCents,
+        reason,
+        refunded_by:  actorId,
+        refunded_at:  new Date().toISOString(),
+        stripe_status: stripeStatus,
+      },
+    });
+  } catch (err) {
+    console.warn('[hubspot] refund enqueue failed:', err?.message);
+  }
+
+  return json({ refund: ins.data });
+}
+
+// RFC-4180 CSV; quotes fields containing comma, quote, CR or LF.
+function toCsv(columns, rows) {
+  const esc = (v) => {
+    if (v === null || v === undefined) return '';
+    const s = String(v);
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const header = columns.join(',');
+  const body = rows.map((r) => columns.map((c) => esc(r[c])).join(',')).join('\n');
+  return rows.length ? `${header}\n${body}\n` : `${header}\n`;
+}
+
+/* =============================================================
+   Phase 5.4 — Support inbox (public POST)
+   -------------------------------------------------------------
+   POST /api/support-tickets { category, subject, body, contact_email? }
+
+   Auth is optional: if the caller carries a valid Supabase JWT, we
+   stamp owner_id; if not (anon landing widget), the category is
+   restricted to 'bug' | 'feature_request'. Rate limited 10/hour
+   per user id (authed) or per source IP (anon). On insert we
+   best-effort enqueue the HubSpot `maneline_support_ticket_opened`
+   event — drained by 5.6 cron.
+   ============================================================= */
+const SUPPORT_TICKET_RATE = { limit: 10, windowSec: 3600 };
+const SUPPORT_TICKET_CATEGORIES = new Set([
+  'account', 'billing', 'bug', 'feature_request', 'emergency_followup',
+]);
+const SUPPORT_TICKET_ANON_CATEGORIES = new Set(['bug', 'feature_request']);
+
+async function handleSupportTicketCreate(request, env, ctx) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  // Resolve optional JWT → actorId. Missing / invalid tokens fall back to anon.
+  const authHeader = request.headers.get('authorization') || '';
+  const jwt = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  let actorId = null;
+  if (jwt) {
+    const who = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        apikey: env.SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${jwt}`,
+      },
+    });
+    if (who.ok) {
+      const whoData = await who.json().catch(() => null);
+      actorId = whoData?.id || null;
+    }
+  }
+
+  const ip = clientIp(request);
+  const bucket = actorId ? `ratelimit:support_ticket:uid:${actorId}` : `ratelimit:support_ticket:ip:${ip}`;
+  const rl = await rateLimit(env, bucket, SUPPORT_TICKET_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429);
+  }
+
+  let body = {};
+  try { body = await request.json(); } catch { body = {}; }
+  const category = typeof body.category === 'string' ? body.category.trim() : '';
+  const subject = typeof body.subject === 'string' ? body.subject.trim() : '';
+  const ticketBody = typeof body.body === 'string' ? body.body.trim() : '';
+  const contactEmailRaw = typeof body.contact_email === 'string' ? body.contact_email.trim() : '';
+
+  if (!SUPPORT_TICKET_CATEGORIES.has(category)) {
+    return json({ error: 'bad_category' }, 400);
+  }
+  if (!actorId && !SUPPORT_TICKET_ANON_CATEGORIES.has(category)) {
+    return json({ error: 'login_required_for_category' }, 401);
+  }
+  if (subject.length < 1 || subject.length > 200) {
+    return json({ error: 'bad_subject' }, 400);
+  }
+  if (ticketBody.length < 1 || ticketBody.length > 10000) {
+    return json({ error: 'bad_body' }, 400);
+  }
+  // Anon callers must provide a contact email so we can reply.
+  let contactEmail = contactEmailRaw || null;
+  if (!actorId) {
+    const emailOk = !!contactEmail && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail);
+    if (!emailOk) {
+      return json({ error: 'bad_contact_email' }, 400);
+    }
+  }
+
+  const row = {
+    owner_id: actorId,
+    contact_email: contactEmail,
+    category,
+    subject: subject.slice(0, 200),
+    body: ticketBody.slice(0, 10000),
+    source_ip: ip,
+    user_agent: request.headers.get('user-agent')?.slice(0, 500) || null,
+  };
+
+  const ins = await supabaseInsertReturning(env, 'support_tickets', row);
+  if (!ins.ok) {
+    return json({ error: 'insert_failed' }, 500);
+  }
+  const ticket = ins.data || {};
+
+  // Best-effort HubSpot enqueue (drained by 5.6 cron).
+  try {
+    await supabaseInsert(env, 'pending_hubspot_syncs', {
+      event_name: 'maneline_support_ticket_opened',
+      payload: {
+        ticket_id: ticket.id || null,
+        owner_id: actorId,
+        contact_email: contactEmail,
+        category,
+        subject: subject.slice(0, 200),
+        created_at: ticket.created_at || new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    console.warn('[hubspot] support enqueue failed:', err?.message);
+  }
+
+  // Append-only audit row (actor may be null for anon).
+  try {
+    await supabaseInsert(env, 'audit_log', {
+      actor_id: actorId,
+      actor_role: actorId ? 'user' : 'anon',
+      action: 'support.ticket.create',
+      target_table: 'support_tickets',
+      target_id: ticket.id || null,
+      metadata: { category, anon: !actorId },
+      ip,
+      user_agent: request.headers.get('user-agent') || null,
+    });
+  } catch (err) {
+    console.warn('[audit] support_ticket insert failed:', err?.message);
+  }
+
+  // Phase 6.4 — emergency_followup pages the on-call admin via Twilio.
+  // Fire-and-forget so the ticket POST returns immediately; dispatch
+  // writes its own sms_dispatches + audit rows. dispatchEmergencyPage
+  // catches all errors internally (the ticket still lands in
+  // /admin/support via the existing pipeline on any Twilio hiccup).
+  if (category === 'emergency_followup' && ticket.id) {
+    const ownerEmail = contactEmail || await lookupProfileEmail(env, actorId);
+    const pageTicket = {
+      id:            ticket.id,
+      subject:       subject.slice(0, 200),
+      owner_email:   ownerEmail,
+      contact_email: contactEmail,
+    };
+    const task = dispatchEmergencyPage(env, pageTicket);
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(task);
+    } else {
+      task.catch(() => { /* already logged */ });
+    }
+  }
+
+  return json({ ticket: { id: ticket.id, status: ticket.status, created_at: ticket.created_at } }, 201);
+}
+
+/**
+ * Lookup user_profiles.email by user_id via service_role. Used by the
+ * emergency-page body builder when the caller didn't supply a
+ * contact_email (authed path — owner_id is always set for
+ * emergency_followup). Returns null on miss.
+ */
+async function lookupProfileEmail(env, userId) {
+  if (!userId) return null;
+  try {
+    const r = await supabaseSelect(
+      env,
+      'user_profiles',
+      `select=email&user_id=eq.${encodeURIComponent(userId)}&limit=1`,
+      { serviceRole: true },
+    );
+    if (r.ok && Array.isArray(r.data) && r.data[0]) return r.data[0].email || null;
+  } catch (err) {
+    console.warn('[support] profile email lookup failed:', err?.message);
+  }
+  return null;
+}
+
+/* =============================================================
+   Phase 5.7 — Vet View scoped magic link
+   -------------------------------------------------------------
+   Four endpoints:
+
+     POST /api/vet-share-tokens          (owner-auth'd) — create
+     GET  /api/vet-share-tokens          (owner-auth'd) — list own
+     POST /api/vet-share-tokens/:id/revoke (owner-auth'd) — revoke
+     GET  /api/vet/:token                (anon, rate-limited) — read
+
+   Policy:
+     - Expiry options 24h / 7d / 14d / 30d (default 14d).
+     - Scope: records always on; media optional; sessions OFF for v1.
+     - Token = 32 random bytes base64url-encoded (URL-safe, no
+       padding, 43 chars). Uniqueness enforced at the DB level.
+     - Anon /api/vet/:token rate-limited to 60/min per token via
+       KV (ML_RL). Each read increments view_count and appends an
+       audit_log row (action='vet_view.record.read').
+     - "12-month record" means vet_records within 365d of
+       share-create time — freezes the window so a long-lived link
+       doesn't retroactively surface newer data.
+   ============================================================= */
+
+const VET_SHARE_DEFAULT_DAYS = 14;
+const VET_SHARE_ALLOWED_DAYS = new Set([1, 7, 14, 30]);
+const VET_SHARE_WINDOW_DAYS  = 365;
+const VET_READ_RATE          = { limit: 60, windowSec: 60 };
+const VET_GET_URL_TTL_SEC    = 300;
+
+function base64UrlEncodeBytes(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function generateVetToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return base64UrlEncodeBytes(bytes);
+}
+
+async function handleVetShareCreate(request, env, ctx) {
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (errResp) {
+    return errResp;
+  }
+
+  let body = {};
+  try { body = await request.json(); } catch { body = {}; }
+
+  const animalId = typeof body.animal_id === 'string' ? body.animal_id.trim() : '';
+  if (!/^[0-9a-f-]{36}$/i.test(animalId)) {
+    return json({ error: 'bad_animal_id' }, 400);
+  }
+
+  const rawDays = Number(body.expires_in_days);
+  const days = VET_SHARE_ALLOWED_DAYS.has(rawDays) ? rawDays : VET_SHARE_DEFAULT_DAYS;
+
+  const scopeIn = body.scope && typeof body.scope === 'object' ? body.scope : {};
+  const scope = {
+    records:  scopeIn.records !== false,
+    media:    scopeIn.media === true,
+    sessions: false,
+  };
+  if (!scope.records && !scope.media) {
+    return json({ error: 'bad_scope', detail: 'at least one of records or media must be true' }, 400);
+  }
+
+  // Ownership check — owner must own the animal (RLS + RPC double-check).
+  const ownership = await supabaseRpc(env, 'am_i_owner_of', { animal_id: animalId }, { userJwt: jwt });
+  if (!ownership.ok || ownership.data !== true) {
+    return json({ error: 'forbidden' }, 403);
+  }
+
+  const token = generateVetToken();
+  const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+
+  const row = {
+    owner_id:   actorId,
+    animal_id:  animalId,
+    token,
+    scope,
+    expires_at: expiresAt,
+  };
+  const ins = await supabaseInsertReturning(env, 'vet_share_tokens', row);
+  if (!ins.ok || !ins.data) {
+    return json({ error: 'insert_failed' }, 500);
+  }
+
+  const shareUrl = `${new URL(request.url).origin}/vet/${token}`;
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'vet_share.create',
+    target_table: 'vet_share_tokens',
+    target_id: ins.data.id,
+    metadata: { animal_id: animalId, expires_at: expiresAt, scope },
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+  }, ctx);
+
+  return json({
+    id:         ins.data.id,
+    token,
+    url:        shareUrl,
+    animal_id:  animalId,
+    scope,
+    expires_at: expiresAt,
+    created_at: ins.data.created_at,
+  }, 201);
+}
+
+async function handleVetShareList(request, env, url) {
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (errResp) {
+    return errResp;
+  }
+
+  const animalId = (url.searchParams.get('animal_id') || '').trim();
+  let query = `select=id,animal_id,token,scope,expires_at,viewed_at,view_count,revoked_at,created_at&owner_id=eq.${actorId}&archived_at=is.null&order=created_at.desc&limit=50`;
+  if (animalId) {
+    if (!/^[0-9a-f-]{36}$/i.test(animalId)) {
+      return json({ error: 'bad_animal_id' }, 400);
+    }
+    query += `&animal_id=eq.${encodeURIComponent(animalId)}`;
+  }
+
+  // Owner JWT + RLS: vet_share_tokens_owner_select enforces owner_id = auth.uid().
+  const r = await supabaseSelect(env, 'vet_share_tokens', query, { userJwt: jwt });
+  if (!r.ok) {
+    return json({ error: 'list_failed' }, 500);
+  }
+  const rows = Array.isArray(r.data) ? r.data : [];
+
+  // Don't echo the raw token on list responses — shoulder-surf risk.
+  // Callers that need the URL again should revoke + re-create.
+  const tokens = rows.map((row) => ({
+    id:          row.id,
+    animal_id:   row.animal_id,
+    token_hint:  typeof row.token === 'string' ? `${row.token.slice(0, 6)}…` : null,
+    scope:       row.scope,
+    expires_at:  row.expires_at,
+    viewed_at:   row.viewed_at,
+    view_count:  row.view_count,
+    revoked_at:  row.revoked_at,
+    created_at:  row.created_at,
+  }));
+
+  return json({ tokens });
+}
+
+async function handleVetShareRevoke(request, env, tokenId, ctx) {
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (errResp) {
+    return errResp;
+  }
+
+  // Ownership check via owner JWT + RLS. If no row comes back, the
+  // caller either doesn't own it or it doesn't exist.
+  const own = await supabaseSelect(
+    env,
+    'vet_share_tokens',
+    `select=id,owner_id,revoked_at&id=eq.${encodeURIComponent(tokenId)}&limit=1`,
+    { userJwt: jwt }
+  );
+  const row = Array.isArray(own.data) ? own.data[0] : null;
+  if (!row) {
+    return json({ error: 'not_found' }, 404);
+  }
+  if (row.owner_id !== actorId) {
+    return json({ error: 'forbidden' }, 403);
+  }
+  if (row.revoked_at) {
+    return json({ ok: true, already_revoked: true });
+  }
+
+  let body = {};
+  try { body = await request.json(); } catch { body = {}; }
+  const reason = typeof body?.reason === 'string' ? body.reason.slice(0, 500) : null;
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'vet_share_tokens',
+    `id=eq.${encodeURIComponent(tokenId)}`,
+    { revoked_at: new Date().toISOString(), revoked_reason: reason }
+  );
+  if (!upd.ok) {
+    return json({ error: 'revoke_failed' }, 500);
+  }
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'vet_share.revoke',
+    target_table: 'vet_share_tokens',
+    target_id: tokenId,
+    metadata: { reason },
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+  }, ctx);
+
+  return json({ ok: true, revoked_at: upd.data?.revoked_at ?? null });
+}
+
+async function handleVetTokenGet(request, env, token, ctx) {
+  if (request.method !== 'GET') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  // Shape-check the token so obviously-bad inputs are cheap to reject
+  // and don't burn DB round-trips. base64url w/ no padding, length 43
+  // for 32 random bytes.
+  if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{20,64}$/.test(token)) {
+    return json({ error: 'bad_token' }, 400);
+  }
+
+  const rl = await rateLimit(env, `ratelimit:vet_token:${token}`, VET_READ_RATE);
+  if (!rl.ok) {
+    return json(
+      { error: 'rate_limited', retry_after: rl.resetSec },
+      429,
+      { 'retry-after': String(rl.resetSec) }
+    );
+  }
+
+  const tokenQ = await supabaseSelect(
+    env,
+    'vet_share_tokens',
+    `select=id,owner_id,animal_id,scope,expires_at,viewed_at,view_count,revoked_at,archived_at,created_at&token=eq.${encodeURIComponent(token)}&limit=1`,
+    { serviceRole: true }
+  );
+  const share = Array.isArray(tokenQ.data) ? tokenQ.data[0] : null;
+  if (!share) {
+    return json({ error: 'not_found' }, 404);
+  }
+  if (share.archived_at) {
+    return json({ error: 'not_found' }, 404);
+  }
+  if (share.revoked_at) {
+    return json({ error: 'revoked' }, 410);
+  }
+  if (Date.parse(share.expires_at) <= Date.now()) {
+    return json({ error: 'expired' }, 410);
+  }
+
+  // Animal metadata — scoped to the single shared animal.
+  const animalQ = await supabaseSelect(
+    env,
+    'animals',
+    `select=id,owner_id,species,barn_name,breed,sex,year_born,discipline&id=eq.${encodeURIComponent(share.animal_id)}&limit=1`,
+    { serviceRole: true }
+  );
+  const animal = Array.isArray(animalQ.data) ? animalQ.data[0] : null;
+  if (!animal || animal.owner_id !== share.owner_id) {
+    // Owner transferred or deleted — treat as revoked.
+    return json({ error: 'not_found' }, 404);
+  }
+
+  // 12-month record window anchored to share creation.
+  const windowStart = new Date(
+    new Date(share.created_at).getTime() - VET_SHARE_WINDOW_DAYS * 24 * 60 * 60 * 1000
+  ).toISOString();
+
+  let records = [];
+  if (share.scope?.records) {
+    const recsQ = await supabaseSelect(
+      env,
+      'vet_records',
+      `select=id,record_type,issued_on,expires_on,issuing_provider,notes,created_at,r2_object_id` +
+        `&animal_id=eq.${encodeURIComponent(share.animal_id)}` +
+        `&archived_at=is.null` +
+        `&created_at=gte.${encodeURIComponent(windowStart)}` +
+        `&order=issued_on.desc.nullslast`,
+      { serviceRole: true }
+    );
+    records = Array.isArray(recsQ.data) ? recsQ.data : [];
+  }
+
+  let media = [];
+  if (share.scope?.media) {
+    const medQ = await supabaseSelect(
+      env,
+      'animal_media',
+      `select=id,kind,caption,taken_on,created_at,r2_object_id` +
+        `&animal_id=eq.${encodeURIComponent(share.animal_id)}` +
+        `&archived_at=is.null` +
+        `&created_at=gte.${encodeURIComponent(windowStart)}` +
+        `&order=created_at.desc`,
+      { serviceRole: true }
+    );
+    media = Array.isArray(medQ.data) ? medQ.data : [];
+  }
+
+  // Resolve r2_objects in one lookup per batch, then presign GETs.
+  const objectIds = [
+    ...records.map((r) => r.r2_object_id),
+    ...media.map((m) => m.r2_object_id),
+  ].filter(Boolean);
+  const objectsById = new Map();
+  if (objectIds.length > 0) {
+    const uniq = Array.from(new Set(objectIds));
+    const inList = uniq.map((id) => encodeURIComponent(id)).join(',');
+    const objQ = await supabaseSelect(
+      env,
+      'r2_objects',
+      `select=id,bucket,object_key,content_type,size_bytes&id=in.(${inList})`,
+      { serviceRole: true }
+    );
+    if (Array.isArray(objQ.data)) {
+      for (const row of objQ.data) objectsById.set(row.id, row);
+    }
+  }
+
+  const presignOne = async (r2Id) => {
+    const row = objectsById.get(r2Id);
+    if (!row || !env.R2_ACCOUNT_ID || !env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
+      return null;
+    }
+    try {
+      const url = await presignGet({
+        bucket:      row.bucket,
+        key:         row.object_key,
+        accountId:   env.R2_ACCOUNT_ID,
+        accessKeyId: env.R2_ACCESS_KEY_ID,
+        secretKey:   env.R2_SECRET_ACCESS_KEY,
+        expiresSec:  VET_GET_URL_TTL_SEC,
+      });
+      return { url, content_type: row.content_type, size_bytes: row.size_bytes };
+    } catch {
+      return null;
+    }
+  };
+
+  const recordsOut = await Promise.all(records.map(async (r) => ({
+    id:                r.id,
+    record_type:       r.record_type,
+    issued_on:         r.issued_on,
+    expires_on:        r.expires_on,
+    issuing_provider:  r.issuing_provider,
+    notes:             r.notes,
+    created_at:        r.created_at,
+    file:              await presignOne(r.r2_object_id),
+  })));
+  const mediaOut = await Promise.all(media.map(async (m) => ({
+    id:          m.id,
+    kind:        m.kind,
+    caption:     m.caption,
+    taken_on:    m.taken_on,
+    created_at:  m.created_at,
+    file:        await presignOne(m.r2_object_id),
+  })));
+
+  // Bump view_count + viewed_at, append audit row. Both are side-effects
+  // we want to outlive the response, so wrap in waitUntil — otherwise
+  // the runtime can discard the pending promises once we return.
+  const bump = supabaseUpdateReturning(
+    env,
+    'vet_share_tokens',
+    `id=eq.${encodeURIComponent(share.id)}`,
+    { viewed_at: new Date().toISOString(), view_count: (share.view_count ?? 0) + 1 }
+  ).catch((err) => console.warn('[vet] view_count bump failed:', err?.message));
+  if (ctx?.waitUntil) ctx.waitUntil(bump);
+
+  ctx_audit(env, {
+    actor_id: null,
+    actor_role: 'anon',
+    action: 'vet_view.record.read',
+    target_table: 'vet_share_tokens',
+    target_id: share.id,
+    metadata: {
+      animal_id: share.animal_id,
+      records_count: recordsOut.length,
+      media_count: mediaOut.length,
+    },
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+  }, ctx);
+
+  return json({
+    share: {
+      expires_at: share.expires_at,
+      scope: share.scope,
+      issued_at: share.created_at,
+    },
+    animal: {
+      id: animal.id,
+      species: animal.species,
+      barn_name: animal.barn_name,
+      breed: animal.breed,
+      sex: animal.sex,
+      year_born: animal.year_born,
+      discipline: animal.discipline,
+    },
+    records: recordsOut,
+    media: mediaOut,
+  });
 }
 
 /* =============================================================
@@ -476,23 +1783,33 @@ async function handleFlags(request, env) {
   }
 
   let signupV2 = true;
+  let chatV1   = true;
   try {
     if (env.FLAGS) {
-      const raw = await env.FLAGS.get('feature:signup_v2');
-      if (raw !== null && raw !== undefined) {
-        signupV2 = String(raw).trim().toLowerCase() !== 'false';
+      const [signupRaw, chatRaw] = await Promise.all([
+        env.FLAGS.get('feature:signup_v2'),
+        env.FLAGS.get('feature:chat_v1'),
+      ]);
+      if (signupRaw !== null && signupRaw !== undefined) {
+        signupV2 = String(signupRaw).trim().toLowerCase() !== 'false';
+      }
+      if (chatRaw !== null && chatRaw !== undefined) {
+        chatV1 = String(chatRaw).trim().toLowerCase() !== 'false';
       }
     }
   } catch (err) {
-    console.warn('[flags] KV read failed, defaulting signup_v2=true:', err?.message);
+    console.warn('[flags] KV read failed, defaulting all-on:', err?.message);
   }
 
-  return new Response(JSON.stringify({ signup_v2: signupV2 }), {
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'public, max-age=30',
-    },
-  });
+  return new Response(
+    JSON.stringify({ signup_v2: signupV2, chat_v1: chatV1 }),
+    {
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'public, max-age=30',
+      },
+    }
+  );
 }
 
 /* =============================================================
@@ -541,6 +1858,515 @@ async function handleSheetsWebhook(request, env) {
 /* =============================================================
    /api/_integrations-health — Phase 0 smoke test
    ============================================================= */
+/* =============================================================
+   Phase 3.2 — Shop catalog read path
+   -------------------------------------------------------------
+   GET  /api/shop/products
+   GET  /api/shop/products/:handle
+   POST /api/_internal/shop/cache-invalidate   (service_role)
+   POST /api/admin/shop/sync                    (silver_lining,
+                                                 via handleAdmin)
+
+   Reads are served from KV (5-min TTL) when warm; cold reads go
+   through anon+RLS against public.products. Write path is the
+   shopify-catalog-sync Edge Function (service_role) which busts
+   the KV keys at the end of each run.
+   ============================================================= */
+const SHOP_LIST_CACHE_KEY = 'shop:v1:list';
+const SHOP_HANDLE_CACHE_PREFIX = 'shop:v1:handle:';
+const SHOP_CACHE_TTL_SEC = 5 * 60;
+
+function shopHandleIsValid(handle) {
+  return typeof handle === 'string' && /^[a-z0-9][a-z0-9-]{0,120}$/i.test(handle);
+}
+
+async function handleShopProductsList(request, env) {
+  if (request.method !== 'GET') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  // Require a signed-in caller. We don't care about role here —
+  // both owners and trainers can browse. RLS on public.products
+  // already restricts anon.
+  let caller;
+  try {
+    caller = await requireOwner(request, env);
+  } catch (res) {
+    return res instanceof Response ? res : json({ error: 'unauthorized' }, 401);
+  }
+
+  // KV cache (warm path). Stored as the final JSON body string.
+  if (env.FLAGS) {
+    const cached = await env.FLAGS.get(SHOP_LIST_CACHE_KEY);
+    if (cached) {
+      return new Response(cached, {
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+          'x-ml-cache': 'hit',
+        },
+      });
+    }
+  }
+
+  // Cold path — read via caller JWT so RLS enforces the
+  // authenticated-only policy.
+  const r = await supabaseSelect(
+    env,
+    'products',
+    'select=id,shopify_variant_id,handle,sku,title,description,image_url,price_cents,currency,category,inventory_qty,available,last_synced_at&archived_at=is.null&order=available.desc,title.asc&limit=500',
+    { userJwt: caller.jwt }
+  );
+  if (!r.ok) {
+    return json({ error: 'products_read_failed', status: r.status }, 500);
+  }
+
+  const rows = Array.isArray(r.data) ? r.data : [];
+  const categories = Array.from(
+    new Set(rows.map((row) => row.category).filter((c) => typeof c === 'string'))
+  ).sort();
+
+  const body = JSON.stringify({ products: rows, categories });
+  if (env.FLAGS) {
+    await env.FLAGS.put(SHOP_LIST_CACHE_KEY, body, { expirationTtl: SHOP_CACHE_TTL_SEC });
+  }
+  return new Response(body, {
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-ml-cache': 'miss',
+    },
+  });
+}
+
+async function handleShopProductByHandle(request, env, rawHandle) {
+  if (request.method !== 'GET') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  const handle = decodeURIComponent(rawHandle || '');
+  if (!shopHandleIsValid(handle)) {
+    return json({ error: 'bad_handle' }, 400);
+  }
+
+  let caller;
+  try {
+    caller = await requireOwner(request, env);
+  } catch (res) {
+    return res instanceof Response ? res : json({ error: 'unauthorized' }, 401);
+  }
+
+  const cacheKey = `${SHOP_HANDLE_CACHE_PREFIX}${handle.toLowerCase()}`;
+  if (env.FLAGS) {
+    const cached = await env.FLAGS.get(cacheKey);
+    if (cached) {
+      return new Response(cached, {
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+          'x-ml-cache': 'hit',
+        },
+      });
+    }
+  }
+
+  // Cold cache: read the local row via caller JWT (RLS).
+  const r = await supabaseSelect(
+    env,
+    'products',
+    `select=id,shopify_variant_id,handle,sku,title,description,image_url,price_cents,currency,category,inventory_qty,available,last_synced_at&handle=eq.${encodeURIComponent(handle)}&archived_at=is.null&limit=1`,
+    { userJwt: caller.jwt }
+  );
+
+  let product = Array.isArray(r.data) && r.data.length > 0 ? r.data[0] : null;
+
+  // On-demand fallback: deep link to a handle the sync hasn't seen
+  // yet. If Shopify is configured, fetch once and return without
+  // persisting (the next sync will pick it up).
+  if (!product && shopifyConfigured(env)) {
+    try {
+      const node = await fetchProductByHandle(env, handle);
+      if (node) {
+        const row = shopifyNodeToProductRow(node);
+        if (row) {
+          product = {
+            id: null,
+            shopify_variant_id: row.shopify_variant_id,
+            handle: row.handle,
+            sku: row.sku,
+            title: row.title,
+            description: row.description,
+            image_url: row.image_url,
+            price_cents: row.price_cents,
+            currency: row.currency,
+            category: row.category,
+            inventory_qty: row.inventory_qty,
+            available: row.available,
+            last_synced_at: row.last_synced_at,
+          };
+        }
+      }
+    } catch {
+      // Fall through — we just return 404 below.
+    }
+  }
+
+  if (!product) {
+    return json({ error: 'not_found' }, 404);
+  }
+
+  const body = JSON.stringify({ product });
+  if (env.FLAGS) {
+    await env.FLAGS.put(cacheKey, body, { expirationTtl: SHOP_CACHE_TTL_SEC });
+  }
+  return new Response(body, {
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-ml-cache': 'miss',
+    },
+  });
+}
+
+async function handleShopCacheInvalidate(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+  const authz = request.headers.get('authorization') || '';
+  const expected = `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`;
+  if (!timingSafeEqual(authz, expected)) {
+    return json({ error: 'unauthorized' }, 401);
+  }
+
+  if (!env.FLAGS) {
+    return json({ ok: true, skipped: 'no_kv_binding' });
+  }
+
+  // Blow the list key; per-handle keys self-expire within 5 min,
+  // which is fine because a handle's price/inventory rarely flips
+  // independent of the full catalog.
+  await env.FLAGS.delete(SHOP_LIST_CACHE_KEY);
+
+  return json({ ok: true, invalidated: [SHOP_LIST_CACHE_KEY] });
+}
+
+/* =============================================================
+   /api/shop/checkout  — Phase 3.4
+   -------------------------------------------------------------
+   Owner-only. Body: { items: [{ variant_id, qty }] }.
+   Flow:
+     1. Resolve every variant_id against public.products via
+        service_role (the Worker is the single source of price
+        truth; the SPA never sets price or fee).
+     2. Reject out-of-stock items fast (fail before creating a
+        Stripe session).
+     3. INSERT orders row with status='pending_payment' and a
+        provisional subtotal/total.
+     4. If SLH_CONNECT_ACCOUNT_ID is unset, we skip Stripe entirely
+        and stamp status='awaiting_merchant_setup' instead. The
+        order is still visible in /app/orders so the owner can see
+        the attempt. (Phase 2 precedent for awaiting_trainer_setup.)
+     5. Otherwise mint a hosted Checkout Session with
+        Idempotency-Key = shop_checkout:<order_id>, and record
+        stripe_checkout_session_id on the row.
+   ============================================================= */
+const SHOP_CHECKOUT_RATE = { limit: 10, windowSec: 60 };
+
+async function handleShopCheckout(request, env, url) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const rl = await rateLimit(
+    env,
+    `ratelimit:shop_checkout:${actorId}`,
+    SHOP_CHECKOUT_RATE
+  );
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, {
+      'retry-after': String(rl.resetSec),
+    });
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const items = Array.isArray(body?.items) ? body.items : [];
+  if (items.length === 0 || items.length > 50) {
+    return json({ error: 'bad_items' }, 400);
+  }
+
+  // Optional Phase 3.8 payload. When present the orders row is tagged
+  // `source='in_expense'` and the webhook auto-creates the matching
+  // `expenses` row on `checkout.session.completed`. Honored only when
+  // items.length === 1 — see phase-3-plan.md §3.8 edge cases.
+  const expenseDraftRaw = body?.expense_draft && typeof body.expense_draft === 'object'
+    ? body.expense_draft
+    : null;
+  let expenseDraft = null;
+  if (expenseDraftRaw) {
+    if (items.length !== 1) {
+      return json({ error: 'expense_draft_requires_single_item' }, 400);
+    }
+    const animalId = typeof expenseDraftRaw.animal_id === 'string' ? expenseDraftRaw.animal_id : '';
+    const recorderRole = expenseDraftRaw.recorder_role === 'trainer' ? 'trainer' : 'owner';
+    const category = typeof expenseDraftRaw.category === 'string' ? expenseDraftRaw.category : '';
+    const occurredOn = typeof expenseDraftRaw.occurred_on === 'string' ? expenseDraftRaw.occurred_on : '';
+    const notesRaw = typeof expenseDraftRaw.notes === 'string' ? expenseDraftRaw.notes : '';
+    if (!/^[0-9a-f-]{36}$/i.test(animalId)) return json({ error: 'bad_animal_id' }, 400);
+    if (category !== 'supplement') return json({ error: 'bad_expense_category' }, 400);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(occurredOn)) return json({ error: 'bad_occurred_on' }, 400);
+
+    // Access check. Owners must own the animal; trainers must hold an
+    // active grant via do_i_have_access_to_animal. Both verified with
+    // the caller's JWT (RLS is the backstop but we want a clean 403
+    // before minting a Stripe session that can't be reconciled).
+    if (recorderRole === 'owner') {
+      const r = await supabaseSelect(
+        env,
+        'animals',
+        `select=id&id=eq.${encodeURIComponent(animalId)}&owner_id=eq.${encodeURIComponent(actorId)}&limit=1`,
+        { userJwt: jwt }
+      );
+      if (!r.ok || !Array.isArray(r.data) || r.data.length === 0) {
+        return json({ error: 'expense_draft_forbidden' }, 403);
+      }
+    } else {
+      const ok = await supabaseRpc(
+        env,
+        'do_i_have_access_to_animal',
+        { animal_id: animalId },
+        { userJwt: jwt }
+      );
+      if (!ok.ok || ok.data !== true) {
+        return json({ error: 'expense_draft_forbidden' }, 403);
+      }
+    }
+
+    // Trim notes to leave room under Stripe's 500-char metadata cap.
+    // JSON-encoded draft with full shape fits under ~450 chars with
+    // ~200 chars of notes; cap defensively.
+    const notes = notesRaw.trim().slice(0, 200);
+    expenseDraft = {
+      animal_id:     animalId,
+      recorder_role: recorderRole,
+      recorder_id:   actorId,
+      category,
+      occurred_on:   occurredOn,
+      notes:         notes || null,
+    };
+  }
+
+  // Normalize, dedupe by variant_id (SPA might send the same SKU
+  // twice; we collapse to one line with summed qty).
+  const byVariant = new Map();
+  for (const raw of items) {
+    const variantId = typeof raw?.variant_id === 'string' ? raw.variant_id.trim() : '';
+    const qty = Math.floor(Number(raw?.qty));
+    if (!variantId || !Number.isFinite(qty) || qty <= 0 || qty > 99) {
+      return json({ error: 'bad_items' }, 400);
+    }
+    byVariant.set(variantId, (byVariant.get(variantId) ?? 0) + qty);
+  }
+  const variantIds = Array.from(byVariant.keys());
+
+  // Server-side price + availability resolution. service_role so
+  // we see every row regardless of the requesting JWT's RLS view.
+  const filter = variantIds
+    .map((v) => `"${v.replace(/"/g, '\\"')}"`)
+    .join(',');
+  const lookup = await supabaseSelect(
+    env,
+    'products',
+    `select=id,shopify_variant_id,handle,sku,title,image_url,price_cents,available,archived_at&shopify_variant_id=in.(${encodeURIComponent(filter)})`,
+    { serviceRole: true }
+  );
+  if (!lookup.ok) {
+    return json({ error: 'products_read_failed' }, 500);
+  }
+  const rows = Array.isArray(lookup.data) ? lookup.data : [];
+  const productsByVariant = new Map(rows.map((r) => [r.shopify_variant_id, r]));
+
+  const resolvedLines = [];
+  for (const variantId of variantIds) {
+    const p = productsByVariant.get(variantId);
+    if (!p || p.archived_at) {
+      return json({ error: 'item_not_found', variant_id: variantId }, 409);
+    }
+    if (!p.available) {
+      return json({ error: 'out_of_stock', variant_id: variantId }, 409);
+    }
+    const qty = byVariant.get(variantId);
+    const unit = Number(p.price_cents);
+    if (!Number.isFinite(unit) || unit <= 0) {
+      return json({ error: 'price_invalid', variant_id: variantId }, 500);
+    }
+    resolvedLines.push({
+      product: p,
+      variantId,
+      qty,
+      unitAmountCents: unit,
+      lineTotalCents: unit * qty,
+    });
+  }
+
+  const subtotalCents = resolvedLines.reduce((s, l) => s + l.lineTotalCents, 0);
+  if (subtotalCents <= 0) {
+    return json({ error: 'empty_order' }, 400);
+  }
+
+  const connectAccountId = env.SLH_CONNECT_ACCOUNT_ID || null;
+  const stripeReady = isStripeConfigured(env) && Boolean(connectAccountId);
+  const initialStatus = stripeReady ? 'pending_payment' : 'awaiting_merchant_setup';
+  const orderSource = expenseDraft ? 'in_expense' : 'shop';
+
+  // Create the order row first so we can key Stripe idempotency off its uuid.
+  const ordersIns = await supabaseInsertReturning(env, 'orders', {
+    owner_id:       actorId,
+    subtotal_cents: subtotalCents,
+    total_cents:    subtotalCents,
+    currency:       'usd',
+    status:         initialStatus,
+    source:         orderSource,
+  });
+  if (!ordersIns.ok || !ordersIns.data?.id) {
+    return json({ error: 'order_insert_failed', status: ordersIns.status }, 500);
+  }
+  const orderId = ordersIns.data.id;
+
+  // Audit — we intentionally log BEFORE minting the Stripe session so
+  // a failure between insert and webhook is still traceable.
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'owner',
+    action:       'order.create',
+    target_table: 'orders',
+    target_id:    orderId,
+    ip:           clientIp(request),
+    user_agent:   request.headers.get('user-agent') || null,
+    metadata: {
+      source:       orderSource,
+      line_count:   resolvedLines.length,
+      total_cents:  subtotalCents,
+      awaiting:     initialStatus === 'awaiting_merchant_setup',
+      ...(expenseDraft
+        ? { expense_draft_animal_id: expenseDraft.animal_id }
+        : {}),
+    },
+  });
+
+  // Path A — SLH not set up yet: park the order, no Stripe call.
+  if (!stripeReady) {
+    return json({
+      order_id: orderId,
+      status:   'awaiting_merchant_setup',
+    });
+  }
+
+  // Path B — mint Checkout Session.
+  const who = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+    headers: {
+      apikey: env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${jwt}`,
+    },
+  });
+  const whoData = who.ok ? await who.json().catch(() => null) : null;
+  const email = whoData?.email || null;
+
+  const origin = new URL(request.url).origin;
+  const session = await createCheckoutSession(env, {
+    ownerId: actorId,
+    orderId,
+    email,
+    successUrl: `${origin}/app/orders/${orderId}?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+    cancelUrl:  `${origin}/app/orders/${orderId}?checkout=cancel`,
+    connectAccountId,
+    idempotencyKey: `shop_checkout:${orderId}`,
+    source: orderSource,
+    expenseDraftJson: expenseDraft ? JSON.stringify(expenseDraft) : null,
+    lineItems: resolvedLines.map((l) => ({
+      title:             l.product.title,
+      sku:               l.product.sku,
+      shopifyVariantId:  l.variantId,
+      productId:         l.product.id,
+      imageUrl:          l.product.image_url || null,
+      unitAmountCents:   l.unitAmountCents,
+      quantity:          l.qty,
+    })),
+  });
+  if (!session.ok || !session.data?.id || !session.data?.url) {
+    // Roll the order to failed so retries don't stack pending_payment rows.
+    await supabaseUpdateReturning(
+      env,
+      'orders',
+      `id=eq.${encodeURIComponent(orderId)}`,
+      {
+        status:          'failed',
+        failure_code:    session.error || 'stripe_session_failed',
+        failure_message: session.message ?? null,
+      }
+    );
+    return json({
+      error:   session.error || 'stripe_session_failed',
+      message: session.message ?? null,
+    }, 502);
+  }
+
+  await supabaseUpdateReturning(
+    env,
+    'orders',
+    `id=eq.${encodeURIComponent(orderId)}`,
+    { stripe_checkout_session_id: session.data.id }
+  );
+
+  return json({
+    order_id: orderId,
+    status:   'pending_payment',
+    url:      session.data.url,
+  });
+}
+
+async function adminShopSync(env) {
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  const res = await fetch(
+    `${env.SUPABASE_URL}/functions/v1/shopify-catalog-sync`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+      body: '{}',
+    }
+  );
+
+  let body;
+  try { body = await res.json(); } catch { body = { ok: res.ok }; }
+  return json(body, res.ok ? 200 : 502);
+}
+
 async function handleIntegrationsHealth(request, env) {
   if (request.method !== 'GET') {
     return new Response('method not allowed', { status: 405 });
@@ -562,6 +2388,10 @@ async function handleIntegrationsHealth(request, env) {
     'HUBSPOT_PORTAL_ID',
     'STRIPE_SECRET_KEY',
     'STRIPE_WEBHOOK_SECRET',
+    'TWILIO_ACCOUNT_SID',
+    'TWILIO_AUTH_TOKEN',
+    'TWILIO_FROM_NUMBER',
+    'RESEND_API_KEY',
   ];
 
   const publicEnv = {};
@@ -584,15 +2414,324 @@ async function handleIntegrationsHealth(request, env) {
     secretsPresent.R2_SECRET_ACCESS_KEY;
   const r2 = r2BindingPresent && r2CredsPresent ? 'live' : 'mock';
 
+  // Shopify is "live" only when (a) storefront secrets set AND
+  // (b) shopify_sync_cursor.last_ok_at is within the last 2 h.
+  // Otherwise we report "mock" even if the tokens are present —
+  // stale catalog is indistinguishable from no catalog from a
+  // consumer perspective.
+  const shopifyTokensPresent =
+    secretsPresent.SHOPIFY_STORE_DOMAIN && secretsPresent.SHOPIFY_STOREFRONT_TOKEN;
+  let shopify = 'mock';
+  if (shopifyTokensPresent && env.SUPABASE_SERVICE_ROLE_KEY) {
+    const r = await supabaseSelect(
+      env,
+      'shopify_sync_cursor',
+      'select=last_ok_at&id=eq.1&limit=1',
+      { serviceRole: true }
+    );
+    const last = Array.isArray(r.data) && r.data[0] ? r.data[0].last_ok_at : null;
+    if (last) {
+      const ageMs = Date.now() - new Date(last).getTime();
+      if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < 2 * 60 * 60 * 1000) {
+        shopify = 'live';
+      }
+    }
+  }
+
+  // Phase 4.9 — Protocol Brain observability. All three metrics are read
+  // from Supabase with service_role (per OAG Law 2 — admin reads route
+  // through the Worker). Any failure degrades to null; the health
+  // endpoint should never 500 because of a metrics query.
+  let chatP50LatencyMs = null;
+  let emergencyRate1h  = null;
+  let chatRuns1h       = 0;
+  let protocolsIndexed = null;
+  if (env.SUPABASE_SERVICE_ROLE_KEY) {
+    try {
+      const sinceIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      const runsQ =
+        `select=latency_ms,emergency_triggered&role=eq.assistant` +
+        `&created_at=gte.${encodeURIComponent(sinceIso)}`;
+      const runs = await supabaseSelect(env, 'chatbot_runs', runsQ, { serviceRole: true });
+      if (runs.ok && Array.isArray(runs.data)) {
+        chatRuns1h = runs.data.length;
+        const lats = runs.data
+          .map((r) => r.latency_ms)
+          .filter((x) => typeof x === 'number' && x >= 0)
+          .sort((a, b) => a - b);
+        if (lats.length > 0) chatP50LatencyMs = lats[Math.floor(lats.length / 2)];
+        if (chatRuns1h > 0) {
+          const em = runs.data.filter((r) => r.emergency_triggered === true).length;
+          emergencyRate1h = em / chatRuns1h;
+        }
+      }
+    } catch { /* ignore — metric stays null */ }
+    try {
+      const protosResp = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/protocols?select=id&embed_status=eq.synced&limit=1`,
+        {
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            Prefer: 'count=exact',
+          },
+        }
+      );
+      const cr = protosResp.headers.get('content-range');
+      if (cr) {
+        const m = cr.match(/\/(\d+|\*)$/);
+        if (m && m[1] !== '*') protocolsIndexed = Number(m[1]);
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Workers AI is 'live' when we have *any* chat run in the last hour with
+  // non-null latency (i.e., the model actually returned). Empty window =
+  // still 'mock' until traffic proves the binding answers.
+  const workersAiLive = chatP50LatencyMs !== null;
+  const vectorizeLive = Boolean(env.VECTORIZE_PROTOCOLS) && (protocolsIndexed ?? 0) > 0;
+
+  // Phase 5.6 — HubSpot health. 'live' iff (a) private-app token
+  // set AND (b) at least one successful sync_log row within 24h.
+  // queue_depth counts pending rows older than 15 min (healthy
+  // drains keep this ≤ 5). dead_letter_count_24h is the loud
+  // alarm — anything > 0 should be investigated.
+  const hubspotTokenPresent = secretsPresent.HUBSPOT_PRIVATE_APP_TOKEN;
+  let hubspotStatus = 'mock';
+  let hubspotQueueDepth = null;
+  let hubspotDeadLetter24h = null;
+  if (env.SUPABASE_SERVICE_ROLE_KEY) {
+    try {
+      const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const since15m = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+
+      if (hubspotTokenPresent) {
+        const logResp = await fetch(
+          `${env.SUPABASE_URL}/rest/v1/hubspot_sync_log?select=id&created_at=gte.${encodeURIComponent(since24h)}&limit=1`,
+          {
+            headers: {
+              apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            },
+          }
+        );
+        if (logResp.ok) {
+          const rows = await logResp.json().catch(() => []);
+          if (Array.isArray(rows) && rows.length > 0) hubspotStatus = 'live';
+        }
+      }
+
+      const qResp = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/pending_hubspot_syncs?select=id&status=eq.pending&created_at=lte.${encodeURIComponent(since15m)}&limit=1`,
+        {
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            Prefer: 'count=exact',
+          },
+        }
+      );
+      if (qResp.ok) {
+        const cr = qResp.headers.get('content-range');
+        const m = cr ? cr.match(/\/(\d+|\*)$/) : null;
+        if (m && m[1] !== '*') hubspotQueueDepth = Number(m[1]);
+      }
+
+      const dlResp = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/pending_hubspot_syncs?select=id&status=eq.dead_letter&updated_at=gte.${encodeURIComponent(since24h)}&limit=1`,
+        {
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            Prefer: 'count=exact',
+          },
+        }
+      );
+      if (dlResp.ok) {
+        const cr = dlResp.headers.get('content-range');
+        const m = cr ? cr.match(/\/(\d+|\*)$/) : null;
+        if (m && m[1] !== '*') hubspotDeadLetter24h = Number(m[1]);
+      }
+    } catch { /* metrics stay null */ }
+  }
+
+  // Phase 5.8 — admin + vet observability. Proves the audit pipeline is
+  // actually writing (admin reads every admin endpoint should stamp a
+  // row) and that the vet-share surface is being used.
+  let adminAuditWrites24h = null;
+  let vetScopedReads24h = null;
+  if (env.SUPABASE_SERVICE_ROLE_KEY) {
+    const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    try {
+      const aResp = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/audit_log?select=id&action=like.admin.*&occurred_at=gte.${encodeURIComponent(since24h)}&limit=1`,
+        {
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            Prefer: 'count=exact',
+          },
+        }
+      );
+      if (aResp.ok) {
+        const cr = aResp.headers.get('content-range');
+        const m = cr ? cr.match(/\/(\d+|\*)$/) : null;
+        if (m && m[1] !== '*') adminAuditWrites24h = Number(m[1]);
+      }
+    } catch { /* metric stays null */ }
+    try {
+      const vResp = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/audit_log?select=id&action=eq.vet_view.record.read&occurred_at=gte.${encodeURIComponent(since24h)}&limit=1`,
+        {
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            Prefer: 'count=exact',
+          },
+        }
+      );
+      if (vResp.ok) {
+        const cr = vResp.headers.get('content-range');
+        const m = cr ? cr.match(/\/(\d+|\*)$/) : null;
+        if (m && m[1] !== '*') vetScopedReads24h = Number(m[1]);
+      }
+    } catch { /* metric stays null */ }
+  }
+
+  // Phase 6.7 — Twilio emergency paging + Stripe subscriptions + closed-beta
+  // onboarding metrics. Every query is service-role (Law §2) and degrades
+  // to null on failure so the endpoint never 500s due to a metric read.
+  const twilioCredsPresent =
+    secretsPresent.TWILIO_ACCOUNT_SID && secretsPresent.TWILIO_AUTH_TOKEN;
+  let twilioDispatches24h = null;
+  let twilioDeliveryFailures24h = null;
+  let twilioLastDispatchAt = null;
+  let subsActiveCount = null;
+  let subsPastDueCount = null;
+  let invitedCount = null;
+  let activatedCount = null;
+  if (env.SUPABASE_SERVICE_ROLE_KEY) {
+    const countFrom = async (path) => {
+      try {
+        const r = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            Prefer: 'count=exact',
+          },
+        });
+        if (!r.ok) return null;
+        const cr = r.headers.get('content-range');
+        const m = cr ? cr.match(/\/(\d+|\*)$/) : null;
+        if (m && m[1] !== '*') return Number(m[1]);
+        return null;
+      } catch { return null; }
+    };
+    const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    twilioDispatches24h = await countFrom(
+      `sms_dispatches?select=id&created_at=gte.${encodeURIComponent(since24h)}&limit=1`,
+    );
+    twilioDeliveryFailures24h = await countFrom(
+      `sms_dispatches?select=id&status=in.(failed,undelivered)&created_at=gte.${encodeURIComponent(since24h)}&limit=1`,
+    );
+    try {
+      const r = await supabaseSelect(
+        env,
+        'sms_dispatches',
+        'select=created_at&order=created_at.desc&limit=1',
+        { serviceRole: true },
+      );
+      if (r.ok && Array.isArray(r.data) && r.data[0]?.created_at) {
+        twilioLastDispatchAt = r.data[0].created_at;
+      }
+    } catch { /* ignore */ }
+
+    subsActiveCount = await countFrom(
+      'stripe_subscriptions?select=id&status=in.(active,trialing)&archived_at=is.null&limit=1',
+    );
+    subsPastDueCount = await countFrom(
+      'stripe_subscriptions?select=id&status=in.(past_due,unpaid)&archived_at=is.null&limit=1',
+    );
+
+    invitedCount = await countFrom(
+      'invitations?select=id&archived_at=is.null&limit=1',
+    );
+    activatedCount = await countFrom(
+      'invitations?select=id&accepted_at=not.is.null&archived_at=is.null&limit=1',
+    );
+  }
+
+  // Twilio is 'live' when credentials are set AND (either zero dispatches
+  // ever OR the most recent dispatch is within the last 7 days). A long
+  // gap in dispatches points to a broken integration even if the keys are
+  // configured — better to show 'mock' and get a visible signal.
+  let twilio = 'mock';
+  if (twilioCredsPresent) {
+    if (!twilioLastDispatchAt) {
+      twilio = 'live';
+    } else {
+      const ageMs = Date.now() - new Date(twilioLastDispatchAt).getTime();
+      if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < 7 * 24 * 60 * 60 * 1000) {
+        twilio = 'live';
+      }
+    }
+  }
+
+  // Stripe live if the secret is present. Refunds + subscriptions both
+  // route through /api/admin/..., so a present key means the panel works.
+  const stripeLive = !!secretsPresent.STRIPE_SECRET_KEY;
+
   const body = {
-    shopify:    'mock',
-    hubspot:    'mock',
-    workersAi:  'mock',
-    stripe:     'mock',
+    shopify,
+    hubspot: {
+      status:                   hubspotStatus,
+      queue_depth:              hubspotQueueDepth,
+      dead_letter_count_24h:    hubspotDeadLetter24h,
+    },
+    admin: {
+      audit_writes_24h:         adminAuditWrites24h,
+    },
+    vet_view: {
+      scoped_reads_24h:         vetScopedReads24h,
+    },
+    workersAi: {
+      status: workersAiLive ? 'live' : 'mock',
+      chat_p50_latency_ms: chatP50LatencyMs,
+      emergency_rate_1h:   emergencyRate1h,
+      runs_1h:             chatRuns1h,
+    },
+    vectorize: {
+      status: vectorizeLive ? 'live' : 'mock',
+      protocols_indexed: protocolsIndexed,
+    },
+    twilio: {
+      status:                   twilio,
+      dispatches_24h:           twilioDispatches24h,
+      delivery_failures_24h:    twilioDeliveryFailures24h,
+      last_dispatch_at:         twilioLastDispatchAt,
+    },
+    stripe: {
+      status:                   stripeLive ? 'live' : 'mock',
+      subscriptions_active_count:   subsActiveCount,
+      subscriptions_past_due_count: subsPastDueCount,
+    },
+    onboarding: {
+      invited_count:            invitedCount,
+      activated_count:          activatedCount,
+    },
     r2,
+    rate_limiter: {
+      // Phase 6.3 — 'durable_object' (post-migration default) serialises
+      // per-bucket reads via the RateLimiter DO; 'kv' falls back to the
+      // legacy best-effort KV counter. Flag lives in wrangler.toml [vars].
+      mode:             rateLimiterMode(env),
+      do_binding_ready: Boolean(env.RATE_LIMITER),
+    },
     bindings: {
       FLAGS:               Boolean(env.FLAGS),
       ML_RL:               Boolean(env.ML_RL),
+      RATE_LIMITER:        Boolean(env.RATE_LIMITER),
       ASSETS:              Boolean(env.ASSETS),
       AI:                  Boolean(env.AI),
       VECTORIZE_PROTOCOLS: Boolean(env.VECTORIZE_PROTOCOLS),
@@ -659,6 +2798,26 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB
  * { actorId, jwt } on success; throws a `Response` on any failure so
  * the caller can `return err` directly.
  */
+async function handleClaimInvite(request, env) {
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (res) {
+    return res;
+  }
+  return claimInvite(env, request, actorId, jwt);
+}
+
+async function handleDismissWelcomeTour(request, env) {
+  let actorId;
+  try {
+    ({ actorId } = await requireOwner(request, env));
+  } catch (res) {
+    return res;
+  }
+  return dismissWelcomeTour(env, actorId);
+}
+
 async function requireOwner(request, env) {
   if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) {
     throw json({ error: 'not_configured' }, 500);
@@ -687,9 +2846,81 @@ async function requireOwner(request, env) {
 }
 
 /**
+ * Phase 6.3 — unified rate-limit entry point. Dispatches to the
+ * Durable Object implementation by default, or falls back to the
+ * legacy KV counter when `env.RATE_LIMITER_MODE === 'kv'` (or the DO
+ * binding isn't wired yet — covers local dev against a wrangler.toml
+ * that hasn't been updated). Every call site in this Worker routes
+ * through here so flipping the flag only touches one line.
+ *
+ * Returns `{ ok, remaining, resetSec }` — same shape callers already
+ * consume. resetSec is derived from the DO's resetMs so existing
+ * Retry-After math (seconds) keeps working unchanged.
+ */
+async function rateLimit(env, bucketKey, { limit, windowSec }) {
+  const mode = rateLimiterMode(env);
+  if (mode === 'durable_object' && env.RATE_LIMITER) {
+    return rateLimitDO(env, bucketKey, { limit, windowSec });
+  }
+  return rateLimitKv(env.ML_RL, bucketKey, { limit, windowSec });
+}
+
+/**
+ * Active rate-limiter mode. Drives both the dispatcher above and the
+ * `rate_limiter.mode` field on /api/_integrations-health. Treats an
+ * unset var as 'durable_object' so a fresh deploy after 6.3 defaults
+ * to the DO path without needing an explicit [vars] entry.
+ */
+function rateLimiterMode(env) {
+  const raw = (env.RATE_LIMITER_MODE || '').toString().trim().toLowerCase();
+  if (raw === 'kv') return 'kv';
+  return 'durable_object';
+}
+
+/**
+ * Durable Object rate limit. One DO instance per bucket key via
+ * `idFromName`, so a hot key serializes against itself and nothing
+ * else. blockConcurrencyWhile inside the DO ensures a burst gets a
+ * deterministic split (limit × 200, rest × 429) with no slip-through.
+ *
+ * The DO speaks JSON over a fetch() RPC — we just wrap the response
+ * back into the legacy `{ ok, remaining, resetSec }` shape.
+ */
+async function rateLimitDO(env, bucketKey, { limit, windowSec }) {
+  const windowMs = Math.max(1000, windowSec * 1000);
+  try {
+    const id   = env.RATE_LIMITER.idFromName(bucketKey);
+    const stub = env.RATE_LIMITER.get(id);
+    const resp = await stub.fetch('https://ratelimiter.internal/check', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ limit, windowMs }),
+    });
+    if (!resp.ok) {
+      // DO itself failed — fail-open so a DO outage can't 500 every
+      // rate-limited path. Log so we notice via `wrangler tail`.
+      console.warn('[rate] DO responded non-2xx, failing open:', resp.status);
+      return { ok: true, remaining: limit, resetSec: windowSec };
+    }
+    const body = await resp.json();
+    return {
+      ok:        Boolean(body.ok),
+      remaining: Number.isFinite(body.remaining) ? body.remaining : 0,
+      resetSec:  Math.max(1, Math.ceil((Number(body.resetMs) || 0) / 1000)),
+    };
+  } catch (err) {
+    console.warn('[rate] DO dispatch threw, failing open:', err?.message);
+    return { ok: true, remaining: limit, resetSec: windowSec };
+  }
+}
+
+/**
  * KV-bound rate limit (mirror of the older rateLimit() helper, but
  * keyed off whichever KV binding the caller passes — we use ML_RL for
  * upload paths so the bucket doesn't contend with feature-flag reads).
+ *
+ * Retained as a fallback when RATE_LIMITER_MODE='kv'. Phase 6.9 deletes
+ * this once the DO path has burned in for 24h under real traffic.
  */
 async function rateLimitKv(kv, bucketKey, { limit, windowSec }) {
   if (!kv) return { ok: true, remaining: limit, resetSec: windowSec };
@@ -704,8 +2935,23 @@ async function rateLimitKv(kv, bucketKey, { limit, windowSec }) {
   state.count += 1;
   const ok = state.count <= limit;
 
-  const ttl = Math.max(state.resetAt - now + 5, 10);
-  await kv.put(bucketKey, JSON.stringify(state), { expirationTtl: ttl });
+  // Workers KV enforces a 60-second minimum on expirationTtl; anything
+  // lower throws `KV PUT failed: 400 Invalid expiration_ttl`. Clamp up
+  // so a short rate-limit window near its boundary can't explode the
+  // request handler.
+  const ttl = Math.max(state.resetAt - now + 60, 60);
+  // KV has a 1-write/sec-per-key cap. Under burst, kv.put throws
+  // `429 Too Many Requests` — which is itself evidence the key is hot
+  // and we're rate-limiting correctly. Swallow it: the in-request
+  // `ok` decision (state.count vs limit) is still right. The counter
+  // can fall a bit behind real traffic, but that's fine for a best-
+  // effort per-minute limit — if we cared about exactness we'd use a
+  // Durable Object. See TECH_DEBT(phase-5) for the upgrade path.
+  try {
+    await kv.put(bucketKey, JSON.stringify(state), { expirationTtl: ttl });
+  } catch (err) {
+    console.warn('[rate] kv.put failed (burst hot key):', err?.message);
+  }
 
   return {
     ok,
@@ -794,7 +3040,7 @@ async function handleUploadSign(request, env) {
     return json({ error: 'bad_request', detail: 'animal_id required for this kind' }, 400);
   }
 
-  const rl = await rateLimitKv(env.ML_RL, `ratelimit:upload_sign:${actorId}`, UPLOAD_SIGN_RATE);
+  const rl = await rateLimit(env, `ratelimit:upload_sign:${actorId}`, UPLOAD_SIGN_RATE);
   if (!rl.ok) {
     return json(
       { error: 'rate_limited', retry_after: rl.resetSec },
@@ -992,7 +3238,7 @@ async function handleUploadReadUrl(request, env, url) {
     return json({ error: 'bad_request', detail: 'object_key required' }, 400);
   }
 
-  const rl = await rateLimitKv(env.ML_RL, `ratelimit:read_url:${actorId}`, UPLOAD_READ_URL_RATE);
+  const rl = await rateLimit(env, `ratelimit:read_url:${actorId}`, UPLOAD_READ_URL_RATE);
   if (!rl.ok) {
     return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
   }
@@ -1113,10 +3359,11 @@ async function supabaseDelete(env, table, filterQuery) {
  * Fire-and-forget audit_log insert. Does not block the response path —
  * failures are logged but never surface to the client.
  */
-function ctx_audit(env, row) {
-  supabaseInsert(env, 'audit_log', row).catch((err) =>
+function ctx_audit(env, row, ctx) {
+  const p = supabaseInsert(env, 'audit_log', row).catch((err) =>
     console.warn('[audit] insert failed:', err?.message)
   );
+  if (ctx?.waitUntil) ctx.waitUntil(p);
 }
 
 async function supabaseUpdateReturning(env, table, filterQuery, patch) {
@@ -1177,8 +3424,8 @@ async function handleAnimalArchiveToggle(request, env, action) {
     throw resp;
   }
 
-  const rl = await rateLimitKv(
-    env.ML_RL,
+  const rl = await rateLimit(
+    env,
     `ratelimit:animal_archive:${actorId}`,
     ARCHIVE_RATE
   );
@@ -1295,8 +3542,8 @@ async function handleSessionArchive(request, env) {
     throw resp;
   }
 
-  const rl = await rateLimitKv(
-    env.ML_RL,
+  const rl = await rateLimit(
+    env,
     `ratelimit:session_archive:${actorId}`,
     SESSION_ARCHIVE_RATE
   );
@@ -1372,6 +3619,127 @@ async function handleSessionArchive(request, env) {
 }
 
 /* =============================================================
+   /api/expenses/archive
+   -------------------------------------------------------------
+   Soft-archive an expense row. Either the owner of the underlying
+   animal OR a trainer with an active grant + authorship on the row
+   can archive — access is encapsulated in the
+   is_expense_owner_or_granted_trainer helper (migration 00009:391).
+
+   Flow:
+     1. requireOwner — valid Supabase JWT.
+     2. SELECT the expense with the caller's JWT so RLS narrows
+        reads. If the row comes back, the caller can SEE it.
+     3. Additional fine-grained check via the helper RPC — blocks
+        "I can see this because I'm the animal owner, but someone
+        else authored it" UPDATE attempts before the RLS UPDATE
+        policy does (clearer 403 vs. silent no-op).
+     4. service_role UPDATE expenses.archived_at = now().
+     5. service_role INSERT expense_archive_events audit row.
+     6. audit_log fire-and-forget.
+
+   OAG §8: no hard deletes; every archive writes an append-only
+   event row.
+   ============================================================= */
+const EXPENSE_ARCHIVE_RATE = { limit: 30, windowSec: 60 };
+
+async function handleExpenseArchive(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId, jwt;
+  try {
+    ({ actorId, jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const rl = await rateLimit(
+    env,
+    `ratelimit:expense_archive:${actorId}`,
+    EXPENSE_ARCHIVE_RATE
+  );
+  if (!rl.ok) {
+    return json(
+      { error: 'rate_limited', retry_after: rl.resetSec },
+      429,
+      { 'retry-after': String(rl.resetSec) }
+    );
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const expenseId = typeof body?.expense_id === 'string' ? body.expense_id : '';
+  const reasonRaw = typeof body?.reason === 'string' ? body.reason.trim() : '';
+  if (!expenseId) return json({ error: 'expense_id required' }, 400);
+
+  // Caller-scoped SELECT via RLS confirms they can at least SEE the
+  // row. Owners see any row on their animal; trainers see rows on
+  // granted animals (regardless of authorship).
+  const lookup = await supabaseSelect(
+    env,
+    'expenses',
+    `select=id,recorder_id,recorder_role,animal_id,archived_at&id=eq.${encodeURIComponent(expenseId)}`,
+    { userJwt: jwt }
+  );
+  const row = Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!row) return json({ error: 'not_found' }, 404);
+  if (row.archived_at) return json({ error: 'already_archived' }, 409);
+
+  // Authorship check: owners can archive any row on their animal,
+  // trainers can only archive rows they authored. Mirrors the
+  // split in the UPDATE policies (00009:269-308).
+  // We can infer the caller's role by comparing recorder_id to
+  // actorId AND recorder_role; for an owner, the animals_owner_select
+  // side of the SELECT RLS means row visibility implies ownership.
+  // For a trainer, visibility implies an active grant — but the
+  // UPDATE policy additionally requires recorder_id = auth.uid().
+  // We enforce the stricter of the two here for a cleaner 403.
+  if (row.recorder_role === 'trainer' && row.recorder_id !== actorId) {
+    return json({ error: 'forbidden' }, 403);
+  }
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'expenses',
+    `id=eq.${encodeURIComponent(expenseId)}`,
+    { archived_at: new Date().toISOString() }
+  );
+  if (!upd.ok || !upd.data) {
+    return json({ error: 'expense_update_failed', status: upd.status }, 500);
+  }
+
+  const evt = await supabaseInsertReturning(env, 'expense_archive_events', {
+    expense_id: expenseId,
+    actor_id:   actorId,
+    action:     'archive',
+    reason:     reasonRaw || null,
+  });
+  if (!evt.ok) {
+    console.warn('[expense_archive] audit event insert failed', { status: evt.status });
+  }
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   row.recorder_role === 'trainer' && row.recorder_id === actorId
+                    ? 'trainer' : 'owner',
+    action:       'expense.archive',
+    target_table: 'expenses',
+    target_id:    expenseId,
+    ip:           clientIp(request),
+    user_agent:   request.headers.get('user-agent') || null,
+    metadata:     { reason: reasonRaw || null },
+  });
+
+  return json({ expense: upd.data });
+}
+
+/* =============================================================
    /api/records/export-pdf
    -------------------------------------------------------------
    Renders a single-animal, N-day records PDF server-side, uploads
@@ -1404,8 +3772,8 @@ async function handleRecordsExport(request, env) {
     throw resp;
   }
 
-  const rl = await rateLimitKv(
-    env.ML_RL,
+  const rl = await rateLimit(
+    env,
     `ratelimit:records_export:${actorId}`,
     RECORDS_EXPORT_RATE
   );
@@ -1610,7 +3978,7 @@ async function handleAccessGrant(request, env) {
     throw resp;
   }
 
-  const rl = await rateLimitKv(env.ML_RL, `ratelimit:access_grant:${actorId}`, ACCESS_RATE);
+  const rl = await rateLimit(env, `ratelimit:access_grant:${actorId}`, ACCESS_RATE);
   if (!rl.ok) {
     return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, {
       'retry-after': String(rl.resetSec),
@@ -1739,7 +4107,7 @@ async function handleAccessRevoke(request, env) {
     throw resp;
   }
 
-  const rl = await rateLimitKv(env.ML_RL, `ratelimit:access_revoke:${actorId}`, ACCESS_RATE);
+  const rl = await rateLimit(env, `ratelimit:access_revoke:${actorId}`, ACCESS_RATE);
   if (!rl.ok) {
     return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, {
       'retry-after': String(rl.resetSec),
@@ -2023,8 +4391,8 @@ async function handleStripeConnectOnboard(request, env, url) {
     return json({ error: 'stripe_not_configured' }, 501);
   }
 
-  const rl = await rateLimitKv(
-    env.ML_RL,
+  const rl = await rateLimit(
+    env,
     `ratelimit:stripe_connect_onboard:${actorId}`,
     STRIPE_CONNECT_RATE
   );
@@ -2132,8 +4500,8 @@ async function handleStripeConnectRefresh(request, env) {
     return json({ error: 'stripe_not_configured' }, 501);
   }
 
-  const rl = await rateLimitKv(
-    env.ML_RL,
+  const rl = await rateLimit(
+    env,
     `ratelimit:stripe_connect_refresh:${actorId}`,
     STRIPE_CONNECT_RATE
   );
@@ -2219,8 +4587,8 @@ async function handleSessionApprove(request, env) {
     throw resp;
   }
 
-  const rl = await rateLimitKv(
-    env.ML_RL,
+  const rl = await rateLimit(
+    env,
     `ratelimit:session_approve:${actorId}`,
     SESSION_APPROVE_RATE
   );
@@ -2314,8 +4682,8 @@ async function handleSessionPay(request, env) {
     throw resp;
   }
 
-  const rl = await rateLimitKv(
-    env.ML_RL,
+  const rl = await rateLimit(
+    env,
     `ratelimit:session_pay:${actorId}`,
     SESSION_PAY_RATE
   );
@@ -2562,8 +4930,8 @@ async function handleStripeWebhook(request, env) {
   }
 
   // Per-IP ceiling — Stripe's own throughput is well below this.
-  const rl = await rateLimitKv(
-    env.ML_RL,
+  const rl = await rateLimit(
+    env,
     `ratelimit:stripe_webhook:${clientIp(request)}`,
     STRIPE_WEBHOOK_RATE
   );
@@ -2716,6 +5084,20 @@ async function processStripeEvent(env, event) {
       return handleAccountUpdated(env, event);
     case 'charge.refunded':
       return handleChargeRefunded(env, event);
+    case 'checkout.session.completed':
+      return handleCheckoutSessionCompleted(env, event);
+    case 'checkout.session.async_payment_succeeded':
+      return handleCheckoutSessionCompleted(env, event);
+    case 'checkout.session.async_payment_failed':
+      return handleCheckoutSessionAsyncPaymentFailed(env, event);
+    case 'customer.subscription.created':
+    case 'customer.subscription.updated':
+    case 'customer.subscription.deleted':
+      return handleSubscriptionLifecycle(env, event);
+    case 'invoice.payment_succeeded':
+      return handleInvoicePaymentSucceeded(env, event);
+    case 'invoice.payment_failed':
+      return handleInvoicePaymentFailed(env, event);
     default:
       // Unhandled events are recorded but treated as success so they
       // don't clog the retry queue. Stripe sends many event types we
@@ -2870,6 +5252,79 @@ async function handleChargeRefunded(env, event) {
   const chId = ch?.id;
   if (!piId && !chId) return { ok: false, error: 'missing_identifiers' };
 
+  // Phase 5.5 — shop order refunds. Walk charge.refunds.data[] and, for
+  // each refund, upsert the matching order_refunds row by
+  // stripe_refund_id. Independent of the session_payments path below.
+  const refundObjs = Array.isArray(ch?.refunds?.data) ? ch.refunds.data : [];
+  for (const rf of refundObjs) {
+    if (!rf?.id) continue;
+    const existing = await supabaseSelect(
+      env,
+      'order_refunds',
+      `select=id,order_id,stripe_status,amount_cents&stripe_refund_id=eq.${encodeURIComponent(rf.id)}&limit=1`,
+      { serviceRole: true }
+    );
+    const row = Array.isArray(existing.data) ? existing.data[0] : null;
+    if (!row) continue;
+    const newStatus = rf.status === 'succeeded'
+      ? 'succeeded'
+      : rf.status === 'failed' || rf.status === 'canceled'
+        ? rf.status
+        : 'pending';
+    if (row.stripe_status === newStatus) continue;
+    const upd = await supabaseUpdateReturning(
+      env,
+      'order_refunds',
+      `id=eq.${encodeURIComponent(row.id)}`,
+      {
+        stripe_status: newStatus,
+        last_error: newStatus === 'failed' ? (rf.failure_reason || null) : null,
+      }
+    );
+    if (!upd.ok) {
+      ctx_audit(env, {
+        action: 'order_refund.webhook_update_failed',
+        target_table: 'order_refunds',
+        target_id: row.id,
+        metadata: { event_id: event.id, stripe_refund_id: rf.id, status: upd.status },
+      });
+      continue;
+    }
+    // If cumulative succeeded refunds now cover the full order, flip orders.status.
+    if (newStatus === 'succeeded') {
+      const agg = await supabaseSelect(
+        env,
+        'order_refunds',
+        `select=amount_cents,stripe_status&order_id=eq.${encodeURIComponent(row.order_id)}`,
+        { serviceRole: true }
+      );
+      const refunded = (Array.isArray(agg.data) ? agg.data : [])
+        .filter((r) => r.stripe_status === 'succeeded')
+        .reduce((s, r) => s + (Number.isFinite(r.amount_cents) ? r.amount_cents : 0), 0);
+      const orderLookup = await supabaseSelect(
+        env,
+        'orders',
+        `select=id,status,total_cents&id=eq.${encodeURIComponent(row.order_id)}&limit=1`,
+        { serviceRole: true }
+      );
+      const order = Array.isArray(orderLookup.data) ? orderLookup.data[0] : null;
+      if (order && refunded >= order.total_cents && order.status !== 'refunded') {
+        await supabaseUpdateReturning(
+          env,
+          'orders',
+          `id=eq.${encodeURIComponent(order.id)}`,
+          { status: 'refunded' }
+        );
+      }
+    }
+    ctx_audit(env, {
+      action: 'order_refund.webhook_updated',
+      target_table: 'order_refunds',
+      target_id: row.id,
+      metadata: { event_id: event.id, stripe_refund_id: rf.id, status: newStatus },
+    });
+  }
+
   const filter = piId
     ? `stripe_payment_intent_id=eq.${encodeURIComponent(piId)}`
     : `stripe_charge_id=eq.${encodeURIComponent(chId)}`;
@@ -2908,6 +5363,426 @@ async function handleChargeRefunded(env, event) {
     metadata:     { event_id: event.id, request_id: event.request?.id ?? null },
   });
   return { ok: true };
+}
+
+/* =============================================================
+   Phase 3.5 — Shop checkout session webhook handlers.
+   ------------------------------------------------------------
+   The three checkout.session.* events share a payload shape: we
+   read metadata.ml_order_id (set on session create in 3.4), load
+   the corresponding orders row, snapshot line items into
+   order_line_items, and flip status. Idempotency is provided by
+   the shared ingestStripeEvent(event.id) UNIQUE guard upstream;
+   we additionally short-circuit when orders.status is already
+   terminal.
+   ============================================================= */
+
+async function handleCheckoutSessionCompleted(env, event) {
+  const sess = event.data?.object;
+  const orderId = sess?.metadata?.ml_order_id || null;
+  if (!orderId) return { ok: true, ignored: true, reason: 'no_order_metadata' };
+
+  const lookup = await supabaseSelect(
+    env,
+    'orders',
+    `select=id,status,subtotal_cents&id=eq.${encodeURIComponent(orderId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const row = Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!row) return { ok: false, error: 'order_not_found' };
+  if (row.status === 'paid' || row.status === 'refunded') {
+    return { ok: true, idempotent: true };
+  }
+
+  // Pull line items + payment_intent back from Stripe. Stripe's
+  // Checkout Session metadata doesn't include line details, but our
+  // product_data.metadata.shopify_variant_id comes through on the
+  // expanded line_items.data[].price.product.metadata.
+  const hydrate = await retrieveCheckoutSession(env, sess.id);
+  if (!hydrate.ok || !hydrate.data) {
+    return { ok: false, error: hydrate.error || 'stripe_session_read_failed' };
+  }
+  const fresh = hydrate.data;
+  const lineItems = Array.isArray(fresh.line_items?.data) ? fresh.line_items.data : [];
+  const pi = fresh.payment_intent && typeof fresh.payment_intent === 'object'
+    ? fresh.payment_intent
+    : null;
+  const paymentIntentId = pi?.id || (typeof fresh.payment_intent === 'string' ? fresh.payment_intent : null);
+  const chargeId =
+    (pi?.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.id) ||
+    (typeof pi?.latest_charge === 'string' ? pi.latest_charge : null);
+  const receiptUrl =
+    (pi?.latest_charge && typeof pi.latest_charge === 'object' && pi.latest_charge.receipt_url) || null;
+
+  const subtotalCents = Number.isFinite(fresh.amount_subtotal)
+    ? fresh.amount_subtotal
+    : row.subtotal_cents;
+  const totalCents = Number.isFinite(fresh.amount_total)
+    ? fresh.amount_total
+    : subtotalCents;
+  const taxCents = Number.isFinite(fresh.total_details?.amount_tax)
+    ? fresh.total_details.amount_tax
+    : 0;
+  const shippingCents = Number.isFinite(fresh.total_details?.amount_shipping)
+    ? fresh.total_details.amount_shipping
+    : 0;
+
+  // Snapshot line items BEFORE flipping the order to paid — if this
+  // fails partway we want to retry on the next webhook delivery.
+  for (const li of lineItems) {
+    const productMeta = li.price?.product?.metadata || {};
+    const shopifyVariantId = productMeta.shopify_variant_id || null;
+    const productId = productMeta.ml_product_id || null;
+    const sku = productMeta.sku || '';
+    const title = li.description || li.price?.product?.name || 'Item';
+    const unit = Number.isFinite(li.price?.unit_amount) ? li.price.unit_amount : 0;
+    const qty = Number.isFinite(li.quantity) ? li.quantity : 1;
+    const lineTotal = Number.isFinite(li.amount_total) ? li.amount_total : unit * qty;
+
+    if (!shopifyVariantId) {
+      // Legacy/edge: a session minted before we started stamping
+      // shopify_variant_id on product_data.metadata. Still snapshot
+      // so the owner sees something; reconciliation can happen later.
+      await supabaseInsertReturning(env, 'order_line_items', {
+        order_id:           orderId,
+        product_id:         productId,
+        shopify_variant_id: 'unknown',
+        sku_snapshot:       sku,
+        title_snapshot:     title,
+        unit_price_cents:   unit,
+        quantity:           qty,
+        line_total_cents:   lineTotal,
+      });
+      continue;
+    }
+
+    await supabaseInsertReturning(env, 'order_line_items', {
+      order_id:           orderId,
+      product_id:         productId,
+      shopify_variant_id: shopifyVariantId,
+      sku_snapshot:       sku,
+      title_snapshot:     title,
+      unit_price_cents:   unit,
+      quantity:           qty,
+      line_total_cents:   lineTotal,
+    });
+  }
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'orders',
+    `id=eq.${encodeURIComponent(orderId)}`,
+    {
+      status:                    'paid',
+      stripe_payment_intent_id:  paymentIntentId,
+      stripe_charge_id:          chargeId,
+      stripe_receipt_url:        receiptUrl,
+      subtotal_cents:            subtotalCents,
+      tax_cents:                 taxCents,
+      shipping_cents:            shippingCents,
+      total_cents:               totalCents,
+      failure_code:              null,
+      failure_message:           null,
+    }
+  );
+  if (!upd.ok) return { ok: false, error: 'order_update_failed' };
+
+  ctx_audit(env, {
+    action:       'order.paid',
+    target_table: 'orders',
+    target_id:    orderId,
+    metadata: {
+      event_id:     event.id,
+      session_id:   sess.id,
+      total_cents:  totalCents,
+      tax_cents:    taxCents,
+      shipping_cents: shippingCents,
+      line_count:   lineItems.length,
+    },
+  });
+
+  // Phase 3.8 — in-expense one-tap purchase: if the session carried an
+  // expense_draft payload, auto-create the matching expenses row now
+  // that payment has cleared. The checkout mint enforced items.length===1
+  // and validated animal access, so we trust the draft here. Idempotent
+  // on order_id — webhook replays won't double-insert.
+  const draftJson = sess?.metadata?.ml_expense_draft_json || null;
+  if (draftJson && lineItems.length >= 1) {
+    let draft = null;
+    try { draft = JSON.parse(draftJson); } catch { draft = null; }
+    if (draft && draft.animal_id && draft.recorder_id && draft.recorder_role && draft.occurred_on) {
+      const existing = await supabaseSelect(
+        env,
+        'expenses',
+        `select=id&order_id=eq.${encodeURIComponent(orderId)}&limit=1`,
+        { serviceRole: true }
+      );
+      const already = Array.isArray(existing.data) && existing.data.length > 0;
+      if (!already) {
+        const li0 = lineItems[0];
+        const productMeta = li0.price?.product?.metadata || {};
+        const productId = productMeta.ml_product_id || null;
+        const unit = Number.isFinite(li0.price?.unit_amount) ? li0.price.unit_amount : 0;
+        const ins = await supabaseInsertReturning(env, 'expenses', {
+          animal_id:     draft.animal_id,
+          recorder_id:   draft.recorder_id,
+          recorder_role: draft.recorder_role,
+          category:      'supplement',
+          vendor:        'silver_lining',
+          amount_cents:  unit,
+          currency:      'usd',
+          occurred_on:   draft.occurred_on,
+          notes:         draft.notes ?? null,
+          product_id:    productId,
+          order_id:      orderId,
+        });
+        if (ins.ok) {
+          ctx_audit(env, {
+            action:       'expense.auto_created_from_order',
+            target_table: 'expenses',
+            target_id:    ins.data?.id || null,
+            metadata: {
+              order_id:      orderId,
+              animal_id:     draft.animal_id,
+              product_id:    productId,
+              amount_cents:  unit,
+              recorder_role: draft.recorder_role,
+            },
+          });
+        } else {
+          ctx_audit(env, {
+            action:       'expense.auto_create_failed',
+            target_table: 'orders',
+            target_id:    orderId,
+            metadata: {
+              status:    ins.status ?? null,
+              animal_id: draft.animal_id,
+            },
+          });
+        }
+      }
+    }
+  }
+
+  // Shopify inventory decrement — best-effort. If SHOPIFY_ADMIN_API_TOKEN
+  // is unset the helper is a no-op; if it's set but fails we log and
+  // move on (hourly sync will reconcile within ~1h).
+  for (const li of lineItems) {
+    const variantId = li.price?.product?.metadata?.shopify_variant_id;
+    const qty = Number.isFinite(li.quantity) ? li.quantity : 1;
+    if (!variantId) continue;
+    try {
+      const res = await adjustInventory(env, {
+        shopifyVariantId: variantId,
+        delta: -qty,
+      });
+      if (!res.ok && !res.skipped) {
+        ctx_audit(env, {
+          action:       'shopify.inventory_adjust_failed',
+          target_table: 'orders',
+          target_id:    orderId,
+          metadata: {
+            event_id:   event.id,
+            variant_id: variantId,
+            delta:      -qty,
+            error:      res.error,
+            message:    res.message ?? null,
+          },
+        });
+      }
+    } catch {
+      // Swallow — webhook idempotency is the backstop.
+    }
+  }
+
+  return { ok: true };
+}
+
+async function handleCheckoutSessionAsyncPaymentFailed(env, event) {
+  const sess = event.data?.object;
+  const orderId = sess?.metadata?.ml_order_id || null;
+  if (!orderId) return { ok: true, ignored: true, reason: 'no_order_metadata' };
+
+  const lookup = await supabaseSelect(
+    env,
+    'orders',
+    `select=id,status&id=eq.${encodeURIComponent(orderId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const row = Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!row) return { ok: false, error: 'order_not_found' };
+  if (row.status === 'failed' || row.status === 'refunded') {
+    return { ok: true, idempotent: true };
+  }
+
+  // Stripe doesn't include last_payment_error on the session object —
+  // pull it from the expanded payment_intent.
+  let failureCode = 'async_payment_failed';
+  let failureMessage = null;
+  try {
+    const hydrate = await retrieveCheckoutSession(env, sess.id);
+    const pi = hydrate.ok && hydrate.data?.payment_intent && typeof hydrate.data.payment_intent === 'object'
+      ? hydrate.data.payment_intent
+      : null;
+    if (pi?.last_payment_error) {
+      failureCode = pi.last_payment_error.code || pi.last_payment_error.decline_code || failureCode;
+      failureMessage = pi.last_payment_error.message || null;
+    }
+  } catch {
+    // Fall through with generic code.
+  }
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'orders',
+    `id=eq.${encodeURIComponent(orderId)}`,
+    {
+      status:          'failed',
+      failure_code:    failureCode,
+      failure_message: failureMessage,
+    }
+  );
+  if (!upd.ok) return { ok: false, error: 'order_update_failed' };
+
+  ctx_audit(env, {
+    action:       'order.failed',
+    target_table: 'orders',
+    target_id:    orderId,
+    metadata: {
+      event_id:      event.id,
+      session_id:    sess.id,
+      failure_code:  failureCode,
+    },
+  });
+  return { ok: true };
+}
+
+/* =============================================================
+   GET /api/orders — owner reads their own orders (index).
+   ------------------------------------------------------------
+   Thin wrapper over PostgREST. RLS on `orders` scopes rows to
+   the requesting owner. Sorted newest-first.  Orders with
+   status='pending_payment' are intentionally NOT filtered out
+   here — they're filtered in the SPA so owners can still see
+   `awaiting_merchant_setup` orders. (OAG §8.)
+   ============================================================= */
+async function handleOrdersList(request, env) {
+  if (request.method !== 'GET') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  let jwt;
+  try {
+    ({ jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  // Grab 100 most recent — enough for any owner realistically to
+  // scroll through; pagination can land if we ever see > 100/owner.
+  const ordersRes = await supabaseSelect(
+    env,
+    'orders',
+    `select=id,status,subtotal_cents,tax_cents,shipping_cents,total_cents,currency,source,created_at,stripe_receipt_url&order=created_at.desc&limit=100`,
+    { userJwt: jwt }
+  );
+  if (!ordersRes.ok) {
+    return json({ error: 'orders_read_failed' }, 500);
+  }
+  const orders = Array.isArray(ordersRes.data) ? ordersRes.data : [];
+  if (orders.length === 0) {
+    return json({ orders: [] });
+  }
+
+  // Fetch line-item counts in one round-trip so the index can show
+  // "3 items" without N+1 queries.
+  const ids = orders.map((o) => o.id);
+  const filter = ids.map((id) => `"${id}"`).join(',');
+  const linesRes = await supabaseSelect(
+    env,
+    'order_line_items',
+    `select=order_id,quantity&order_id=in.(${encodeURIComponent(filter)})`,
+    { userJwt: jwt }
+  );
+  const byOrder = new Map();
+  if (linesRes.ok && Array.isArray(linesRes.data)) {
+    for (const li of linesRes.data) {
+      const cur = byOrder.get(li.order_id) ?? { lines: 0, units: 0 };
+      cur.lines += 1;
+      cur.units += Number(li.quantity) || 0;
+      byOrder.set(li.order_id, cur);
+    }
+  }
+
+  const enriched = orders.map((o) => ({
+    ...o,
+    line_count: byOrder.get(o.id)?.lines ?? 0,
+    unit_count: byOrder.get(o.id)?.units ?? 0,
+  }));
+  return json({ orders: enriched });
+}
+
+/* =============================================================
+   GET /api/orders/:id — owner reads their own order.
+   ------------------------------------------------------------
+   Thin wrapper over PostgREST so the SPA success page has a
+   single place to poll during the Stripe→webhook race. RLS on
+   `orders` + `order_line_items` (owner SELECT) enforces
+   authorization — we call supabaseSelect with the user's JWT,
+   not service_role.
+   ============================================================= */
+async function handleOrderGet(request, env, orderId) {
+  if (request.method !== 'GET') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  const uuidShape = /^[0-9a-f-]{32,40}$/i;
+  if (!uuidShape.test(orderId)) {
+    return json({ error: 'bad_id' }, 400);
+  }
+
+  let jwt;
+  try {
+    ({ jwt } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const orderRes = await supabaseSelect(
+    env,
+    'orders',
+    `select=id,status,subtotal_cents,tax_cents,shipping_cents,total_cents,currency,source,created_at,stripe_checkout_session_id,stripe_receipt_url,failure_code,failure_message&id=eq.${encodeURIComponent(orderId)}&limit=1`,
+    { userJwt: jwt }
+  );
+  if (!orderRes.ok) {
+    return json({ error: 'order_read_failed' }, 500);
+  }
+  const order = Array.isArray(orderRes.data) ? orderRes.data[0] : null;
+  if (!order) {
+    // RLS hides other-owner rows as 404 equivalent.
+    return json({ error: 'not_found' }, 404);
+  }
+
+  const linesRes = await supabaseSelect(
+    env,
+    'order_line_items',
+    `select=id,product_id,shopify_variant_id,sku_snapshot,title_snapshot,unit_price_cents,quantity,line_total_cents&order_id=eq.${encodeURIComponent(orderId)}&order=created_at.asc`,
+    { userJwt: jwt }
+  );
+  const lines = Array.isArray(linesRes.data) ? linesRes.data : [];
+
+  // Phase 5.5 — owner-visible refund history. order_refunds RLS grants
+  // owner SELECT via the join on orders.owner_id, so we pass the user's
+  // JWT rather than service_role.
+  const refundsRes = await supabaseSelect(
+    env,
+    'order_refunds',
+    `select=id,amount_cents,reason,stripe_status,created_at&order_id=eq.${encodeURIComponent(orderId)}&order=created_at.asc`,
+    { userJwt: jwt }
+  );
+  const refunds = Array.isArray(refundsRes.data) ? refundsRes.data : [];
+
+  return json({ order, line_items: lines, refunds });
 }
 
 /**
@@ -2979,3 +5854,496 @@ async function retryAwaitingPaymentsForTrainer(env, trainerId, stripeAccountId) 
   return { ok: true, retried };
 }
 
+
+/* =============================================================
+   Phase 4 — Workers AI + Vectorize internal endpoints
+   -------------------------------------------------------------
+   Both routes are INTERNAL. They gate on a constant-time match
+   of the X-Internal-Secret header against env.WORKER_INTERNAL_SECRET
+   (a secret shared with the Supabase Edge Function that drives
+   the seed pipeline). Never exposed to end users.
+
+   /api/ai/embed              POST { text }                  →  { vector: float[768] }
+   /api/protocols/embed-index POST { protocol_id, text, metadata? }
+                                                             →  { ok, dims, mutationId }
+   ============================================================= */
+
+async function requireInternalSecret(request, env) {
+  if (!env.WORKER_INTERNAL_SECRET) {
+    return json({ error: 'not_configured' }, 500);
+  }
+  const got = request.headers.get('x-internal-secret') || '';
+  if (!timingSafeEqual(got, env.WORKER_INTERNAL_SECRET)) {
+    return json({ error: 'unauthorized' }, 401);
+  }
+  return null;
+}
+
+async function readJson(request) {
+  try {
+    const body = await request.json();
+    return body && typeof body === 'object' ? body : null;
+  } catch {
+    return null;
+  }
+}
+
+async function handleAiEmbed(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  const gate = await requireInternalSecret(request, env);
+  if (gate) return gate;
+
+  const body = await readJson(request);
+  const text = typeof body?.text === 'string' ? body.text : '';
+  if (!text.trim()) {
+    return json({ error: 'text_required' }, 400);
+  }
+
+  try {
+    const vector = await embedText(env, text);
+    return json({ vector, dims: EMBED_DIMS });
+  } catch (err) {
+    return json({ error: 'embed_failed', detail: err?.message ?? 'unknown' }, 502);
+  }
+}
+
+async function handleProtocolEmbedIndex(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  const gate = await requireInternalSecret(request, env);
+  if (gate) return gate;
+
+  const body = await readJson(request);
+  const protocolId = typeof body?.protocol_id === 'string' ? body.protocol_id.trim() : '';
+  const text       = typeof body?.text === 'string' ? body.text : '';
+  const metadata   = body?.metadata && typeof body.metadata === 'object' ? body.metadata : {};
+
+  if (!protocolId || !/^[0-9a-f-]{36}$/i.test(protocolId)) {
+    return json({ error: 'protocol_id_invalid' }, 400);
+  }
+  if (!text.trim()) {
+    return json({ error: 'text_required' }, 400);
+  }
+
+  let vector;
+  try {
+    vector = await embedText(env, text);
+  } catch (err) {
+    return json(
+      { error: 'embed_failed', detail: err?.message ?? 'unknown' },
+      502
+    );
+  }
+
+  try {
+    const res = await upsertProtocolVector(env, protocolId, vector, metadata);
+    return json({
+      ok: true,
+      dims: EMBED_DIMS,
+      mutation_id: res.mutationId,
+      count: res.count,
+    });
+  } catch (err) {
+    return json(
+      { error: 'vectorize_upsert_failed', detail: err?.message ?? 'unknown' },
+      502
+    );
+  }
+}
+
+/* =============================================================
+   Phase 5.6 — /api/_internal/hubspot-drain
+   -------------------------------------------------------------
+   Called by pg_cron every 5m via net.http_post from the
+   drain_hubspot_syncs() plpgsql function. Body shape:
+     { rows: [{ id, event_name, payload, attempts }] }
+   — each row is already status='sending' in the queue (the
+   plpgsql function flipped it before POSTing).
+
+   Responsibilities:
+     1. Gate on X-Internal-Secret (same pattern as /api/ai/embed).
+     2. If HUBSPOT_PRIVATE_APP_TOKEN missing → push rows back to
+        'pending' with a 15m next_run_at, return 501
+        hubspot_not_configured. Matches plan §5.6's graceful
+        "waiting on keys" pattern.
+     3. For each row: upsert HubSpot contact, send behavioral
+        event, write hubspot_sync_log on success. 4xx → dead_letter.
+        5xx / throw → backoff (15m × 2^attempts, max 5).
+   ============================================================= */
+
+const HUBSPOT_MAX_ATTEMPTS = 5;
+const HUBSPOT_BACKOFF_BASE_MS = 15 * 60 * 1000;
+
+function truncateError(msg) {
+  return typeof msg === 'string' ? msg.slice(0, 500) : 'unknown';
+}
+
+async function handleHubspotDrain(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  const gate = await requireInternalSecret(request, env);
+  if (gate) return gate;
+
+  const body = await readJson(request);
+  const rows = Array.isArray(body?.rows) ? body.rows : [];
+
+  if (!isHubspotConfigured(env)) {
+    const delayedAt = new Date(Date.now() + HUBSPOT_BACKOFF_BASE_MS).toISOString();
+    for (const r of rows) {
+      if (!r?.id) continue;
+      await supabaseUpdateReturning(
+        env,
+        'pending_hubspot_syncs',
+        `id=eq.${encodeURIComponent(r.id)}`,
+        {
+          status: 'pending',
+          next_run_at: delayedAt,
+          last_error: 'hubspot_not_configured',
+        }
+      );
+    }
+    return json({ error: 'hubspot_not_configured' }, 501);
+  }
+
+  let sent = 0;
+  let dead_letter = 0;
+  let retried = 0;
+
+  for (const r of rows) {
+    if (!r?.id || typeof r.event_name !== 'string') {
+      continue;
+    }
+    const eventName = r.event_name;
+    const payload = r.payload && typeof r.payload === 'object' ? r.payload : {};
+    const attempts = typeof r.attempts === 'number' ? r.attempts : 0;
+
+    const hs = toHubspotPayload(eventName, payload);
+    if (!hs.email) {
+      await supabaseUpdateReturning(
+        env,
+        'pending_hubspot_syncs',
+        `id=eq.${encodeURIComponent(r.id)}`,
+        { status: 'dead_letter', last_error: 'missing_email' }
+      );
+      dead_letter++;
+      continue;
+    }
+
+    const t0 = Date.now();
+    try {
+      const contactRes = await upsertContact(env, hs.email, hs.contactProperties);
+      if (contactRes.status >= 400 && contactRes.status < 500) {
+        await supabaseUpdateReturning(
+          env,
+          'pending_hubspot_syncs',
+          `id=eq.${encodeURIComponent(r.id)}`,
+          {
+            status: 'dead_letter',
+            last_error: truncateError(
+              `contact_${contactRes.status}: ${JSON.stringify(contactRes.data)}`
+            ),
+          }
+        );
+        dead_letter++;
+        continue;
+      }
+      if (!contactRes.ok) {
+        throw new Error(`contact_upsert_${contactRes.status}`);
+      }
+
+      const eventRes = await sendBehavioralEvent(env, {
+        eventName,
+        email: hs.email,
+        properties: hs.eventProperties,
+      });
+      if (eventRes.status >= 400 && eventRes.status < 500) {
+        await supabaseUpdateReturning(
+          env,
+          'pending_hubspot_syncs',
+          `id=eq.${encodeURIComponent(r.id)}`,
+          {
+            status: 'dead_letter',
+            last_error: truncateError(
+              `event_${eventRes.status}: ${JSON.stringify(eventRes.data)}`
+            ),
+          }
+        );
+        dead_letter++;
+        continue;
+      }
+      if (!eventRes.ok) {
+        throw new Error(`event_send_${eventRes.status}`);
+      }
+
+      const contactId =
+        Array.isArray(contactRes.data?.results) && contactRes.data.results[0]?.id
+          ? String(contactRes.data.results[0].id)
+          : null;
+
+      await supabaseInsert(env, 'hubspot_sync_log', {
+        event_name: eventName,
+        hubspot_contact_id: contactId,
+        payload,
+        response: { contact: contactRes.data, event: eventRes.data },
+        latency_ms: Date.now() - t0,
+      });
+      await supabaseUpdateReturning(
+        env,
+        'pending_hubspot_syncs',
+        `id=eq.${encodeURIComponent(r.id)}`,
+        { status: 'sent', last_error: null }
+      );
+      sent++;
+    } catch (err) {
+      const nextAttempts = attempts + 1;
+      if (nextAttempts >= HUBSPOT_MAX_ATTEMPTS) {
+        await supabaseUpdateReturning(
+          env,
+          'pending_hubspot_syncs',
+          `id=eq.${encodeURIComponent(r.id)}`,
+          {
+            status: 'dead_letter',
+            attempts: nextAttempts,
+            last_error: truncateError(err?.message ?? 'unknown'),
+          }
+        );
+        dead_letter++;
+      } else {
+        const backoffMs = HUBSPOT_BACKOFF_BASE_MS * Math.pow(2, nextAttempts - 1);
+        const nextRunAt = new Date(Date.now() + backoffMs).toISOString();
+        await supabaseUpdateReturning(
+          env,
+          'pending_hubspot_syncs',
+          `id=eq.${encodeURIComponent(r.id)}`,
+          {
+            status: 'pending',
+            attempts: nextAttempts,
+            next_run_at: nextRunAt,
+            last_error: truncateError(err?.message ?? 'unknown'),
+          }
+        );
+        retried++;
+      }
+    }
+  }
+
+  return json({ processed: rows.length, sent, dead_letter, retried });
+}
+
+/* =============================================================
+   Phase 4.3 — /api/chat
+   -------------------------------------------------------------
+   Owner-facing RAG chat. Flow:
+
+     1. requireOwner JWT.
+     2. KV daily rate-limit (30/day/user). 429 on overrun.
+     3. Emergency keyword short-circuit — writes a chatbot_runs row
+        with emergency_triggered=true, returns JSON (no AI call).
+     4. Insert user turn into chatbot_runs.
+     5. Embed message → query Vectorize (top-K) → hydrate protocols
+        (with Phase 3 linked products).
+     6. Compose messages (system-prompt + retrieved block + last 8
+        turns of history + user turn) and stream Llama-3.3-70B.
+     7. Tee the SSE stream: forward one branch to client, accumulate
+        the other into `response_text`. On stream close (via
+        ctx.waitUntil) insert the assistant chatbot_runs row and
+        touch the conversation.
+     8. On AI error / 8s timeout → fall back to keyword search over
+        `protocols.keywords`. Return JSON (not SSE) with the canned
+        "warming up" copy + top-3 protocols; log fallback='kv_keyword'.
+
+   Response envelope:
+     - Success  : text/event-stream
+         headers: X-Conversation-Id, X-Rate-Limit-Remaining,
+                  X-Protocol-Ids (comma-joined), X-Model
+     - Emergency: 200 JSON { emergency: true, matched_keyword,
+                             conversation_id }
+     - Fallback : 200 JSON { fallback: 'kv_keyword', message,
+                             protocols: [...], conversation_id }
+     - 429      : JSON { error: 'rate_limited', remaining: 0 }
+     - 400/401/500 per usual.
+   ============================================================= */
+
+async function handleChat(request, env, ctx) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId;
+  try {
+    ({ actorId } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const body = await readJson(request);
+  const message = typeof body?.message === 'string' ? body.message.trim() : '';
+  const requestedConvId =
+    typeof body?.conversation_id === 'string' && /^[0-9a-f-]{36}$/i.test(body.conversation_id)
+      ? body.conversation_id
+      : null;
+  if (!message) {
+    return json({ error: 'message_required' }, 400);
+  }
+  if (message.length > 2000) {
+    return json({ error: 'message_too_long', max: 2000 }, 400);
+  }
+
+  // ---- Rate limit ---------------------------------------------------
+  const rl = await incrementDailyRateLimit(env, actorId);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', remaining: 0 }, 429);
+  }
+
+  // ---- Emergency short-circuit (before conversation insert, but we
+  //      still write an auditable chatbot_runs row so the guardrail
+  //      leaves a trail). ----------------------------------------------
+  const matchedKeyword = detectEmergency(message);
+
+  // ---- Conversation + user turn ------------------------------------
+  let conversation;
+  try {
+    conversation = await getOrCreateConversation(env, actorId, requestedConvId, message);
+  } catch (err) {
+    return json({ error: 'conversation_failed', detail: err?.message ?? 'unknown' }, 500);
+  }
+  const convId = conversation.id;
+
+  // Fetch history BEFORE inserting the user turn so the trailing user
+  // message we pass to composeMessages doesn't double up.
+  const history = await getRecentHistory(env, convId, 8);
+
+  const userTurnIndex = await nextTurnIndex(env, convId);
+  await insertChatbotRun(env, {
+    conversation_id:      convId,
+    turn_index:           userTurnIndex,
+    role:                 'user',
+    user_text:            message,
+    emergency_triggered:  Boolean(matchedKeyword),
+    rate_limit_remaining: rl.remaining,
+  });
+
+  if (matchedKeyword) {
+    // Log the emergency-assistant row (role=assistant, response_text=null,
+    // emergency_triggered=true). Client renders the red alert banner with
+    // animals.vet_phone tap-to-copy — the assistant text comes from the SPA,
+    // not the model.
+    await insertChatbotRun(env, {
+      conversation_id:      convId,
+      turn_index:           userTurnIndex + 1,
+      role:                 'assistant',
+      response_text:        null,
+      fallback:             'emergency',
+      emergency_triggered:  true,
+      rate_limit_remaining: rl.remaining,
+    });
+    ctx.waitUntil(touchConversation(env, convId));
+    return json({
+      emergency:       true,
+      matched_keyword: matchedKeyword,
+      conversation_id: convId,
+      remaining:       rl.remaining,
+    });
+  }
+
+  // ---- RAG: embed → Vectorize → hydrate ----------------------------
+  let retrievedIds = [];
+  let retrieved = [];
+  try {
+    const vector = await embedText(env, message);
+    const matches = await queryProtocolVectors(env, vector, RAG_TOP_K);
+    retrievedIds = Array.isArray(matches)
+      ? matches.map((m) => m?.id).filter((s) => typeof s === 'string')
+      : [];
+    retrieved = await hydrateProtocols(env, retrievedIds);
+  } catch (err) {
+    // Embed or Vectorize down → skip retrieval; the model still gets
+    // the system prompt. If the model also fails we fall through to
+    // kvKeywordFallback below.
+    retrievedIds = [];
+    retrieved = [];
+  }
+
+  const messages = composeMessages(retrieved, history, message);
+
+  // ---- Stream (with 8s timeout + keyword fallback) -----------------
+  const started = Date.now();
+  let aiStream;
+  try {
+    aiStream = await runChatModelWithTimeout(env, messages);
+  } catch (err) {
+    console.error('chat.ai_failed', {
+      msg: err?.message ?? 'unknown',
+      name: err?.name,
+      stack: typeof err?.stack === 'string' ? err.stack.slice(0, 500) : undefined,
+    });
+    // Keyword fallback: no AI, but still a useful answer.
+    const fbRows = await kvKeywordFallback(env, message);
+    const hydrated = fbRows.length
+      ? await hydrateProtocols(env, fbRows.map((r) => r.id))
+      : [];
+    const assistantTurn = userTurnIndex + 1;
+    ctx.waitUntil((async () => {
+      await insertChatbotRun(env, {
+        conversation_id:        convId,
+        turn_index:             assistantTurn,
+        role:                   'assistant',
+        response_text:          FALLBACK_CANNED_MESSAGE,
+        retrieved_protocol_ids: hydrated.map((p) => p.id),
+        fallback:               'kv_keyword',
+        latency_ms:             Date.now() - started,
+        rate_limit_remaining:   rl.remaining,
+      });
+      await touchConversation(env, convId);
+    })());
+    return json({
+      fallback:        'kv_keyword',
+      message:         FALLBACK_CANNED_MESSAGE,
+      protocols:       hydrated,
+      conversation_id: convId,
+      remaining:       rl.remaining,
+    });
+  }
+
+  const { clientBranch, accumulated } = teeAndAccumulate(aiStream);
+
+  const assistantTurn = userTurnIndex + 1;
+  ctx.waitUntil((async () => {
+    try {
+      const text = await accumulated;
+      await insertChatbotRun(env, {
+        conversation_id:        convId,
+        turn_index:             assistantTurn,
+        role:                   'assistant',
+        response_text:          text,
+        retrieved_protocol_ids: retrieved.map((p) => p.id),
+        model_id:               CHAT_MODEL,
+        latency_ms:             Date.now() - started,
+        rate_limit_remaining:   rl.remaining,
+      });
+      await touchConversation(env, convId);
+    } catch {
+      // Swallow — this is best-effort audit logging.
+    }
+  })());
+
+  return new Response(clientBranch, {
+    status: 200,
+    headers: {
+      'content-type':          'text/event-stream; charset=utf-8',
+      'cache-control':         'no-store',
+      'x-conversation-id':     convId,
+      'x-rate-limit-remaining':String(rl.remaining),
+      'x-protocol-ids':        retrieved.map((p) => p.id).join(','),
+      'x-model':               CHAT_MODEL,
+    },
+  });
+}

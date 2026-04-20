@@ -48,6 +48,18 @@ compatibility_date = "2025-10-01"
 #   HUBSPOT_PRIVATE_APP_TOKEN  (SECRET — "pat-na1-..." private-app token)
 #   HUBSPOT_PORTAL_ID          (public — 8-digit hub id; can live in [vars])
 #
+# Phase 6 — Resend (transactional invitation emails):
+#   RESEND_API_KEY             (SECRET — "re_..." — admin invite flow)
+#
+# Phase 6 — Twilio (emergency on-call SMS paging):
+#   TWILIO_ACCOUNT_SID         (SECRET — "AC...")
+#   TWILIO_AUTH_TOKEN          (SECRET — used for HMAC sig + Basic auth)
+#   TWILIO_FROM_NUMBER         (SECRET — E.164, toll-free 10DLC registered)
+#
+# Phase 6 — Public origin (for SMS body deep-links + Twilio status
+# callback URL). Falls back to https://maneline.co if unset.
+#   MANELINE_PUBLIC_ORIGIN     (public — [vars] below)
+#
 # All Phase 2/3/5 keys are PLACEHOLDER — do NOT set values yet. The mock
 # integrations in app/src/integrations/ report everything as mock until the
 # real credentials are provisioned. See docs/INTEGRATIONS.md.
@@ -56,6 +68,12 @@ compatibility_date = "2025-10-01"
 [vars]
 SUPABASE_URL       = "https://vvzasinqfirzxfduenjx.supabase.co"
 SUPABASE_ANON_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ2emFzaW5xZmlyenhmZHVlbmp4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYyNzcyMTksImV4cCI6MjA5MTg1MzIxOX0.25G0D11vS6M5JqMC_Z2jE69RKfXsR_I9NAEMwxMPR4o"
+# Phase 6.3 — "durable_object" routes rate limits via the RateLimiter DO
+# (default, deterministic). "kv" falls back to rateLimitKv + ML_RL.
+RATE_LIMITER_MODE  = "durable_object"
+# Phase 6.4 — origin used for emergency-SMS deep links + Twilio status
+# callback URL. Keep in sync with production hostname.
+MANELINE_PUBLIC_ORIGIN = "https://maneline.co"
 
 # Secrets — never paste here. Set at the CLI:
 #   npx wrangler secret put SUPABASE_WEBHOOK_SECRET
@@ -165,3 +183,28 @@ binding = "AI"
 [[vectorize]]
 binding    = "VECTORIZE_PROTOCOLS"
 index_name = "maneline-protocols"
+
+# -----------------------------------------------------------------
+# DURABLE OBJECTS — Phase 6.3 rate limiter.
+#
+# Replaces the KV-backed rateLimitKv in worker.js. One DO instance per
+# bucket key (e.g. `ratelimit:vet_token:<token>`) gives us a hard
+# serialization around the read-modify-write via
+# state.blockConcurrencyWhile, so a 65-parallel burst against a 60/min
+# bucket returns exactly 60 × 200 + 5 × 429 — no slip-through.
+#
+# RATE_LIMITER_MODE is a plain var, not a secret. Values:
+#   "durable_object"  → route via env.RATE_LIMITER (default).
+#   "kv"              → fall back to rateLimitKv + env.ML_RL (safety net).
+#
+# Flip the mode by editing [vars] and redeploying; no migration needed.
+# -----------------------------------------------------------------
+
+[[durable_objects.bindings]]
+name       = "RATE_LIMITER"
+class_name = "RateLimiter"
+
+[[migrations]]
+tag          = "v2"
+new_classes  = ["RateLimiter"]
+

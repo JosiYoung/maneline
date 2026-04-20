@@ -265,7 +265,7 @@ function PayPanel({
     );
   }
 
-  if (intent.status === "succeeded" || intent.status === "processing") {
+  if (intent.status !== "pending") {
     return (
       <Card>
         <CardContent className="py-6 text-sm text-muted-foreground">

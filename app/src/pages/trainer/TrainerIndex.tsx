@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate } from "react-router-dom";
 import { TrainerLayout } from "../../components/trainer/TrainerLayout";
+import { WelcomeTour } from "../../components/WelcomeTour";
 import TrainerDashboard from "./TrainerDashboard";
 import TrainerAccount from "./TrainerAccount";
 import ClientsIndex from "./ClientsIndex";
@@ -8,6 +9,7 @@ import SessionsIndex from "./SessionsIndex";
 import SessionNew from "./SessionNew";
 import SessionDetail from "./SessionDetail";
 import PayoutsIndex from "./PayoutsIndex";
+import ExpensesIndex from "./ExpensesIndex";
 
 // TrainerIndex — the trainer portal's route shell. Mounted under
 // <ProtectedRoute allow="trainer"> in App.tsx, so every child route here
@@ -26,10 +28,12 @@ export default function TrainerIndex() {
         <Route path="sessions"          element={<SessionsIndex />} />
         <Route path="sessions/new"      element={<SessionNew />} />
         <Route path="sessions/:id"      element={<SessionDetail />} />
+        <Route path="expenses"    element={<ExpensesIndex />} />
         <Route path="payouts"     element={<PayoutsIndex />} />
         <Route path="account"     element={<TrainerAccount />} />
         <Route path="*" element={<Navigate to="/trainer" replace />} />
       </Routes>
+      <WelcomeTour />
     </TrainerLayout>
   );
 }

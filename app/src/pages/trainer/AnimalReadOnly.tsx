@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronLeft, Plus } from "lucide-react";
@@ -14,6 +15,12 @@ import {
   SESSIONS_QUERY_KEY,
   listSessionsForAnimal,
 } from "@/lib/sessions";
+import { ExpensesList } from "@/components/expenses/ExpensesList";
+import { ExpenseForm } from "@/components/expenses/ExpenseForm";
+import {
+  EXPENSES_QUERY_KEY,
+  listExpensesForAnimal,
+} from "@/lib/expenses";
 import {
   TRAINER_ANIMAL_MEDIA_QUERY_KEY,
   TRAINER_ANIMAL_QUERY_KEY,
@@ -23,6 +30,7 @@ import {
   listVetRecordsForTrainer,
   type Animal,
 } from "@/lib/trainerAnimals";
+import { ProtocolsSection } from "@/components/owner/ProtocolsSection";
 
 // AnimalReadOnly — /trainer/animals/:id.
 //
@@ -66,6 +74,14 @@ export default function AnimalReadOnly() {
     enabled: Boolean(id) && animalQ.isSuccess,
   });
 
+  const expensesQ = useQuery({
+    queryKey: [...EXPENSES_QUERY_KEY, "animal", id],
+    queryFn: () => listExpensesForAnimal(id, { includeArchived: true }),
+    enabled: Boolean(id) && animalQ.isSuccess,
+  });
+
+  const [addingExpense, setAddingExpense] = useState(false);
+
   return (
     <div className="space-y-6">
       <Link
@@ -102,7 +118,13 @@ export default function AnimalReadOnly() {
               <TabsTrigger value="records">Vet records</TabsTrigger>
               <TabsTrigger value="media">Media</TabsTrigger>
               <TabsTrigger value="sessions">Sessions</TabsTrigger>
+              <TabsTrigger value="expenses">Expenses</TabsTrigger>
+              <TabsTrigger value="protocols">Protocols</TabsTrigger>
             </TabsList>
+
+            <TabsContent value="protocols">
+              <ProtocolsSection animalId={id} role="trainer" />
+            </TabsContent>
 
             <TabsContent value="records">
               {recordsQ.isLoading && (
@@ -159,6 +181,48 @@ export default function AnimalReadOnly() {
                   detailHref={(sid) => `/trainer/sessions/${sid}`}
                   emptyText="No sessions logged on this animal yet."
                   showAnimal={false}
+                />
+              )}
+            </TabsContent>
+
+            <TabsContent value="expenses" className="space-y-4">
+              <div className="flex justify-end">
+                {!addingExpense && (
+                  <Button size="sm" onClick={() => setAddingExpense(true)}>
+                    <Plus size={14} />
+                    Add expense
+                  </Button>
+                )}
+              </div>
+
+              {addingExpense && (
+                <Card className="border-accent/40 bg-accent/5">
+                  <CardContent className="py-4">
+                    <ExpenseForm
+                      animalId={id}
+                      recorderRole="trainer"
+                      onCreated={() => setAddingExpense(false)}
+                      onCancel={() => setAddingExpense(false)}
+                    />
+                  </CardContent>
+                </Card>
+              )}
+
+              {expensesQ.isLoading && (
+                <div className="h-24 animate-pulse rounded-md bg-muted/40" />
+              )}
+              {expensesQ.isError && (
+                <Card>
+                  <CardContent className="py-6 text-sm text-destructive">
+                    Couldn't load expenses. Try refreshing the page.
+                  </CardContent>
+                </Card>
+              )}
+              {expensesQ.isSuccess && (
+                <ExpensesList
+                  expenses={expensesQ.data}
+                  showAnimal={false}
+                  emptyText="No expenses logged on this animal yet."
                 />
               )}
             </TabsContent>

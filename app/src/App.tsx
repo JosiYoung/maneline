@@ -9,6 +9,7 @@ import SignupCompleteProfile from './pages/SignupCompleteProfile';
 import CheckEmail from './pages/CheckEmail';
 import AuthCallback from './pages/AuthCallback';
 import VetView from './pages/VetView';
+import Welcome from './pages/Welcome';
 import NotFound from './pages/NotFound';
 
 import OwnerIndex from './pages/owner/OwnerIndex';
@@ -30,6 +31,9 @@ export default function App() {
 
         {/* Vet view — scoped magic link, no session required */}
         <Route path="/vet/:token" element={<VetView />} />
+
+        {/* Invitation deep-link — public, looks up the token server-side */}
+        <Route path="/welcome" element={<Welcome />} />
 
         {/* Owner portal */}
         <Route

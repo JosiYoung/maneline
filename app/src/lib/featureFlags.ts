@@ -2,11 +2,13 @@ import { useQuery } from '@tanstack/react-query';
 
 export interface FeatureFlags {
   signup_v2: boolean;
+  chat_v1:   boolean;
 }
 
 const DEFAULT_FLAGS: FeatureFlags = {
-  // Fail open to the modern flow if the endpoint is unreachable.
+  // Fail open to the modern flows if the endpoint is unreachable.
   signup_v2: true,
+  chat_v1:   true,
 };
 
 async function fetchFlags(): Promise<FeatureFlags> {
@@ -17,7 +19,9 @@ async function fetchFlags(): Promise<FeatureFlags> {
     if (!res.ok) return DEFAULT_FLAGS;
     const data = (await res.json()) as Partial<FeatureFlags>;
     return {
-      signup_v2: data.signup_v2 !== false, // anything except literal false is "on"
+      // anything except literal false is "on"
+      signup_v2: data.signup_v2 !== false,
+      chat_v1:   data.chat_v1   !== false,
     };
   } catch {
     return DEFAULT_FLAGS;
