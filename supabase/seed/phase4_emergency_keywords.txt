@@ -1,0 +1,85 @@
+# Mane Line — Phase 4 emergency keyword list
+#
+# One keyword / phrase per line. Lines starting with '#' and blank
+# lines are ignored. Matching is case-insensitive whole-substring
+# (word-boundary aware on server; client uses the same list).
+#
+# When ANY line matches the owner's message, /api/chat short-circuits:
+#   - no model call, no Vectorize query
+#   - chatbot_runs row is written with emergency_triggered=true, response_text=null
+#   - client renders a red Alert + tap-to-copy animals.vet_phone
+#
+# STARTER LIST — Cedric + SLH must review before Phase 4 sign-off
+# (plan prereq #7 in docs/phase-4-plan.md §1).
+#
+# Bias toward false positives: a wrongly-triggered banner is an
+# annoyance; a missed emergency is a liability event. When in
+# doubt, add the keyword.
+
+# ===== Catastrophic / seek-vet-now =====
+colic
+colicky
+not breathing
+can't breathe
+cant breathe
+choke
+choking
+tying up
+tied up
+tying-up
+exertional rhabdo
+azoturia
+down and can't get up
+down and cant get up
+can't stand
+cant stand
+won't stand up
+blood
+bleeding
+bleeding out
+hemorrhage
+seizure
+seizing
+convulsing
+convulsion
+
+# ===== Foaling / neonatal =====
+foal not nursing
+foal won't nurse
+foal wont nurse
+newborn foal
+red bag
+dystocia
+retained placenta
+
+# ===== Acute pain / neuro =====
+staggering
+falling over
+head pressing
+circling
+paralyzed
+can't move hind
+cant move hind
+compound fracture
+bone sticking out
+
+# ===== Severe GI / respiratory =====
+projectile vomit
+projectile vomiting
+severe diarrhea
+bloody stool
+bloody manure
+gasping
+struggling to breathe
+blue gums
+white gums
+
+# ===== Trauma =====
+hit by car
+hit by vehicle
+fell through
+impaled
+gored
+kicked in the head
+unconscious
+unresponsive
