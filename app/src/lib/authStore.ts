@@ -41,7 +41,7 @@ async function fetchProfile(userId: string): Promise<UserProfile | null> {
   // `id` column is an unrelated surrogate PK, so we must NOT filter on it.
   const { data, error } = await supabase
     .from('user_profiles')
-    .select('user_id, role, status, display_name, email, has_pin, created_at, updated_at')
+    .select('user_id, role, status, display_name, email, has_pin, welcome_tour_seen_at, created_at, updated_at')
     .eq('user_id', userId)
     .maybeSingle();
   if (error) {
