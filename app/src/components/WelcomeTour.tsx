@@ -1,5 +1,4 @@
-import { useEffect, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -12,14 +11,15 @@ import {
 } from "@/components/ui/dialog";
 import { dismissWelcomeTour } from "@/lib/invitations";
 import { useAuthStore } from "@/lib/authStore";
-import { notify } from "@/lib/toast";
 
 // WelcomeTour — 3-step dismissible dialog shown once per user.
 //
 // Phase 6.2 feature #2. Role-aware copy for owner vs trainer. Gated
 // by user_profiles.welcome_tour_seen_at; dismissing stamps the column
-// via /api/profiles/dismiss-welcome-tour and refreshes the local
-// profile so the tour never re-opens in the same session.
+// via /api/profiles/dismiss-welcome-tour. We close the dialog
+// optimistically on first user action and fire the server write in
+// the background — the local `dismissed` ref prevents the effect from
+// re-opening the dialog if refreshProfile is slow or fails.
 
 type TourRole = "owner" | "trainer";
 
@@ -56,42 +56,37 @@ const STEPS: Record<TourRole, Step[]> = {
   ],
 };
 
-function useWelcomeTourEligibility(): {
-  open: boolean;
-  role: TourRole | null;
-  setOpen: (v: boolean) => void;
-} {
+export function WelcomeTour() {
   const profile = useAuthStore((s) => s.profile);
+  const refreshProfile = useAuthStore((s) => s.refreshProfile);
   const [open, setOpen] = useState(false);
+  const [step, setStep] = useState(0);
+  // Local latch: once the user clicks away, never reopen this session
+  // even if profile.welcome_tour_seen_at arrives back null (e.g. server
+  // error, offline). Belt-and-suspenders against the stuck-dialog bug.
+  const dismissedRef = useRef(false);
+
   useEffect(() => {
+    if (dismissedRef.current) return;
     if (!profile) return;
     if (profile.role !== "owner" && profile.role !== "trainer") return;
     if (profile.welcome_tour_seen_at) return;
     setOpen(true);
   }, [profile]);
+
   const role = (profile?.role === "owner" || profile?.role === "trainer")
     ? profile.role
     : null;
-  return { open, role, setOpen };
-}
 
-export function WelcomeTour() {
-  const { open, role, setOpen } = useWelcomeTourEligibility();
-  const [step, setStep] = useState(0);
-  const refreshProfile = useAuthStore((s) => s.refreshProfile);
-
-  const dismissM = useMutation({
-    mutationFn: () => dismissWelcomeTour(),
-    onSuccess: async () => {
-      setOpen(false);
-      setStep(0);
-      await refreshProfile();
-    },
-    onError: (e: Error) => {
-      notify.error(e.message);
-      setOpen(false);
-    },
-  });
+  function dismiss() {
+    dismissedRef.current = true;
+    setOpen(false);
+    setStep(0);
+    // Fire-and-forget server write; we don't gate the close on it.
+    void dismissWelcomeTour()
+      .then(() => refreshProfile())
+      .catch(() => { /* local latch already closed the tour */ });
+  }
 
   if (!role) return null;
   const steps = STEPS[role];
@@ -102,7 +97,7 @@ export function WelcomeTour() {
     <Dialog
       open={open}
       onOpenChange={(v) => {
-        if (!v) dismissM.mutate();
+        if (!v) dismiss();
       }}
     >
       <DialogContent>
@@ -127,14 +122,12 @@ export function WelcomeTour() {
               Back
             </Button>
           ) : (
-            <Button variant="ghost" onClick={() => dismissM.mutate()} disabled={dismissM.isPending}>
+            <Button variant="ghost" onClick={dismiss}>
               Skip
             </Button>
           )}
           {isLast ? (
-            <Button onClick={() => dismissM.mutate()} disabled={dismissM.isPending}>
-              {dismissM.isPending ? "Saving…" : "Let's go"}
-            </Button>
+            <Button onClick={dismiss}>Let's go</Button>
           ) : (
             <Button onClick={() => setStep((s) => s + 1)}>Next</Button>
           )}
