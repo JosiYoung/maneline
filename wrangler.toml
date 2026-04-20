@@ -205,6 +205,6 @@ name       = "RATE_LIMITER"
 class_name = "RateLimiter"
 
 [[migrations]]
-tag          = "v2"
-new_classes  = ["RateLimiter"]
+tag                 = "v2"
+new_sqlite_classes  = ["RateLimiter"]
 
