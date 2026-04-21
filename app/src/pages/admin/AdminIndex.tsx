@@ -4,6 +4,7 @@ import { PortalHeader } from '../../components/PortalHeader';
 import { PinSettings } from '../../components/PinSettings';
 import AdminDashboard from './AdminDashboard';
 import AdminOrderDetail from './OrderDetail';
+import InvoicesIndex from './InvoicesIndex';
 import OnboardingIndex from './OnboardingIndex';
 import OnCallIndex from './OnCallIndex';
 import OrdersIndex from './OrdersIndex';
@@ -28,6 +29,7 @@ const TABS = [
   { to: '/admin/onboarding', label: 'Onboarding', end: false },
   { to: '/admin/trainer-applications', label: 'Trainer queue', end: false },
   { to: '/admin/orders', label: 'Orders', end: false },
+  { to: '/admin/invoices', label: 'Invoices', end: false },
   { to: '/admin/subscriptions', label: 'Subscriptions', end: false },
   { to: '/admin/support', label: 'Support', end: false },
   { to: '/admin/on-call', label: 'On-call', end: false },
@@ -64,6 +66,7 @@ export default function AdminIndex() {
           <Route path="trainer-applications" element={<TrainerApplicationsIndex />} />
           <Route path="orders" element={<OrdersIndex />} />
           <Route path="orders/:id" element={<AdminOrderDetail />} />
+          <Route path="invoices" element={<InvoicesIndex />} />
           <Route path="subscriptions" element={<SubscriptionsIndex />} />
           <Route path="subscriptions/:id" element={<SubscriptionDetail />} />
           <Route path="support" element={<SupportTicketsIndex />} />

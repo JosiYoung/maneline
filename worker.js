@@ -151,6 +151,7 @@ import {
   handleInvoicePaymentSucceeded,
   handleSubscriptionLifecycle,
 } from './worker/stripe-subscriptions.js';
+import { adminInvoicesList } from './worker/admin-invoices.js';
 
 // Phase 6.3 — Durable Object rate limiter. Class MUST be re-exported
 // from the Worker entry so `[[durable_objects.bindings]]` can resolve
@@ -685,6 +686,11 @@ async function handleAdmin(request, env, url) {
       ticket_id: (url.searchParams.get('ticket_id') || '').trim() || null,
       status:    (url.searchParams.get('status') || '').trim() || null,
     };
+  } else if (tail === 'invoices' && request.method === 'GET') {
+    action = 'admin.read.invoices';
+    targetTable = 'invoices';
+    response = await adminInvoicesList(env, url);
+    metadata = { status: (url.searchParams.get('status') || '').trim() || 'all' };
   } else if (tail === 'subscriptions' && request.method === 'GET') {
     action = 'admin.read.subscriptions';
     targetTable = 'stripe_subscriptions';
@@ -5479,13 +5485,16 @@ async function syncConnectInvoiceFromEvent(env, event) {
   const r = await supabaseSelect(
     env,
     'invoices',
-    `select=id,status&stripe_invoice_id=eq.${encodeURIComponent(stripeInvoiceId)}&limit=1`,
+    'select=id,status,trainer_id,owner_id,adhoc_email,adhoc_name,' +
+      'total_cents,amount_paid_cents,currency,invoice_number' +
+      `&stripe_invoice_id=eq.${encodeURIComponent(stripeInvoiceId)}&limit=1`,
     { serviceRole: true }
   );
   const row = Array.isArray(r.data) ? r.data[0] : null;
   if (!row) return { ok: true, ignored: true }; // not one of ours; subscription handler or unrelated
 
   const patch = {};
+  let transitionedToPaid = false;
   switch (event.type) {
     case 'invoice.paid':
     case 'invoice.payment_succeeded':
@@ -5493,6 +5502,7 @@ async function syncConnectInvoiceFromEvent(env, event) {
       patch.status            = 'paid';
       patch.paid_at           = new Date().toISOString();
       patch.amount_paid_cents = stripeInv.amount_paid ?? stripeInv.total ?? 0;
+      transitionedToPaid = true;
       break;
     case 'invoice.voided':
       if (row.status === 'void') return { ok: true, idempotent: true };
@@ -5520,7 +5530,85 @@ async function syncConnectInvoiceFromEvent(env, event) {
     target_id:    row.id,
     metadata:     { stripe_invoice_id: stripeInvoiceId, event_id: event.id },
   });
+
+  // Fire the HubSpot behavioral event on paid transitions only. Best
+  // effort — the insert is idempotent-by-event_id at the drain layer
+  // (hubspot_sync_log) but we guard here so retries of the same
+  // webhook don't enqueue duplicate rows. The contact is the payer
+  // (owner or adhoc), not the trainer — HubSpot tracks who paid.
+  if (transitionedToPaid) {
+    try {
+      await enqueueInvoicePaidHubspot(env, {
+        invoice: { ...row, ...patch },
+        stripeInvoice: stripeInv,
+        eventId: event.id,
+      });
+    } catch (err) {
+      console.warn('[hubspot] invoice.paid enqueue failed:', err?.message);
+    }
+  }
   return { ok: true };
+}
+
+// Enqueue maneline_invoice_paid into pending_hubspot_syncs. Resolves
+// the payer (contact) email from owner_id → user_profiles.email,
+// falling back to adhoc_email for invoices sent to non-users. Adds
+// trainer context as event properties so HubSpot workflows can
+// segment by trainer. Drain cron handles delivery + retries.
+async function enqueueInvoicePaidHubspot(env, { invoice, stripeInvoice, eventId }) {
+  // Resolve payer email.
+  let payerEmail = invoice.adhoc_email ? String(invoice.adhoc_email).trim().toLowerCase() : '';
+  let payerName  = invoice.adhoc_name || null;
+  if (invoice.owner_id) {
+    const o = await supabaseSelect(
+      env,
+      'user_profiles',
+      `select=email,display_name&user_id=eq.${encodeURIComponent(invoice.owner_id)}&limit=1`,
+      { serviceRole: true }
+    );
+    const prof = Array.isArray(o.data) ? o.data[0] : null;
+    if (prof?.email) payerEmail = String(prof.email).trim().toLowerCase();
+    if (prof?.display_name) payerName = prof.display_name;
+  }
+  if (!payerEmail) {
+    // Can't send without an email — bail quietly. Drain layer also
+    // dead-letters on missing_email; this just avoids the extra row.
+    return;
+  }
+
+  // Resolve trainer context (display_name/email for the event body).
+  let trainerEmail = null;
+  let trainerName  = null;
+  if (invoice.trainer_id) {
+    const t = await supabaseSelect(
+      env,
+      'user_profiles',
+      `select=email,display_name&user_id=eq.${encodeURIComponent(invoice.trainer_id)}&limit=1`,
+      { serviceRole: true }
+    );
+    const prof = Array.isArray(t.data) ? t.data[0] : null;
+    trainerEmail = prof?.email ?? null;
+    trainerName  = prof?.display_name ?? null;
+  }
+
+  await supabaseInsert(env, 'pending_hubspot_syncs', {
+    event_name: 'maneline_invoice_paid',
+    payload: {
+      email: payerEmail,
+      display_name: payerName,
+      invoice_id: invoice.id,
+      invoice_number: invoice.invoice_number ?? null,
+      stripe_invoice_id: stripeInvoice?.id ?? null,
+      total_cents: invoice.total_cents ?? null,
+      amount_paid_cents: invoice.amount_paid_cents ?? stripeInvoice?.amount_paid ?? null,
+      currency: invoice.currency ?? null,
+      trainer_id: invoice.trainer_id,
+      trainer_email: trainerEmail,
+      trainer_name: trainerName,
+      paid_at: invoice.paid_at ?? new Date().toISOString(),
+      stripe_event_id: eventId ?? null,
+    },
+  });
 }
 
 /* =============================================================

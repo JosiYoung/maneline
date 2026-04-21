@@ -99,6 +99,20 @@ export function toHubspotPayload(eventName, payload) {
         props.maneline_last_order_total_cents = String(payload.total_cents);
       }
       break;
+    case 'maneline_invoice_paid':
+      // Track lifetime-paid-to-trainer signal for workflows. We don't
+      // have the prior value here (stateless mapper) so we stamp the
+      // most recent invoice's amount; HubSpot can aggregate via a
+      // calculated property if LTV is needed.
+      if (typeof payload?.amount_paid_cents === 'number') {
+        props.maneline_last_invoice_paid_cents = String(payload.amount_paid_cents);
+      } else if (typeof payload?.total_cents === 'number') {
+        props.maneline_last_invoice_paid_cents = String(payload.total_cents);
+      }
+      if (typeof payload?.paid_at === 'string') {
+        props.maneline_last_invoice_paid_at = payload.paid_at;
+      }
+      break;
     // maneline_emergency_triggered and maneline_user_registered
     // do not bump contact props — only the behavioral event.
   }
