@@ -1,10 +1,12 @@
 import { NavLink } from "react-router-dom";
 import {
   LayoutDashboard,
+  BarChart3,
   Users,
   Calendar,
   DollarSign,
   Receipt,
+  FileText,
   User,
   type LucideIcon,
 } from "lucide-react";
@@ -22,9 +24,11 @@ type Item = { to: string; label: string; Icon: LucideIcon; end?: boolean };
 
 const NAV_ITEMS: Item[] = [
   { to: "/trainer",          label: "Dashboard", Icon: LayoutDashboard, end: true },
+  { to: "/trainer/business", label: "Business",  Icon: BarChart3 },
   { to: "/trainer/clients",  label: "Clients",   Icon: Users },
   { to: "/trainer/sessions", label: "Sessions",  Icon: Calendar },
   { to: "/trainer/expenses", label: "Expenses",  Icon: Receipt },
+  { to: "/trainer/invoices", label: "Invoices",  Icon: FileText },
   { to: "/trainer/payouts",  label: "Payouts",   Icon: DollarSign },
   { to: "/trainer/account",  label: "Account",   Icon: User },
 ];

@@ -177,9 +177,9 @@ function StatusBody({
 }: {
   status: ConnectStatus;
   row: {
-    charges_enabled: boolean;
-    payouts_enabled: boolean;
-    details_submitted: boolean;
+    charges_enabled: boolean | null;
+    payouts_enabled: boolean | null;
+    details_submitted: boolean | null;
     disabled_reason: string | null;
     onboarding_link_last_issued_at: string | null;
   } | null;

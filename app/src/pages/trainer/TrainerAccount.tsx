@@ -1,19 +1,25 @@
 import { PinSettings } from "../../components/PinSettings";
+import { BrandingSection } from "../../components/trainer/account/BrandingSection";
+import { InvoiceDefaultsSection } from "../../components/trainer/account/InvoiceDefaultsSection";
 
 // TrainerAccount — /trainer/account.
 //
-// Phase 2 Prompt 2.2 stub: hosts the existing PinSettings surface from
-// Phase 0 so trainers can still manage their login PIN. Prompt 2.6 adds
-// Stripe Connect onboarding and fee visibility next to this block.
+// Hosts the PIN-change flow plus the Phase 7 "business in a box"
+// invoice-branding controls: logo, brand color, and the monthly
+// invoice defaults (net days, auto-finalize day, footer memo).
+// Stripe Connect onboarding lives on /trainer/payouts.
 export default function TrainerAccount() {
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl">Account</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          Manage your sign-in PIN. Stripe payout onboarding lands here next.
+          Manage your sign-in PIN and the branding on the invoices you
+          send. Payout onboarding lives on the Payouts tab.
         </p>
       </div>
+      <BrandingSection />
+      <InvoiceDefaultsSection />
       <PinSettings />
     </div>
   );

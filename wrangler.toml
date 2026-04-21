@@ -56,6 +56,12 @@ compatibility_date = "2025-10-01"
 #   TWILIO_AUTH_TOKEN          (SECRET — used for HMAC sig + Basic auth)
 #   TWILIO_FROM_NUMBER         (SECRET — E.164, toll-free 10DLC registered)
 #
+# Phase 7 — Cron shared secret (manual /api/cron/run-once testing):
+#   CRON_SHARED_SECRET         (SECRET — random 32+ byte string. Only
+#                               needed to smoke-test cron jobs before
+#                               flipping FLAGS["cron:enabled"]=true.
+#                               Set via `wrangler secret put`.)
+#
 # Phase 6 — Public origin (for SMS body deep-links + Twilio status
 # callback URL). Falls back to https://maneline.co if unset.
 #   MANELINE_PUBLIC_ORIGIN     (public — [vars] below)
@@ -207,4 +213,23 @@ class_name = "RateLimiter"
 [[migrations]]
 tag                 = "v2"
 new_sqlite_classes  = ["RateLimiter"]
+
+# -----------------------------------------------------------------
+# CRON TRIGGERS — Phase 7 PR #6
+#
+# Hourly scheduled() firing runs the recurring-line-item
+# materializer and the auto-finalize sweep over trainer drafts.
+#
+# KILL SWITCH: the handler reads `cron:enabled` from FLAGS KV and
+# no-ops unless set to "true". Default is OFF so prod doesn't
+# auto-finalize invoices before launch. Flip at launch:
+#   npx wrangler kv key put --binding=FLAGS cron:enabled true --remote
+#
+# Per-job overrides (`cron:recurring`, `cron:auto_finalize`) let
+# us toggle individual jobs during smoke tests without disabling
+# the entire cron fabric.
+# -----------------------------------------------------------------
+
+[triggers]
+crons = ["0 * * * *"]
 

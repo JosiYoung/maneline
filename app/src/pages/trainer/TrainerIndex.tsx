@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from "react-router-dom";
 import { TrainerLayout } from "../../components/trainer/TrainerLayout";
 import { WelcomeTour } from "../../components/WelcomeTour";
 import TrainerDashboard from "./TrainerDashboard";
+import BusinessDashboard from "./BusinessDashboard";
 import TrainerAccount from "./TrainerAccount";
 import ClientsIndex from "./ClientsIndex";
 import AnimalReadOnly from "./AnimalReadOnly";
@@ -10,6 +11,9 @@ import SessionNew from "./SessionNew";
 import SessionDetail from "./SessionDetail";
 import PayoutsIndex from "./PayoutsIndex";
 import ExpensesIndex from "./ExpensesIndex";
+import InvoicesIndex from "./InvoicesIndex";
+import InvoiceDetail from "./InvoiceDetail";
+import RecurringItemsIndex from "./RecurringItemsIndex";
 
 // TrainerIndex — the trainer portal's route shell. Mounted under
 // <ProtectedRoute allow="trainer"> in App.tsx, so every child route here
@@ -23,12 +27,16 @@ export default function TrainerIndex() {
     <TrainerLayout>
       <Routes>
         <Route index element={<TrainerDashboard />} />
+        <Route path="business"    element={<BusinessDashboard />} />
         <Route path="clients"     element={<ClientsIndex />} />
         <Route path="animals/:id" element={<AnimalReadOnly />} />
         <Route path="sessions"          element={<SessionsIndex />} />
         <Route path="sessions/new"      element={<SessionNew />} />
         <Route path="sessions/:id"      element={<SessionDetail />} />
         <Route path="expenses"    element={<ExpensesIndex />} />
+        <Route path="invoices"           element={<InvoicesIndex />} />
+        <Route path="invoices/recurring" element={<RecurringItemsIndex />} />
+        <Route path="invoices/:id"       element={<InvoiceDetail />} />
         <Route path="payouts"     element={<PayoutsIndex />} />
         <Route path="account"     element={<TrainerAccount />} />
         <Route path="*" element={<Navigate to="/trainer" replace />} />

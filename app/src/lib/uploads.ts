@@ -14,7 +14,11 @@ import { supabase } from "./supabase";
 // Every call attaches the current Supabase access token so requireOwner()
 // on the Worker side sees a real user.
 
-export type UploadKind = "vet_record" | "animal_photo" | "animal_video";
+export type UploadKind =
+  | "vet_record"
+  | "animal_photo"
+  | "animal_video"
+  | "trainer_logo";
 
 export type PresignResult = {
   put_url: string;
@@ -41,6 +45,10 @@ export type CommitInput =
       animal_id: string;
       caption?: string | null;
       taken_on?: string | null;
+    }
+  | {
+      kind: "trainer_logo";
+      object_key: string;
     };
 
 export type CommitResult = { id: string; r2_object_id: string };
@@ -142,4 +150,11 @@ export const VET_RECORD_MIME = new Set([
   "image/heic",
 ]);
 
+export const TRAINER_LOGO_MIME = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+]);
+
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+export const MAX_LOGO_BYTES = 2 * 1024 * 1024;

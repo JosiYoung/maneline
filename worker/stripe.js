@@ -98,6 +98,67 @@ async function stripeFetch(env, method, path, body) {
 }
 
 /**
+ * POST /v1/accounts/{id} — patch a connected account. Used by Phase 7
+ * PR #7 to push trainer branding (logo, primary color, display name)
+ * onto the Connect account so the Stripe-hosted invoice page + PDF
+ * render with the trainer's identity, not ours.
+ *
+ * Must be called WITHOUT the Stripe-Account header — we're modifying
+ * the connected account itself as the platform.
+ */
+export function updateConnectAccount(env, accountId, patch) {
+  return stripeFetch(env, 'POST', `/accounts/${encodeURIComponent(accountId)}`, patch);
+}
+
+/**
+ * POST https://files.stripe.com/v1/files — multipart upload of a logo
+ * image bytes so Stripe can reference it by file id in
+ * settings.branding.{icon,logo}. Uploaded on-behalf-of the connected
+ * account via Stripe-Account so the file is usable by that account.
+ *
+ * Returns { ok, data: { id, ... } } shaped like other helpers.
+ */
+export async function uploadStripeFileForAccount(env, {
+  stripeAccountId,
+  bytes,
+  filename,
+  mimeType,
+  purpose = 'business_logo',
+}) {
+  if (!isStripeConfigured(env)) {
+    return { ok: false, status: 501, data: null, error: 'stripe_not_configured' };
+  }
+  const form = new FormData();
+  form.append('purpose', purpose);
+  form.append('file', new Blob([bytes], { type: mimeType }), filename);
+
+  const headers = {
+    Authorization: basicAuthHeader(env.STRIPE_SECRET_KEY),
+    'Stripe-Version': STRIPE_API_VERSION,
+  };
+  if (stripeAccountId) headers['Stripe-Account'] = stripeAccountId;
+
+  const res = await fetch('https://files.stripe.com/v1/files', {
+    method: 'POST',
+    headers,
+    body: form,
+  });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      data,
+      error: data?.error?.code || data?.error?.type || 'stripe_file_upload_failed',
+      message: data?.error?.message ?? null,
+    };
+  }
+  return { ok: true, status: res.status, data };
+}
+
+/**
  * POST /v1/accounts — create a Stripe Connect Express account for a
  * trainer. We pass capabilities and the trainer's email so Stripe can
  * pre-fill the onboarding form.
@@ -206,6 +267,190 @@ export async function createPaymentIntent(env, {
 
 export function retrievePaymentIntent(env, paymentIntentId) {
   return stripeFetch(env, 'GET', `/payment_intents/${encodeURIComponent(paymentIntentId)}`);
+}
+
+/**
+ * Phase 7 — white-label invoicing on Stripe Connect (direct charges).
+ *
+ * All calls below target the trainer's Connect account via the
+ * `Stripe-Account` header so the Customer + Invoice rows live on the
+ * trainer's books, the hosted-invoice page renders with the trainer's
+ * branding (brand color + logo uploaded to Stripe), and payouts settle
+ * directly to the trainer minus `application_fee_amount`.
+ *
+ * Idempotency-Key is accepted per mutating call so the Worker can key
+ * on `invoice:{db_id}:finalize` / `send` / `void` and make a retry
+ * from the SPA a no-op.
+ */
+async function stripeConnectFetch(env, method, path, body, opts = {}) {
+  if (!isStripeConfigured(env)) {
+    return { ok: false, status: 501, data: null, error: 'stripe_not_configured' };
+  }
+  const { stripeAccountId, idempotencyKey } = opts;
+  const headers = {
+    Authorization: basicAuthHeader(env.STRIPE_SECRET_KEY),
+    'Stripe-Version': STRIPE_API_VERSION,
+  };
+  if (stripeAccountId) headers['Stripe-Account'] = stripeAccountId;
+  if (idempotencyKey)  headers['Idempotency-Key'] = idempotencyKey;
+
+  let requestBody;
+  if (body && Object.keys(body).length > 0) {
+    headers['content-type'] = 'application/x-www-form-urlencoded';
+    requestBody = encodeForm(body);
+  }
+
+  const res = await fetch(`${STRIPE_API_BASE}${path}`, {
+    method,
+    headers,
+    body: requestBody,
+  });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      data,
+      error: data?.error?.code || data?.error?.type || 'stripe_request_failed',
+      message: data?.error?.message ?? null,
+    };
+  }
+  return { ok: true, status: res.status, data };
+}
+
+// POST /v1/customers on the trainer's Connect account. Safe to call
+// multiple times — the Worker keeps a (trainer, owner|adhoc_email) ->
+// stripe_customer_id map and short-circuits on hit.
+export function createConnectCustomer(env, {
+  stripeAccountId,
+  email,
+  name,
+  metadata = {},
+  idempotencyKey,
+}) {
+  const body = { metadata };
+  if (email) body.email = email;
+  if (name)  body.name  = name;
+  return stripeConnectFetch(env, 'POST', '/customers', body, {
+    stripeAccountId,
+    idempotencyKey,
+  });
+}
+
+// POST /v1/invoices — creates a DRAFT invoice on the trainer's account.
+// We attach `application_fee_amount` so Stripe routes the platform cut
+// to our account at finalize time. `auto_advance=false` because we
+// drive the state transitions ourselves (finalize + send explicitly).
+export function createConnectInvoice(env, {
+  stripeAccountId,
+  customerId,
+  applicationFeeAmountCents,
+  daysUntilDue,
+  footerMemo,
+  invoiceNumber,
+  metadata = {},
+  idempotencyKey,
+}) {
+  const body = {
+    customer: customerId,
+    collection_method: 'send_invoice',
+    days_until_due: daysUntilDue,
+    auto_advance: 'false',
+    metadata,
+  };
+  if (applicationFeeAmountCents && applicationFeeAmountCents > 0) {
+    body.application_fee_amount = applicationFeeAmountCents;
+  }
+  if (footerMemo)    body.footer = footerMemo;
+  if (invoiceNumber) body.number = invoiceNumber;
+  return stripeConnectFetch(env, 'POST', '/invoices', body, {
+    stripeAccountId,
+    idempotencyKey,
+  });
+}
+
+// POST /v1/invoiceitems — attach one line to the draft invoice. Stripe
+// rolls these up into the invoice's subtotal at finalize time.
+export function createConnectInvoiceItem(env, {
+  stripeAccountId,
+  customerId,
+  invoiceId,
+  amountCents,
+  currency = 'usd',
+  description,
+  quantity,
+  unitAmountCents,
+  idempotencyKey,
+}) {
+  const body = {
+    customer: customerId,
+    invoice: invoiceId,
+    currency,
+    description,
+  };
+  // Prefer unit_amount + quantity when the caller provides both — gives
+  // prettier hosted-invoice rendering. Fall back to a flat amount for
+  // expenses/custom lines where "2.5 hrs × $120" isn't meaningful.
+  if (unitAmountCents !== undefined && unitAmountCents !== null && quantity !== undefined && quantity !== null) {
+    body.unit_amount = unitAmountCents;
+    body.quantity    = quantity;
+  } else {
+    body.amount = amountCents;
+  }
+  return stripeConnectFetch(env, 'POST', '/invoiceitems', body, {
+    stripeAccountId,
+    idempotencyKey,
+  });
+}
+
+// POST /v1/invoices/{id}/finalize — flips Stripe's status draft -> open
+// and locks the invoice shape. Must happen before `send`.
+export function finalizeConnectInvoice(env, { stripeAccountId, invoiceId, idempotencyKey }) {
+  return stripeConnectFetch(
+    env,
+    'POST',
+    `/invoices/${encodeURIComponent(invoiceId)}/finalize`,
+    { auto_advance: 'false' },
+    { stripeAccountId, idempotencyKey }
+  );
+}
+
+// POST /v1/invoices/{id}/send — emails the hosted-invoice link to the
+// customer. Idempotent server-side on Stripe when passed the same key.
+export function sendConnectInvoice(env, { stripeAccountId, invoiceId, idempotencyKey }) {
+  return stripeConnectFetch(
+    env,
+    'POST',
+    `/invoices/${encodeURIComponent(invoiceId)}/send`,
+    {},
+    { stripeAccountId, idempotencyKey }
+  );
+}
+
+// POST /v1/invoices/{id}/void — terminal state on Stripe. We mirror to
+// status='void' + voided_at=now(). Stripe does NOT allow finalized
+// invoices to be "deleted" — void is the audit-preserving answer.
+export function voidConnectInvoice(env, { stripeAccountId, invoiceId, idempotencyKey }) {
+  return stripeConnectFetch(
+    env,
+    'POST',
+    `/invoices/${encodeURIComponent(invoiceId)}/void`,
+    {},
+    { stripeAccountId, idempotencyKey }
+  );
+}
+
+export function retrieveConnectInvoice(env, { stripeAccountId, invoiceId }) {
+  return stripeConnectFetch(
+    env,
+    'GET',
+    `/invoices/${encodeURIComponent(invoiceId)}`,
+    null,
+    { stripeAccountId }
+  );
 }
 
 /**

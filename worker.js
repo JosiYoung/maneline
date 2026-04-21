@@ -70,12 +70,21 @@ import { presignPut, presignGet } from './worker/r2-presign.js';
 import { renderRecordsPdf } from './worker/records-export.js';
 import {
   createAccountLink,
+  createConnectCustomer,
+  createConnectInvoice,
+  createConnectInvoiceItem,
   createExpressAccount,
   createPaymentIntent,
   createRefund,
+  finalizeConnectInvoice,
   isStripeConfigured,
   retrieveAccount,
+  retrieveConnectInvoice,
   retrievePaymentIntent,
+  sendConnectInvoice,
+  updateConnectAccount,
+  uploadStripeFileForAccount,
+  voidConnectInvoice,
 } from './worker/stripe.js';
 import { verifyStripeSignature } from './worker/stripe-webhook.js';
 import { createCheckoutSession, retrieveCheckoutSession } from './worker/stripe-checkout.js';
@@ -198,6 +207,21 @@ export default {
       if (url.pathname === '/api/stripe/sweep/process') {
         return handleStripeSweepProcess(request, env);
       }
+      if (url.pathname === '/api/invoices/finalize') {
+        return handleInvoiceFinalize(request, env);
+      }
+      if (url.pathname === '/api/invoices/send') {
+        return handleInvoiceSend(request, env);
+      }
+      if (url.pathname === '/api/invoices/void') {
+        return handleInvoiceVoid(request, env);
+      }
+      if (url.pathname === '/api/cron/run-once') {
+        return handleCronRunOnce(request, env);
+      }
+      if (url.pathname === '/api/trainer/branding/sync') {
+        return handleTrainerBrandingSync(request, env);
+      }
       if (url.pathname === '/api/records/export-pdf') {
         return handleRecordsExport(request, env);
       }
@@ -300,7 +324,65 @@ export default {
       return json({ ok: false, error: 'Server error', detail: err?.message ?? 'unknown' }, 500);
     }
   },
+
+  /**
+   * Cloudflare Cron Trigger entry — fires on the schedule(s) declared
+   * in wrangler.toml [[triggers]].
+   *
+   * KILL SWITCH: Reads feature flag `cron:enabled` from env.FLAGS KV.
+   * If the value is anything other than "true" (including missing), the
+   * handler returns immediately. Default is OFF until launch.
+   *
+   * Flip:
+   *   npx wrangler kv key put --binding=FLAGS cron:enabled true  --remote
+   *   npx wrangler kv key put --binding=FLAGS cron:enabled false --remote
+   *   npx wrangler kv key delete --binding=FLAGS cron:enabled    --remote
+   *
+   * Per-job flags (`cron:auto_finalize`, `cron:recurring`) let us
+   * enable jobs individually during smoke tests — if the master flag
+   * is on and a per-job flag is explicitly "false", that job no-ops.
+   */
+  async scheduled(event, env, ctx) {
+    const master = await env.FLAGS.get('cron:enabled');
+    if (master !== 'true') {
+      console.log('[cron] master kill switch off — skipping', event.cron);
+      return;
+    }
+    ctx.waitUntil(runScheduledJobs(env, { cron: event.cron, scheduledTime: event.scheduledTime }));
+  },
 };
+
+async function runScheduledJobs(env, meta) {
+  const started = Date.now();
+  const results = {};
+
+  const recurringOn = (await env.FLAGS.get('cron:recurring')) !== 'false';
+  if (recurringOn) {
+    try {
+      results.recurring = await materializeRecurringItems(env);
+    } catch (err) {
+      console.error('[cron] materializeRecurringItems failed', err);
+      results.recurring = { ok: false, error: String(err?.message ?? err) };
+    }
+  } else {
+    results.recurring = { ok: true, skipped: true };
+  }
+
+  const autoFinalizeOn = (await env.FLAGS.get('cron:auto_finalize')) !== 'false';
+  if (autoFinalizeOn) {
+    try {
+      results.auto_finalize = await autoFinalizeDueDrafts(env);
+    } catch (err) {
+      console.error('[cron] autoFinalizeDueDrafts failed', err);
+      results.auto_finalize = { ok: false, error: String(err?.message ?? err) };
+    }
+  } else {
+    results.auto_finalize = { ok: true, skipped: true };
+  }
+
+  console.log('[cron] ran', meta.cron, 'in', Date.now() - started, 'ms', JSON.stringify(results));
+  return results;
+}
 
 /* =============================================================
    Crypto / request helpers
@@ -2787,7 +2869,19 @@ const ALLOWED_CONTENT_TYPES = {
     'video/mp4':        'mp4',
     'video/quicktime':  'mov',
   },
+  // Phase 7 — trainer invoice-branding logo. Stored in the private records
+  // bucket (served to the trainer via the same read-url signed GET as other
+  // records; the PDF exporter reads the bytes directly via the R2 binding).
+  trainer_logo: {
+    'image/png':  'png',
+    'image/jpeg': 'jpg',
+    'image/webp': 'webp',
+  },
 };
+
+// Logos are kept small so the invoice PDF header renders fast. 2 MB is
+// plenty for a reasonable bitmap/PNG at print resolution.
+const MAX_LOGO_BYTES = 2 * 1024 * 1024;
 
 // Max bytes we'll presign for. Hard cap here and at commit time so a
 // leaked signed URL can't be used to dump a 2 GB file into the bucket.
@@ -3031,13 +3125,19 @@ async function handleUploadSign(request, env) {
 
   // Records uploads must always attach to an animal the caller owns;
   // /sign rejects early so we don't waste a signature on an orphan object.
+  // trainer_logo and records_export are animal-less by design.
   if (animalId) {
     const ownsIt = await assertCallerOwnsAnimal(env, jwt, animalId);
     if (!ownsIt) {
       return json({ error: 'forbidden', detail: 'not the owner of that animal' }, 403);
     }
-  } else if (kind !== 'records_export') {
+  } else if (kind !== 'records_export' && kind !== 'trainer_logo') {
     return json({ error: 'bad_request', detail: 'animal_id required for this kind' }, 400);
+  }
+
+  // Logo uploads cap at 2 MB — tighter than the 25 MB records ceiling.
+  if (kind === 'trainer_logo' && byteEstimate > MAX_LOGO_BYTES) {
+    return json({ error: 'bad_byte_size', detail: `trainer_logo max is ${MAX_LOGO_BYTES} bytes` }, 413);
   }
 
   const rl = await rateLimit(env, `ratelimit:upload_sign:${actorId}`, UPLOAD_SIGN_RATE);
@@ -3130,7 +3230,7 @@ async function handleUploadCommit(request, env) {
   if (animalId) {
     const ownsIt = await assertCallerOwnsAnimal(env, jwt, animalId);
     if (!ownsIt) return json({ error: 'forbidden' }, 403);
-  } else if (kind !== 'records_export') {
+  } else if (kind !== 'records_export' && kind !== 'trainer_logo') {
     return json({ error: 'bad_request', detail: 'animal_id required' }, 400);
   }
 
@@ -3143,6 +3243,10 @@ async function handleUploadCommit(request, env) {
   if (head.size > MAX_UPLOAD_BYTES) {
     // Belt-and-suspenders — presign already caps, but if an attacker
     // finds a way to upload more, we still refuse to record it.
+    await env.MANELINE_R2.delete(objectKey).catch(() => {});
+    return json({ error: 'too_large' }, 413);
+  }
+  if (kind === 'trainer_logo' && head.size > MAX_LOGO_BYTES) {
     await env.MANELINE_R2.delete(objectKey).catch(() => {});
     return json({ error: 'too_large' }, 413);
   }
@@ -3192,6 +3296,51 @@ async function handleUploadCommit(request, env) {
       caption:      body?.caption || null,
       taken_on:     body?.taken_on || null,
     });
+  } else if (kind === 'trainer_logo') {
+    // Phase 7 branding: no typed row — the logo pointer lives on
+    // trainer_profiles. Swap the key and best-effort delete the old
+    // object so we don't leak bytes on re-upload.
+    const prior = await supabaseSelect(
+      env,
+      'trainer_profiles',
+      `select=invoice_logo_r2_key&user_id=eq.${actorId}&limit=1`,
+      { serviceRole: true }
+    );
+    const priorKey = Array.isArray(prior.data) ? prior.data[0]?.invoice_logo_r2_key : null;
+
+    const upd = await supabaseUpdateReturning(
+      env,
+      'trainer_profiles',
+      `user_id=eq.${actorId}`,
+      { invoice_logo_r2_key: objectKey }
+    );
+    if (!upd.ok) {
+      await supabaseDelete(env, 'r2_objects', `id=eq.${r2ObjectId}`);
+      await env.MANELINE_R2.delete(objectKey).catch(() => {});
+      return json({ error: 'db_write_failed', detail: 'trainer_profiles update' }, 500);
+    }
+
+    if (priorKey && priorKey !== objectKey) {
+      await env.MANELINE_R2.delete(priorKey).catch(() => {});
+      await supabaseDelete(
+        env,
+        'r2_objects',
+        `owner_id=eq.${actorId}&object_key=eq.${encodeURIComponent(priorKey)}`
+      );
+    }
+
+    ctx_audit(env, {
+      actor_id: actorId,
+      actor_role: 'trainer',
+      action: 'branding.logo_upload',
+      target_table: 'trainer_profiles',
+      target_id: actorId,
+      ip: clientIp(request),
+      user_agent: request.headers.get('user-agent') || null,
+      metadata: { r2_object_id: r2ObjectId, object_key: objectKey, prior_key: priorKey },
+    });
+
+    return json({ id: actorId, r2_object_id: r2ObjectId });
   }
 
   if (!typedInsert.ok || !typedInsert.data?.id) {
@@ -4899,6 +5048,989 @@ async function handleSessionPay(request, env) {
 
 
 /* =============================================================
+   /api/invoices/{finalize,send,void}
+   -------------------------------------------------------------
+   Phase 7 PR #5 — white-label trainer invoicing on Stripe Connect.
+
+   Finalize: draft -> open on both Stripe and our DB. Creates Customer
+   + InvoiceItems + Invoice on the trainer's connected account the
+   first time, then calls /v1/invoices/{id}/finalize. application_fee_amount
+   is computed via effective_fee_bps() so the platform cut stays in
+   lockstep with the session-payment path.
+
+   Send: /v1/invoices/{id}/send. Stripe emails the hosted-invoice URL
+   to the customer. Sets sent_at on our row.
+
+   Void: /v1/invoices/{id}/void. Sets status='void', voided_at=now().
+   Invoices are never deleted (OAG §8).
+   ============================================================= */
+const INVOICE_ACTION_RATE = { limit: 12, windowSec: 60 };
+
+async function requireInvoiceOwnership(env, invoiceId, actorId) {
+  const r = await supabaseSelect(
+    env,
+    'invoices',
+    `select=*&id=eq.${encodeURIComponent(invoiceId)}`,
+    { serviceRole: true }
+  );
+  if (!r.ok) return { error: json({ error: 'lookup_failed' }, 500) };
+  const row = Array.isArray(r.data) ? r.data[0] : null;
+  if (!row) return { error: json({ error: 'invoice_not_found' }, 404) };
+  if (row.trainer_id !== actorId) return { error: json({ error: 'forbidden' }, 403) };
+  return { invoice: row };
+}
+
+async function resolveTrainerInvoiceContext(env, invoice) {
+  const connect = await getLatestConnectForTrainer(env, invoice.trainer_id);
+  if (!connect || !connect.stripe_account_id) {
+    return { error: json({ error: 'connect_not_onboarded' }, 409) };
+  }
+  if (!connect.charges_enabled || connect.deactivated_at) {
+    return { error: json({ error: 'connect_not_ready', disabled_reason: connect.disabled_reason ?? null }, 409) };
+  }
+
+  const settingsRes = await supabaseSelect(
+    env,
+    'trainer_invoice_settings',
+    `select=*&trainer_id=eq.${encodeURIComponent(invoice.trainer_id)}`,
+    { serviceRole: true }
+  );
+  const settings = Array.isArray(settingsRes.data) ? settingsRes.data[0] : null;
+
+  return { connect, settings };
+}
+
+// Look up (trainer, owner|adhoc_email) -> stripe_customer_id. Creates
+// the Customer on the trainer's Connect account the first time we
+// bill a given counterparty.
+async function ensureStripeCustomer(env, {
+  invoice,
+  stripeAccountId,
+}) {
+  const trainerId = invoice.trainer_id;
+  const ownerId   = invoice.owner_id;
+  const adhocEmail = invoice.adhoc_email ? invoice.adhoc_email.toLowerCase() : null;
+
+  // Lookup existing mapping.
+  let query;
+  if (ownerId) {
+    query = `select=id,stripe_customer_id&trainer_id=eq.${encodeURIComponent(trainerId)}&owner_id=eq.${encodeURIComponent(ownerId)}`;
+  } else if (adhocEmail) {
+    query = `select=id,stripe_customer_id&trainer_id=eq.${encodeURIComponent(trainerId)}&adhoc_email=eq.${encodeURIComponent(adhocEmail)}`;
+  } else {
+    return { error: json({ error: 'invoice_has_no_subject' }, 400) };
+  }
+  const existing = await supabaseSelect(env, 'trainer_customer_map', query, { serviceRole: true });
+  const hit = Array.isArray(existing.data) ? existing.data[0] : null;
+  if (hit) return { stripeCustomerId: hit.stripe_customer_id };
+
+  // Resolve billing name + email.
+  let email, name;
+  if (ownerId) {
+    const prof = await supabaseSelect(
+      env,
+      'user_profiles',
+      `select=display_name,email&user_id=eq.${encodeURIComponent(ownerId)}`,
+      { serviceRole: true }
+    );
+    const row = Array.isArray(prof.data) ? prof.data[0] : null;
+    email = row?.email;
+    name  = row?.display_name || row?.email;
+  } else {
+    email = invoice.adhoc_email;
+    name  = invoice.adhoc_name || invoice.adhoc_email;
+  }
+  if (!email) return { error: json({ error: 'customer_email_missing' }, 400) };
+
+  const cust = await createConnectCustomer(env, {
+    stripeAccountId,
+    email,
+    name,
+    metadata: {
+      ml_trainer_id: trainerId,
+      ml_owner_id:   ownerId ?? '',
+      ml_adhoc:      adhocEmail ?? '',
+    },
+    idempotencyKey: `invoice_customer:${trainerId}:${ownerId ?? adhocEmail}`,
+  });
+  if (!cust.ok || !cust.data?.id) {
+    return { error: json({ error: 'customer_create_failed', stripe_error: cust.error, message: cust.message }, 502) };
+  }
+  const stripeCustomerId = cust.data.id;
+
+  await supabaseInsertReturning(env, 'trainer_customer_map', {
+    trainer_id:         trainerId,
+    owner_id:           ownerId,
+    adhoc_email:        adhocEmail,
+    stripe_customer_id: stripeCustomerId,
+  });
+  return { stripeCustomerId };
+}
+
+async function handleInvoiceFinalize(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  if (!isStripeConfigured(env)) return json({ error: 'stripe_not_configured' }, 501);
+
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { return resp instanceof Response ? resp : json({ error: 'unauthorized' }, 401); }
+
+  const rl = await rateLimit(env, `ratelimit:invoice_finalize:${actorId}`, INVOICE_ACTION_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited' }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const invoiceId = body?.invoice_id;
+  if (!invoiceId || typeof invoiceId !== 'string') {
+    return json({ error: 'invoice_id_required' }, 400);
+  }
+
+  const own = await requireInvoiceOwnership(env, invoiceId, actorId);
+  if (own.error) return own.error;
+  const invoice = own.invoice;
+
+  const r = await performInvoiceFinalize(env, invoice, {
+    auditActorId:   actorId,
+    auditActorRole: 'trainer',
+    auditAction:    'invoice.finalize',
+  });
+  if (r.response) return r.response;
+  return json({ ok: true, idempotent: r.idempotent ?? false, invoice: r.invoice });
+}
+
+/**
+ * Drive a draft invoice from `draft` → `open` on Stripe and sync our
+ * row. Shared between the HTTP handler (handleInvoiceFinalize) and
+ * the hourly cron (autoFinalizeDueDrafts).
+ *
+ * Returns:
+ *   { response: Response }        — caller should return this directly
+ *                                   (bad state, Stripe error, etc.)
+ *   { invoice: Row, idempotent? } — success
+ */
+async function performInvoiceFinalize(env, invoice, { auditActorId = null, auditActorRole = 'system', auditAction = 'invoice.finalize' } = {}) {
+  if (invoice.status === 'open' || invoice.status === 'paid') {
+    return { invoice, idempotent: true };
+  }
+  if (invoice.status !== 'draft') {
+    return { response: json({ error: 'not_draft', status: invoice.status }, 409) };
+  }
+
+  const linesRes = await supabaseSelect(
+    env,
+    'invoice_line_items',
+    `select=*&invoice_id=eq.${encodeURIComponent(invoice.id)}&order=sort_order.asc`,
+    { serviceRole: true }
+  );
+  const lines = Array.isArray(linesRes.data) ? linesRes.data : [];
+  if (lines.length === 0) return { response: json({ error: 'no_line_items' }, 409) };
+
+  const subtotalCents = lines.reduce((acc, l) => acc + Math.round(Number(l.quantity) * l.unit_amount_cents), 0);
+  const taxCents = lines.reduce((acc, l) => {
+    const sub = Math.round(Number(l.quantity) * l.unit_amount_cents);
+    return acc + Math.round((sub * l.tax_rate_bps) / 10000);
+  }, 0);
+  const totalCents = subtotalCents + taxCents;
+  if (totalCents <= 0) return { response: json({ error: 'zero_total' }, 409) };
+
+  const ctx = await resolveTrainerInvoiceContext(env, invoice);
+  if (ctx.error) return { response: ctx.error };
+  const { connect, settings } = ctx;
+  const stripeAccountId = connect.stripe_account_id;
+
+  const feeRpc = await supabaseRpc(env, 'effective_fee_bps', { p_trainer_id: invoice.trainer_id }, { serviceRole: true });
+  if (!feeRpc.ok) return { response: json({ error: 'fee_lookup_failed' }, 500) };
+  const feeBps = Number(feeRpc.data);
+  if (!Number.isFinite(feeBps) || feeBps < 0 || feeBps > 10000) {
+    return { response: json({ error: 'fee_invalid' }, 500) };
+  }
+  const platformFeeCents = Math.ceil((totalCents * feeBps) / 10000);
+
+  const custRes = await ensureStripeCustomer(env, { invoice, stripeAccountId });
+  if (custRes.error) return { response: custRes.error };
+  const stripeCustomerId = custRes.stripeCustomerId;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const daysUntilDue = Math.max(
+    0,
+    Math.round(
+      (new Date(invoice.due_date + 'T00:00:00Z').getTime() - new Date(today + 'T00:00:00Z').getTime()) /
+        (1000 * 60 * 60 * 24)
+    )
+  );
+
+  let stripeInvoiceId = invoice.stripe_invoice_id;
+
+  if (!stripeInvoiceId) {
+    const inv = await createConnectInvoice(env, {
+      stripeAccountId,
+      customerId: stripeCustomerId,
+      applicationFeeAmountCents: platformFeeCents,
+      daysUntilDue,
+      footerMemo: settings?.footer_memo ?? null,
+      metadata: {
+        ml_invoice_id: invoice.id,
+        ml_trainer_id: invoice.trainer_id,
+        ml_owner_id:   invoice.owner_id ?? '',
+      },
+      idempotencyKey: `invoice_create:${invoice.id}`,
+    });
+    if (!inv.ok || !inv.data?.id) {
+      return { response: json({ error: 'invoice_create_failed', stripe_error: inv.error, message: inv.message }, 502) };
+    }
+    stripeInvoiceId = inv.data.id;
+
+    await supabaseUpdateReturning(
+      env,
+      'invoices',
+      `id=eq.${encodeURIComponent(invoice.id)}`,
+      { stripe_invoice_id: stripeInvoiceId, stripe_customer_id: stripeCustomerId }
+    );
+
+    for (const line of lines) {
+      const itemAmount = Math.round(Number(line.quantity) * line.unit_amount_cents);
+      const item = await createConnectInvoiceItem(env, {
+        stripeAccountId,
+        customerId: stripeCustomerId,
+        invoiceId: stripeInvoiceId,
+        amountCents: itemAmount,
+        description: line.description,
+        quantity: line.kind === 'session' ? line.quantity : undefined,
+        unitAmountCents: line.kind === 'session' ? line.unit_amount_cents : undefined,
+        idempotencyKey: `invoice_item:${line.id}`,
+      });
+      if (!item.ok) {
+        return { response: json({ error: 'invoice_item_failed', stripe_error: item.error, message: item.message }, 502) };
+      }
+    }
+  }
+
+  const fin = await finalizeConnectInvoice(env, {
+    stripeAccountId,
+    invoiceId: stripeInvoiceId,
+    idempotencyKey: `invoice_finalize:${invoice.id}`,
+  });
+  if (!fin.ok) {
+    return { response: json({ error: 'finalize_failed', stripe_error: fin.error, message: fin.message }, 502) };
+  }
+  const finalized = fin.data || {};
+
+  const updated = await supabaseUpdateReturning(
+    env,
+    'invoices',
+    `id=eq.${encodeURIComponent(invoice.id)}`,
+    {
+      status: 'open',
+      stripe_invoice_id:       stripeInvoiceId,
+      stripe_customer_id:      stripeCustomerId,
+      stripe_hosted_invoice_url: finalized.hosted_invoice_url ?? null,
+      stripe_invoice_pdf_url:    finalized.invoice_pdf ?? null,
+      invoice_number:          finalized.number ?? null,
+      subtotal_cents:          subtotalCents,
+      tax_cents:               taxCents,
+      total_cents:             totalCents,
+      platform_fee_cents:      platformFeeCents,
+    }
+  );
+
+  ctx_audit(env, {
+    actor_id:     auditActorId,
+    actor_role:   auditActorRole,
+    action:       auditAction,
+    target_table: 'invoices',
+    target_id:    invoice.id,
+    metadata:     { stripe_invoice_id: stripeInvoiceId, total_cents: totalCents, platform_fee_cents: platformFeeCents },
+  });
+
+  return { invoice: updated.data };
+}
+
+async function handleInvoiceSend(request, env) {
+  if (request.method !== 'POST') return new Response('method not allowed', { status: 405 });
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  if (!isStripeConfigured(env)) return json({ error: 'stripe_not_configured' }, 501);
+
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { return resp instanceof Response ? resp : json({ error: 'unauthorized' }, 401); }
+
+  const rl = await rateLimit(env, `ratelimit:invoice_send:${actorId}`, INVOICE_ACTION_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited' }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const invoiceId = body?.invoice_id;
+  if (!invoiceId) return json({ error: 'invoice_id_required' }, 400);
+
+  const own = await requireInvoiceOwnership(env, invoiceId, actorId);
+  if (own.error) return own.error;
+  const invoice = own.invoice;
+
+  if (!invoice.stripe_invoice_id) return json({ error: 'not_finalized' }, 409);
+  if (invoice.status !== 'open') return json({ error: 'not_sendable', status: invoice.status }, 409);
+
+  const ctx = await resolveTrainerInvoiceContext(env, invoice);
+  if (ctx.error) return ctx.error;
+
+  const sent = await sendConnectInvoice(env, {
+    stripeAccountId: ctx.connect.stripe_account_id,
+    invoiceId: invoice.stripe_invoice_id,
+    idempotencyKey: `invoice_send:${invoice.id}`,
+  });
+  if (!sent.ok) {
+    return json({ error: 'send_failed', stripe_error: sent.error, message: sent.message }, 502);
+  }
+
+  const updated = await supabaseUpdateReturning(
+    env,
+    'invoices',
+    `id=eq.${encodeURIComponent(invoice.id)}`,
+    { sent_at: new Date().toISOString() }
+  );
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'trainer',
+    action:       'invoice.send',
+    target_table: 'invoices',
+    target_id:    invoice.id,
+    metadata:     { stripe_invoice_id: invoice.stripe_invoice_id },
+  });
+
+  return json({ ok: true, invoice: updated.data });
+}
+
+async function handleInvoiceVoid(request, env) {
+  if (request.method !== 'POST') return new Response('method not allowed', { status: 405 });
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { return resp instanceof Response ? resp : json({ error: 'unauthorized' }, 401); }
+
+  const rl = await rateLimit(env, `ratelimit:invoice_void:${actorId}`, INVOICE_ACTION_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited' }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const invoiceId = body?.invoice_id;
+  if (!invoiceId) return json({ error: 'invoice_id_required' }, 400);
+
+  const own = await requireInvoiceOwnership(env, invoiceId, actorId);
+  if (own.error) return own.error;
+  const invoice = own.invoice;
+
+  if (invoice.status === 'void') {
+    return json({ ok: true, idempotent: true, invoice });
+  }
+  if (invoice.status === 'paid') {
+    return json({ error: 'already_paid' }, 409);
+  }
+
+  // Draft can skip Stripe entirely — just flip our row. Open invoices
+  // must be voided on Stripe first so their hosted URL goes dead.
+  if (invoice.status !== 'draft' && invoice.stripe_invoice_id) {
+    if (!isStripeConfigured(env)) return json({ error: 'stripe_not_configured' }, 501);
+    const ctx = await resolveTrainerInvoiceContext(env, invoice);
+    if (ctx.error) return ctx.error;
+
+    const vd = await voidConnectInvoice(env, {
+      stripeAccountId: ctx.connect.stripe_account_id,
+      invoiceId: invoice.stripe_invoice_id,
+      idempotencyKey: `invoice_void:${invoice.id}`,
+    });
+    if (!vd.ok) {
+      return json({ error: 'void_failed', stripe_error: vd.error, message: vd.message }, 502);
+    }
+  }
+
+  const updated = await supabaseUpdateReturning(
+    env,
+    'invoices',
+    `id=eq.${encodeURIComponent(invoice.id)}`,
+    { status: 'void', voided_at: new Date().toISOString() }
+  );
+
+  ctx_audit(env, {
+    actor_id:     actorId,
+    actor_role:   'trainer',
+    action:       'invoice.void',
+    target_table: 'invoices',
+    target_id:    invoice.id,
+    metadata:     { stripe_invoice_id: invoice.stripe_invoice_id },
+  });
+
+  return json({ ok: true, invoice: updated.data });
+}
+
+// Webhook sync — fires when a Stripe-hosted invoice gets paid or
+// voided outside our UI. Matches on stripe_invoice_id so it only
+// touches rows we created; subscription invoices still flow through
+// the stripe-subscriptions.js handlers. Avoids the need to inspect
+// event metadata to decide which path to take.
+async function syncConnectInvoiceFromEvent(env, event) {
+  const stripeInv = event?.data?.object;
+  const stripeInvoiceId = stripeInv?.id;
+  if (!stripeInvoiceId) return { ok: false, error: 'missing_invoice' };
+
+  const r = await supabaseSelect(
+    env,
+    'invoices',
+    `select=id,status&stripe_invoice_id=eq.${encodeURIComponent(stripeInvoiceId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const row = Array.isArray(r.data) ? r.data[0] : null;
+  if (!row) return { ok: true, ignored: true }; // not one of ours; subscription handler or unrelated
+
+  const patch = {};
+  switch (event.type) {
+    case 'invoice.paid':
+    case 'invoice.payment_succeeded':
+      if (row.status === 'paid') return { ok: true, idempotent: true };
+      patch.status            = 'paid';
+      patch.paid_at           = new Date().toISOString();
+      patch.amount_paid_cents = stripeInv.amount_paid ?? stripeInv.total ?? 0;
+      break;
+    case 'invoice.voided':
+      if (row.status === 'void') return { ok: true, idempotent: true };
+      patch.status    = 'void';
+      patch.voided_at = new Date().toISOString();
+      break;
+    case 'invoice.marked_uncollectible':
+      patch.status = 'uncollectible';
+      break;
+    default:
+      return { ok: true, ignored: true };
+  }
+
+  const upd = await supabaseUpdateReturning(
+    env,
+    'invoices',
+    `id=eq.${encodeURIComponent(row.id)}`,
+    patch
+  );
+  if (!upd.ok) return { ok: false, error: 'invoice_update_failed' };
+
+  ctx_audit(env, {
+    action:       `invoice.webhook.${event.type}`,
+    target_table: 'invoices',
+    target_id:    row.id,
+    metadata:     { stripe_invoice_id: stripeInvoiceId, event_id: event.id },
+  });
+  return { ok: true };
+}
+
+/* =============================================================
+   PR #6 — Cron jobs: recurring-line materialization + auto-finalize
+   -------------------------------------------------------------
+   Fired from scheduled() (hourly) and the manual /api/cron/run-once
+   endpoint. Each job is idempotent: re-running within the same
+   period is a no-op.
+
+   SAFETY: The scheduled() handler gates on FLAGS["cron:enabled"]
+   so nothing fires in prod until launch. Per-job flags
+   ("cron:recurring", "cron:auto_finalize") give finer control
+   during smoke tests.
+   ============================================================= */
+
+// Compute YYYY-MM-DD in a given IANA time zone. Used to check
+// whether "today" in the trainer's local calendar matches their
+// auto_finalize_day. Intl is available in the Workers runtime.
+function todayInTimeZone(tz) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz || 'America/Chicago',
+    year:  'numeric',
+    month: '2-digit',
+    day:   '2-digit',
+  }).formatToParts(new Date());
+  const y = parts.find(p => p.type === 'year')?.value;
+  const m = parts.find(p => p.type === 'month')?.value;
+  const d = parts.find(p => p.type === 'day')?.value;
+  return `${y}-${m}-${d}`; // en-CA is ISO-ordered
+}
+
+// Given a first-of-month date "YYYY-MM-01", return the last day of
+// that month as "YYYY-MM-DD". Used to seed invoice.period_end when
+// the recurring materializer creates a draft.
+function endOfMonthDate(monthStartIso) {
+  const [y, m] = monthStartIso.split('-').map(Number);
+  // new Date(y, m, 0) → last day of month m (1-indexed), since
+  // day=0 rolls back from the next month's first.
+  const d = new Date(Date.UTC(y, m, 0));
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+function addDaysIso(iso, days) {
+  const [y, m, d] = iso.split('-').map(Number);
+  const t = new Date(Date.UTC(y, m - 1, d));
+  t.setUTCDate(t.getUTCDate() + days);
+  return `${t.getUTCFullYear()}-${String(t.getUTCMonth() + 1).padStart(2, '0')}-${String(t.getUTCDate()).padStart(2, '0')}`;
+}
+
+/**
+ * For every active recurring_line_items row, ensure the current
+ * billing period (trainer-local calendar month) has ONE line on a
+ * draft invoice for that (trainer, subject) pair.
+ *
+ * Match via invoice_line_items.source_id=recurring.id — so a re-run
+ * within the same month never double-bills. If no draft exists for
+ * the period, we create one using the trainer's default net days.
+ */
+async function materializeRecurringItems(env) {
+  const started = Date.now();
+  const stats = { considered: 0, already_billed: 0, drafts_created: 0, lines_added: 0, errors: [] };
+
+  const rowsRes = await supabaseSelect(
+    env,
+    'recurring_line_items',
+    'select=*&active=eq.true',
+    { serviceRole: true }
+  );
+  if (!rowsRes.ok) {
+    return { ok: false, error: 'recurring_query_failed', status: rowsRes.status };
+  }
+  const rows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+  stats.considered = rows.length;
+
+  // Cache month_start per trainer (one RPC round trip each).
+  const monthStartCache = new Map();
+  async function monthStartFor(trainerId) {
+    if (monthStartCache.has(trainerId)) return monthStartCache.get(trainerId);
+    const r = await supabaseRpc(env, 'trainer_month_start', { p_trainer_id: trainerId }, { serviceRole: true });
+    const ms = (r.ok && typeof r.data === 'string') ? r.data : null;
+    monthStartCache.set(trainerId, ms);
+    return ms;
+  }
+
+  // Cache (trainer_id, default_due_net_days) so we don't re-query.
+  const settingsCache = new Map();
+  async function settingsFor(trainerId) {
+    if (settingsCache.has(trainerId)) return settingsCache.get(trainerId);
+    const r = await supabaseSelect(
+      env,
+      'trainer_invoice_settings',
+      `select=default_due_net_days&trainer_id=eq.${encodeURIComponent(trainerId)}`,
+      { serviceRole: true }
+    );
+    const row = Array.isArray(r.data) ? r.data[0] : null;
+    settingsCache.set(trainerId, row);
+    return row;
+  }
+
+  for (const r of rows) {
+    try {
+      const monthStart = await monthStartFor(r.trainer_id);
+      if (!monthStart) { stats.errors.push({ id: r.id, reason: 'no_month_start' }); continue; }
+
+      // Already billed this period?
+      const existingLine = await supabaseSelect(
+        env,
+        'invoice_line_items',
+        `select=id,invoice_id,invoices!inner(id,trainer_id,owner_id,adhoc_email,period_start,status)` +
+        `&kind=eq.recurring&source_id=eq.${encodeURIComponent(r.id)}` +
+        `&invoices.trainer_id=eq.${encodeURIComponent(r.trainer_id)}` +
+        `&invoices.period_start=eq.${encodeURIComponent(monthStart)}` +
+        `&invoices.status=neq.void`,
+        { serviceRole: true }
+      );
+      const hits = Array.isArray(existingLine.data) ? existingLine.data : [];
+      const matched = hits.find(h => {
+        const inv = h.invoices || {};
+        if (r.owner_id)  return inv.owner_id === r.owner_id;
+        if (r.adhoc_email) return (inv.adhoc_email || '').toLowerCase() === r.adhoc_email.toLowerCase();
+        return false;
+      });
+      if (matched) { stats.already_billed++; continue; }
+
+      // Find or create a draft for this subject+period.
+      let draft;
+      const draftFilter = r.owner_id
+        ? `trainer_id=eq.${encodeURIComponent(r.trainer_id)}&owner_id=eq.${encodeURIComponent(r.owner_id)}&period_start=eq.${encodeURIComponent(monthStart)}&status=eq.draft`
+        : `trainer_id=eq.${encodeURIComponent(r.trainer_id)}&adhoc_email=eq.${encodeURIComponent(r.adhoc_email.toLowerCase())}&period_start=eq.${encodeURIComponent(monthStart)}&status=eq.draft`;
+
+      const draftQ = await supabaseSelect(env, 'invoices', `select=*&${draftFilter}&limit=1`, { serviceRole: true });
+      draft = Array.isArray(draftQ.data) ? draftQ.data[0] : null;
+
+      if (!draft) {
+        const periodEnd = endOfMonthDate(monthStart);
+        const settings = await settingsFor(r.trainer_id);
+        const netDays = Number(settings?.default_due_net_days ?? 15);
+        const dueDate = addDaysIso(periodEnd, netDays);
+
+        const payload = {
+          trainer_id:   r.trainer_id,
+          owner_id:     r.owner_id,
+          adhoc_email:  r.adhoc_email ? r.adhoc_email.toLowerCase() : null,
+          adhoc_name:   r.adhoc_email ? r.adhoc_email : null,
+          status:       'draft',
+          period_start: monthStart,
+          period_end:   periodEnd,
+          due_date:     dueDate,
+        };
+
+        const createRes = await supabaseInsertReturning(env, 'invoices', payload);
+        if (!createRes.ok || !createRes.data) {
+          stats.errors.push({ id: r.id, reason: 'draft_create_failed', status: createRes.status });
+          continue;
+        }
+        draft = createRes.data;
+        stats.drafts_created++;
+      }
+
+      // Add the recurring line. invoice_line_items_insert RLS won't
+      // apply since we use service_role.
+      const linesRes = await supabaseSelect(
+        env,
+        'invoice_line_items',
+        `select=sort_order&invoice_id=eq.${encodeURIComponent(draft.id)}&order=sort_order.desc&limit=1`,
+        { serviceRole: true }
+      );
+      const topSort = Array.isArray(linesRes.data) && linesRes.data[0]
+        ? Number(linesRes.data[0].sort_order) : 0;
+
+      const insLine = await supabaseInsertReturning(env, 'invoice_line_items', {
+        invoice_id:         draft.id,
+        kind:               'recurring',
+        source_id:          r.id,
+        description:        r.description,
+        quantity:           1,
+        unit_amount_cents:  r.amount_cents,
+        tax_rate_bps:       0,
+        amount_cents:       r.amount_cents,
+        sort_order:         topSort + 1,
+      });
+      if (!insLine.ok) {
+        stats.errors.push({ id: r.id, reason: 'line_insert_failed' });
+        continue;
+      }
+
+      // Recompute draft totals (subtotal = sum of amount_cents;
+      // recurring has no tax by default, so use existing tax_cents).
+      const allLinesRes = await supabaseSelect(
+        env,
+        'invoice_line_items',
+        `select=quantity,unit_amount_cents,tax_rate_bps&invoice_id=eq.${encodeURIComponent(draft.id)}`,
+        { serviceRole: true }
+      );
+      const allLines = Array.isArray(allLinesRes.data) ? allLinesRes.data : [];
+      const sub = allLines.reduce((a, l) => a + Math.round(Number(l.quantity) * l.unit_amount_cents), 0);
+      const tax = allLines.reduce((a, l) => {
+        const s = Math.round(Number(l.quantity) * l.unit_amount_cents);
+        return a + Math.round((s * l.tax_rate_bps) / 10000);
+      }, 0);
+      await supabaseUpdateReturning(
+        env,
+        'invoices',
+        `id=eq.${encodeURIComponent(draft.id)}`,
+        { subtotal_cents: sub, tax_cents: tax, total_cents: sub + tax }
+      );
+
+      stats.lines_added++;
+    } catch (err) {
+      stats.errors.push({ id: r.id, reason: String(err?.message ?? err) });
+    }
+  }
+
+  stats.elapsed_ms = Date.now() - started;
+  return { ok: true, ...stats };
+}
+
+/**
+ * Finalize drafts whose billing period has ended and whose trainer
+ * has configured today (in their local TZ) as auto_finalize_day.
+ * Each trainer's drafts get finalized one at a time via
+ * performInvoiceFinalize so the hosted Stripe invoice mirrors the
+ * "manual finalize" path exactly.
+ */
+async function autoFinalizeDueDrafts(env) {
+  const started = Date.now();
+  const stats = { candidates: 0, finalized: 0, skipped: 0, errors: [] };
+
+  // Pull every trainer's settings + timezone in one pass.
+  const settingsRes = await supabaseSelect(
+    env,
+    'trainer_invoice_settings',
+    'select=trainer_id,auto_finalize_day',
+    { serviceRole: true }
+  );
+  if (!settingsRes.ok) return { ok: false, error: 'settings_query_failed' };
+  const settings = Array.isArray(settingsRes.data) ? settingsRes.data : [];
+
+  for (const s of settings) {
+    try {
+      const trainerId = s.trainer_id;
+      const profRes = await supabaseSelect(
+        env,
+        'trainer_profiles',
+        `select=invoice_timezone&user_id=eq.${encodeURIComponent(trainerId)}`,
+        { serviceRole: true }
+      );
+      const prof = Array.isArray(profRes.data) ? profRes.data[0] : null;
+      const tz = prof?.invoice_timezone || 'America/Chicago';
+      const today = todayInTimeZone(tz); // YYYY-MM-DD
+      const todayDay = Number(today.slice(-2));
+
+      if (todayDay !== Number(s.auto_finalize_day)) {
+        stats.skipped++;
+        continue;
+      }
+
+      // Any drafts whose billing period has already ended.
+      const draftsRes = await supabaseSelect(
+        env,
+        'invoices',
+        `select=*&trainer_id=eq.${encodeURIComponent(trainerId)}` +
+        `&status=eq.draft` +
+        `&period_end=lt.${encodeURIComponent(today)}` +
+        `&total_cents=gt.0`,
+        { serviceRole: true }
+      );
+      const drafts = Array.isArray(draftsRes.data) ? draftsRes.data : [];
+      stats.candidates += drafts.length;
+
+      for (const inv of drafts) {
+        const res = await performInvoiceFinalize(env, inv, {
+          auditActorId:   null,
+          auditActorRole: 'system',
+          auditAction:    'invoice.auto_finalize',
+        });
+        if (res.response) {
+          stats.errors.push({ invoice_id: inv.id, response_status: res.response.status });
+          continue;
+        }
+        stats.finalized++;
+
+        // Best-effort send so the hosted URL lands in the client's inbox.
+        if (res.invoice?.stripe_invoice_id) {
+          const ctx = await resolveTrainerInvoiceContext(env, res.invoice);
+          if (!ctx.error) {
+            const sr = await sendConnectInvoice(env, {
+              stripeAccountId: ctx.connect.stripe_account_id,
+              invoiceId: res.invoice.stripe_invoice_id,
+              idempotencyKey: `invoice_send:${res.invoice.id}`,
+            });
+            if (sr.ok) {
+              await supabaseUpdateReturning(
+                env,
+                'invoices',
+                `id=eq.${encodeURIComponent(res.invoice.id)}`,
+                { sent_at: new Date().toISOString() }
+              );
+            }
+          }
+        }
+      }
+    } catch (err) {
+      stats.errors.push({ trainer_id: s.trainer_id, reason: String(err?.message ?? err) });
+    }
+  }
+
+  stats.elapsed_ms = Date.now() - started;
+  return { ok: true, ...stats };
+}
+
+/**
+ * POST /api/cron/run-once
+ * Manual trigger for the scheduled jobs. Requires a service-role
+ * header (x-cron-key == env.CRON_SHARED_SECRET) — this is NOT a
+ * public endpoint. Bypasses the cron:enabled master switch so we
+ * can smoke-test the jobs before flipping the flag.
+ *
+ * Body: { "job": "recurring" | "auto_finalize" | "all" }
+ */
+async function handleCronRunOnce(request, env) {
+  if (request.method !== 'POST') return new Response('method not allowed', { status: 405 });
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+
+  const secret = env.CRON_SHARED_SECRET;
+  if (!secret) return json({ error: 'cron_not_configured' }, 501);
+  const provided = request.headers.get('x-cron-key') || '';
+  if (!timingSafeEqual(provided, secret)) {
+    return json({ error: 'unauthorized' }, 401);
+  }
+
+  let body;
+  try { body = await request.json(); } catch { body = {}; }
+  const job = body?.job || 'all';
+
+  const out = {};
+  if (job === 'recurring' || job === 'all') {
+    out.recurring = await materializeRecurringItems(env);
+  }
+  if (job === 'auto_finalize' || job === 'all') {
+    out.auto_finalize = await autoFinalizeDueDrafts(env);
+  }
+  return json({ ok: true, job, ...out });
+}
+
+/**
+ * POST /api/trainer/branding/sync — Phase 7 PR #7
+ *
+ * Pushes the trainer's brand (logo, primary color, display name) onto
+ * their connected Stripe account so the hosted-invoice page + PDF
+ * render with the trainer's identity instead of Mane Line's.
+ *
+ *   logo           — read from R2 (trainer_profiles.invoice_logo_r2_key),
+ *                    uploaded to files.stripe.com as purpose=business_logo
+ *                    on-behalf-of the connected account. Cached by R2 key
+ *                    so a no-op resync doesn't re-upload.
+ *   primary color  — trainer_invoice_settings.brand_hex -> settings.branding.primary_color
+ *   business name  — user_profiles.display_name -> business_profile.name
+ *
+ * Returns 200 with { synced_at, logo_file_id, has_logo, has_color, has_name }.
+ * 404 if the trainer has no Connect account yet (finish onboarding first).
+ * Upstream Stripe errors surface as 502.
+ */
+async function handleTrainerBrandingSync(request, env) {
+  if (request.method !== 'POST') return new Response('method not allowed', { status: 405 });
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  if (!isStripeConfigured(env)) return json({ error: 'stripe_not_configured' }, 501);
+
+  let actorId;
+  try {
+    ({ actorId } = await requireOwner(request, env));
+  } catch (res) {
+    return res;
+  }
+
+  const profileQ = await supabaseSelect(
+    env,
+    'user_profiles',
+    `select=user_id,role,status,display_name&user_id=eq.${encodeURIComponent(actorId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const profile = Array.isArray(profileQ.data) ? profileQ.data[0] : null;
+  if (!profile || profile.role !== 'trainer' || profile.status !== 'active') {
+    return json({ error: 'forbidden' }, 403);
+  }
+
+  const tpQ = await supabaseSelect(
+    env,
+    'trainer_profiles',
+    `select=invoice_logo_r2_key,invoice_logo_stripe_file_id,invoice_logo_stripe_file_key&user_id=eq.${encodeURIComponent(actorId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const tp = Array.isArray(tpQ.data) ? tpQ.data[0] : null;
+  if (!tp) return json({ error: 'trainer_profile_missing' }, 404);
+
+  const settingsQ = await supabaseSelect(
+    env,
+    'trainer_invoice_settings',
+    `select=brand_hex&trainer_id=eq.${encodeURIComponent(actorId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const settings = Array.isArray(settingsQ.data) ? settingsQ.data[0] : null;
+
+  const connectQ = await supabaseSelect(
+    env,
+    'stripe_connect_accounts',
+    `select=stripe_account_id&trainer_id=eq.${encodeURIComponent(actorId)}&deactivated_at=is.null&order=created_at.desc&limit=1`,
+    { serviceRole: true }
+  );
+  const connect = Array.isArray(connectQ.data) ? connectQ.data[0] : null;
+  if (!connect || !connect.stripe_account_id) {
+    return json({ error: 'no_connect_account' }, 404);
+  }
+  const stripeAccountId = connect.stripe_account_id;
+
+  // Reuse the cached Stripe File id when the R2 logo hasn't changed.
+  // If the trainer cleared the logo, unset the icon on Stripe too.
+  let logoFileId = null;
+  const currentR2Key = tp.invoice_logo_r2_key || null;
+  if (currentR2Key) {
+    if (
+      tp.invoice_logo_stripe_file_id &&
+      tp.invoice_logo_stripe_file_key === currentR2Key
+    ) {
+      logoFileId = tp.invoice_logo_stripe_file_id;
+    } else {
+      const r2Obj = await env.MANELINE_R2.get(currentR2Key);
+      if (!r2Obj) return json({ error: 'logo_fetch_failed', detail: 'r2_object_missing' }, 500);
+      const bytes = await r2Obj.arrayBuffer();
+      const mimeType = r2Obj.httpMetadata?.contentType || 'image/png';
+      const filename = currentR2Key.split('/').pop() || 'logo';
+      const up = await uploadStripeFileForAccount(env, {
+        stripeAccountId,
+        bytes,
+        filename,
+        mimeType,
+        purpose: 'business_logo',
+      });
+      if (!up.ok || !up.data?.id) {
+        return json({ error: 'stripe_file_upload_failed', stripe_error: up.error, message: up.message }, 502);
+      }
+      logoFileId = up.data.id;
+      await supabaseUpdateReturning(
+        env,
+        'trainer_profiles',
+        `user_id=eq.${encodeURIComponent(actorId)}`,
+        {
+          invoice_logo_stripe_file_id:  logoFileId,
+          invoice_logo_stripe_file_key: currentR2Key,
+        }
+      );
+    }
+  }
+
+  // encodeForm flattens nested objects into Stripe's `a[b][c]` form,
+  // so we can pass the branding block as a plain nested object.
+  const branding = {};
+  if (logoFileId) branding.icon = logoFileId;
+  if (settings?.brand_hex) branding.primary_color = settings.brand_hex;
+  const nestedPatch = {};
+  if (Object.keys(branding).length) {
+    nestedPatch.settings = { branding };
+  }
+  if (profile.display_name) {
+    nestedPatch.business_profile = { name: profile.display_name };
+  }
+
+  if (Object.keys(nestedPatch).length === 0) {
+    return json({ error: 'nothing_to_sync', detail: 'Set a display name, brand color, or logo first.' }, 400);
+  }
+
+  const upd = await updateConnectAccount(env, stripeAccountId, nestedPatch);
+  if (!upd.ok) {
+    return json({ error: 'account_update_failed', stripe_error: upd.error, message: upd.message }, 502);
+  }
+
+  const syncedAt = new Date().toISOString();
+  await supabaseUpdateReturning(
+    env,
+    'trainer_profiles',
+    `user_id=eq.${encodeURIComponent(actorId)}`,
+    { branding_synced_at: syncedAt }
+  );
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'trainer',
+    action: 'branding.sync',
+    target_table: 'stripe_connect_accounts',
+    target_id: stripeAccountId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: {
+      logo_file_id: logoFileId,
+      primary_color: settings?.brand_hex ?? null,
+      business_name: profile.display_name ?? null,
+    },
+  });
+
+  return json({
+    ok:            true,
+    synced_at:     syncedAt,
+    logo_file_id:  logoFileId,
+    has_logo:      Boolean(logoFileId),
+    has_color:     Boolean(settings?.brand_hex),
+    has_name:      Boolean(profile.display_name),
+  });
+}
+
+/* =============================================================
    /api/stripe/webhook
    -------------------------------------------------------------
    Receives every Stripe event. Auth is signature-only:
@@ -5094,8 +6226,22 @@ async function processStripeEvent(env, event) {
     case 'customer.subscription.updated':
     case 'customer.subscription.deleted':
       return handleSubscriptionLifecycle(env, event);
-    case 'invoice.payment_succeeded':
+    case 'invoice.paid':
+    case 'invoice.voided':
+    case 'invoice.marked_uncollectible':
+      // Trainer white-label invoices only — subscription invoices
+      // don't fire these. Ignores unknown IDs so unrelated Stripe
+      // accounts (should we ever add more) don't error out.
+      return syncConnectInvoiceFromEvent(env, event);
+    case 'invoice.payment_succeeded': {
+      // Shared between Phase 4 subscriptions and Phase 7 trainer
+      // invoices. Route by whether we have a matching row in
+      // public.invoices; fall through to the subscription handler
+      // otherwise.
+      const trainerSync = await syncConnectInvoiceFromEvent(env, event);
+      if (trainerSync && !trainerSync.ignored) return trainerSync;
       return handleInvoicePaymentSucceeded(env, event);
+    }
     case 'invoice.payment_failed':
       return handleInvoicePaymentFailed(env, event);
     default:

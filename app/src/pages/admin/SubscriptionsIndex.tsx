@@ -45,7 +45,7 @@ function formatDate(iso: string | null): string {
   }
 }
 
-function formatCents(cents: number | null, currency: string | null): string {
+export function formatCents(cents: number | null, currency: string | null): string {
   if (cents == null) return "—";
   const ccy = (currency || "usd").toUpperCase();
   return `${(cents / 100).toFixed(2)} ${ccy}`;

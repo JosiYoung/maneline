@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 import { useAuthStore } from '../lib/authStore';
 import { homeForRole } from '../components/ProtectedRoute';
+import type { UserRole } from '../lib/types';
 import ScrollHero from '../components/landing/ScrollHero';
 import { SupportWidget } from '../components/shared/SupportWidget';
 
@@ -82,7 +83,7 @@ function TopNav({ authed, role }: { authed: boolean; role?: string }) {
 
       <div style={{ display: 'flex', gap: 10, pointerEvents: 'auto' }}>
         {authed ? (
-          <Link to={homeForRole(role || 'owner')} style={navCta('primary')}>
+          <Link to={homeForRole((role || 'owner') as UserRole)} style={navCta('primary')}>
             My portal
           </Link>
         ) : (
@@ -184,7 +185,7 @@ function HeroScene({ authed, role }: { authed: boolean; role?: string }) {
 
         <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
           {authed ? (
-            <Link to={homeForRole(role || 'owner')} style={cta('primary')}>
+            <Link to={homeForRole((role || 'owner') as UserRole)} style={cta('primary')}>
               Go to my portal
             </Link>
           ) : (
@@ -1770,7 +1771,7 @@ function FinalCTA({ authed, role }: { authed: boolean; role?: string }) {
           }}
         >
           {authed ? (
-            <Link to={homeForRole(role || 'owner')} style={cta('primary')}>
+            <Link to={homeForRole((role || 'owner') as UserRole)} style={cta('primary')}>
               Go to my portal
             </Link>
           ) : (
