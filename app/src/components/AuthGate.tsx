@@ -21,7 +21,7 @@ const PUBLIC_EXACT = new Set<string>([
   '/auth/callback',
   '/welcome',
 ]);
-const PUBLIC_PREFIXES = ['/vet/'];
+const PUBLIC_PREFIXES = ['/vet/', '/e/'];
 
 function isPublicPath(pathname: string): boolean {
   if (PUBLIC_EXACT.has(pathname)) return true;

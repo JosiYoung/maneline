@@ -6,6 +6,7 @@ import {
   Users,
   ShoppingBag,
   MessageCircle,
+  CalendarDays,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useFeatureFlags } from "@/lib/featureFlags";
@@ -26,6 +27,7 @@ type Tab = {
 const BASE_TABS: Tab[] = [
   { to: "/app",          label: "Today",    Icon: Home,     end: true },
   { to: "/app/animals",  label: "Animals",  Icon: PawPrint },
+  { to: "/app/barn",     label: "Barn",     Icon: CalendarDays },
   { to: "/app/records",  label: "Records",  Icon: FileText },
   { to: "/app/trainers", label: "Trainers", Icon: Users },
   { to: "/app/shop",     label: "Shop",     Icon: ShoppingBag },

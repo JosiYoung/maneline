@@ -10,6 +10,7 @@ import CheckEmail from './pages/CheckEmail';
 import AuthCallback from './pages/AuthCallback';
 import VetView from './pages/VetView';
 import Welcome from './pages/Welcome';
+import PublicEventAccept from './pages/PublicEventAccept';
 import NotFound from './pages/NotFound';
 
 import OwnerIndex from './pages/owner/OwnerIndex';
@@ -34,6 +35,9 @@ export default function App() {
 
         {/* Invitation deep-link — public, looks up the token server-side */}
         <Route path="/welcome" element={<Welcome />} />
+
+        {/* Barn event invite — public, scoped by per-attendee token */}
+        <Route path="/e/:token" element={<PublicEventAccept />} />
 
         {/* Owner portal */}
         <Route

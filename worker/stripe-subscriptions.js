@@ -21,6 +21,7 @@
  */
 
 import { isStripeConfigured } from './stripe.js';
+import { mirrorBarnModeSubscriptionFromStripe } from './subscription.js';
 
 const STRIPE_API_BASE = 'https://api.stripe.com/v1';
 const STRIPE_API_VERSION = '2024-06-20';
@@ -260,6 +261,8 @@ export async function handleSubscriptionLifecycle(env, event) {
   if (!sub?.id) return { ok: false, error: 'missing_subscription' };
   const up = await upsertSubscriptionCache(env, sub);
   if (!up.ok) return { ok: false, error: 'cache_upsert_failed' };
+  // Phase 8 — mirror into Barn Mode entitlement table if this sub is one.
+  await mirrorBarnModeSubscriptionFromStripe(env, sub, { eventId: event.id });
   return { ok: true, subscription_id: sub.id };
 }
 
@@ -375,6 +378,11 @@ export async function handleInvoicePaymentFailed(env, event) {
       ? sub.data.status
       : 'past_due';
     await upsertSubscriptionCache(env, sub.data, { overrideStatus: status });
+    // Phase 8 — force Barn Mode mirror into past_due / grace_started.
+    await mirrorBarnModeSubscriptionFromStripe(env, sub.data, {
+      eventId: event.id,
+      forcedStatus: 'past_due',
+    });
   } else {
     await sbUpdate(
       env,

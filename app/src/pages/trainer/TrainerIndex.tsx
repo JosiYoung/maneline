@@ -14,6 +14,7 @@ import ExpensesIndex from "./ExpensesIndex";
 import InvoicesIndex from "./InvoicesIndex";
 import InvoiceDetail from "./InvoiceDetail";
 import RecurringItemsIndex from "./RecurringItemsIndex";
+import MySchedule from "./MySchedule";
 
 // TrainerIndex — the trainer portal's route shell. Mounted under
 // <ProtectedRoute allow="trainer"> in App.tsx, so every child route here
@@ -37,6 +38,7 @@ export default function TrainerIndex() {
         <Route path="invoices"           element={<InvoicesIndex />} />
         <Route path="invoices/recurring" element={<RecurringItemsIndex />} />
         <Route path="invoices/:id"       element={<InvoiceDetail />} />
+        <Route path="my-schedule" element={<MySchedule />} />
         <Route path="payouts"     element={<PayoutsIndex />} />
         <Route path="account"     element={<TrainerAccount />} />
         <Route path="*" element={<Navigate to="/trainer" replace />} />

@@ -15,6 +15,15 @@ import Settings      from "../app/Settings";
 import SessionApproveAndPay from "../app/SessionApproveAndPay";
 import ShopIndex     from "./shop/ShopIndex";
 import ProductDetail from "./shop/ProductDetail";
+import BarnCalendar  from "./BarnCalendar";
+import BarnContacts  from "./BarnContacts";
+import BarnHealth    from "./BarnHealth";
+import BarnHealthThresholds from "./BarnHealthThresholds";
+import BarnHealthAnimal     from "./BarnHealthAnimal";
+import BarnFacility  from "./BarnFacility";
+import BarnSpending       from "./BarnSpending";
+import BarnSpendingAnimal from "./BarnSpendingAnimal";
+import SettingsSubscription from "./SettingsSubscription";
 import OrderReturn   from "./orders/OrderReturn";
 import OrdersIndex   from "./orders/OrdersIndex";
 import ChatIndex        from "../app/chat/ChatIndex";
@@ -40,11 +49,21 @@ export default function OwnerIndex() {
         <Route path="sessions/:id/pay"  element={<SessionApproveAndPay />} />
         <Route path="shop"              element={<ShopIndex />} />
         <Route path="shop/:handle"      element={<ProductDetail />} />
+        <Route path="barn"              element={<Navigate to="/app/barn/calendar" replace />} />
+        <Route path="barn/calendar"     element={<BarnCalendar />} />
+        <Route path="barn/contacts"     element={<BarnContacts />} />
+        <Route path="barn/health"                   element={<BarnHealth />} />
+        <Route path="barn/health/thresholds"        element={<BarnHealthThresholds />} />
+        <Route path="barn/health/animals/:id"       element={<BarnHealthAnimal />} />
+        <Route path="barn/facility"                 element={<BarnFacility />} />
+        <Route path="barn/spending"                 element={<BarnSpending />} />
+        <Route path="barn/spending/animals/:id"     element={<BarnSpendingAnimal />} />
         <Route path="orders"            element={<OrdersIndex />} />
         <Route path="orders/:id"        element={<OrderReturn />} />
         <Route path="chat"                         element={<ChatIndex />} />
         <Route path="chat/:conversationId"         element={<ConversationView />} />
-        <Route path="settings"          element={<Settings />} />
+        <Route path="settings"                    element={<Settings />} />
+        <Route path="settings/subscription"       element={<SettingsSubscription />} />
         {/* Unknown /app/* path falls back to Today. */}
         <Route path="*"                 element={<Navigate to="/app" replace />} />
       </Routes>

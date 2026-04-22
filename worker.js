@@ -152,6 +152,92 @@ import {
   handleSubscriptionLifecycle,
 } from './worker/stripe-subscriptions.js';
 import { adminInvoicesList } from './worker/admin-invoices.js';
+import {
+  generatePublicToken,
+  deriveTokenExpiry,
+  isEmail,
+  isE164,
+  isUuid,
+  lookupUserByEmail,
+  srInsertReturning as barnSrInsertReturning,
+  srInsertMany as barnSrInsertMany,
+  srSelect as barnSrSelect,
+  srPatchReturning as barnSrPatchReturning,
+  srArchive as barnSrArchive,
+  parseRruleMinimal,
+  materializeRecurrenceDates,
+  resolveAttendeeForCreate,
+  logBarnNotification,
+  publicEventUrl,
+} from './worker/barn.js';
+import {
+  HERD_HEALTH_RECORD_TYPES,
+  HERD_HEALTH_RECORD_TYPE_SET,
+  HERD_HEALTH_DEFAULTS,
+  isHerdHealthRecordType,
+  listOrSeedThresholds,
+  upsertThreshold,
+  resetThresholdsToDefaults,
+  computeHerdHealth,
+  listOwnerAnimals as hhListOwnerAnimals,
+  insertAcknowledgement as hhInsertAcknowledgement,
+  listAnimalVetRecords as hhListAnimalVetRecords,
+  getOwnerAnimal as hhGetOwnerAnimal,
+} from './worker/herd-health.js';
+import {
+  CARE_MATRIX_COLUMNS,
+  getOwnerRanch as fmGetOwnerRanch,
+  listOwnerRanches as fmListOwnerRanches,
+  readFacilityMap as fmReadFacilityMap,
+  getOwnerStall as fmGetOwnerStall,
+  getOwnerTurnoutGroup as fmGetOwnerTurnoutGroup,
+  insertStall as fmInsertStall,
+  patchStall as fmPatchStall,
+  archiveStall as fmArchiveStall,
+  assignStall as fmAssignStall,
+  insertTurnoutGroup as fmInsertTurnoutGroup,
+  patchTurnoutGroup as fmPatchTurnoutGroup,
+  archiveTurnoutGroup as fmArchiveTurnoutGroup,
+  addTurnoutMembers as fmAddTurnoutMembers,
+  removeTurnoutMember as fmRemoveTurnoutMember,
+  listCareMatrix as fmListCareMatrix,
+  batchUpsertCareMatrix as fmBatchUpsertCareMatrix,
+} from './worker/facility.js';
+import {
+  EXPENSE_CATEGORIES,
+  DISPOSITION_VALUES,
+  listOwnerExpensesForYear as spListExpensesYear,
+  listOwnerAnimalRanchMap as spListRanchMap,
+  listOwnerAnimalsWithBasis as spListAnimalsBasis,
+  getOwnerAnimalBasis as spGetAnimalBasis,
+  sumAnimalSpend as spSumAnimalSpend,
+  patchAnimalBasis as spPatchAnimalBasis,
+} from './worker/spending.js';
+import {
+  isStripePlatformConfigured,
+  getSubscriptionForOwner,
+  insertSubscriptionRow,
+  patchSubscription,
+  listEntitlementEvents,
+  insertEntitlementEvent,
+  countOwnerHorses,
+  ownerHasBarnMode,
+  getSilverLiningLinkForOwner,
+  getActiveLinkByCustomerId,
+  getAnyLinkByCustomerId,
+  insertSilverLiningLink,
+  patchSilverLiningLink,
+  findPromoByCode,
+  markPromoRedeemed,
+  listPromoCodes,
+  insertPromoCodesBulk,
+  generatePromoCode,
+  ensurePlatformStripeCustomer,
+  createBarnModeCheckoutSession,
+  createBillingPortalSession,
+  handleBarnModeCheckoutCompleted,
+} from './worker/subscription.js';
+import { sendEmail as sendResendEmail, isResendConfigured } from './worker/resend.js';
 
 // Phase 6.3 — Durable Object rate limiter. Class MUST be re-exported
 // from the Worker entry so `[[durable_objects.bindings]]` can resolve
@@ -231,6 +317,193 @@ export default {
       }
       if (url.pathname === '/api/access/revoke') {
         return handleAccessRevoke(request, env);
+      }
+      // --- Phase 8 Barn Mode — Module 01 (calendar + contacts) ---
+      if (url.pathname === '/api/barn/pro-contacts') {
+        if (request.method === 'GET')  return handleProContactsList(request, env, url);
+        if (request.method === 'POST') return handleProContactCreate(request, env, ctx);
+        return new Response('method not allowed', { status: 405 });
+      }
+      if (url.pathname.startsWith('/api/barn/pro-contacts/')) {
+        const rest = url.pathname.slice('/api/barn/pro-contacts/'.length);
+        const [id, action] = rest.split('/');
+        if (!isUuid(id)) return json({ error: 'bad_id' }, 400);
+        if (!action && request.method === 'PATCH') {
+          return handleProContactUpdate(request, env, id, ctx);
+        }
+        if (action === 'archive' && request.method === 'POST') {
+          return handleProContactArchive(request, env, id, ctx);
+        }
+        return new Response('not found', { status: 404 });
+      }
+      if (url.pathname === '/api/barn/events') {
+        if (request.method === 'GET')  return handleBarnEventsList(request, env, url);
+        if (request.method === 'POST') return handleBarnEventCreate(request, env, ctx);
+        return new Response('method not allowed', { status: 405 });
+      }
+      if (url.pathname.startsWith('/api/barn/events/')) {
+        const rest = url.pathname.slice('/api/barn/events/'.length);
+        const [id, action] = rest.split('/');
+        if (!isUuid(id)) return json({ error: 'bad_id' }, 400);
+        if (!action) {
+          if (request.method === 'GET')   return handleBarnEventGet(request, env, id);
+          if (request.method === 'PATCH') return handleBarnEventUpdate(request, env, id, ctx);
+          return new Response('method not allowed', { status: 405 });
+        }
+        if (action === 'cancel'  && request.method === 'POST') return handleBarnEventCancel(request, env, id, ctx);
+        if (action === 'archive' && request.method === 'POST') return handleBarnEventArchive(request, env, id, ctx);
+        if (action === 'respond' && request.method === 'POST') return handleBarnEventRespond(request, env, id, ctx);
+        return new Response('not found', { status: 404 });
+      }
+      if (url.pathname.startsWith('/api/public/events/')) {
+        const rest = url.pathname.slice('/api/public/events/'.length);
+        const [token, action] = rest.split('/');
+        if (!token || token.length < 10) return json({ error: 'bad_token' }, 400);
+        if (!action && request.method === 'GET') return handlePublicEventGet(request, env, token);
+        if (action === 'respond' && request.method === 'POST') return handlePublicEventRespond(request, env, token, ctx);
+        if (action === 'revoke'  && request.method === 'POST') return handlePublicEventRevoke(request, env, token, ctx);
+        return new Response('not found', { status: 404 });
+      }
+      if (url.pathname === '/api/_internal/barn-reminders-tick' && request.method === 'POST') {
+        return handleBarnRemindersTick(request, env, ctx);
+      }
+      if (url.pathname === '/api/_internal/barn-materialize-recurrences' && request.method === 'POST') {
+        return handleBarnMaterializeRecurrences(request, env, ctx);
+      }
+      if (url.pathname === '/api/_internal/pro-claim-email' && request.method === 'POST') {
+        return handleBarnProClaimEmail(request, env, ctx);
+      }
+      // --- Phase 8 Barn Mode — Module 02 (herd health dashboard) ---
+      if (url.pathname === '/api/barn/herd-health' && request.method === 'GET') {
+        return handleHerdHealthGet(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/herd-health/thresholds' && request.method === 'PATCH') {
+        return handleHerdHealthThresholdsPatch(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/herd-health/thresholds/reset' && request.method === 'POST') {
+        return handleHerdHealthThresholdsReset(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/herd-health/acknowledge' && request.method === 'POST') {
+        return handleHerdHealthAcknowledge(request, env, ctx);
+      }
+      if (url.pathname.startsWith('/api/barn/herd-health/animals/') && request.method === 'GET') {
+        const id = url.pathname.slice('/api/barn/herd-health/animals/'.length);
+        if (!isUuid(id)) return json({ error: 'bad_id' }, 400);
+        return handleHerdHealthAnimalDetail(request, env, id, ctx);
+      }
+      if (url.pathname === '/api/barn/herd-health/report.pdf' && request.method === 'POST') {
+        return handleHerdHealthReportPdf(request, env, ctx);
+      }
+      // --- Phase 8 Barn Mode — Module 03 (facility map + care matrix) ---
+      if (url.pathname === '/api/barn/facility/ranches' && request.method === 'GET') {
+        return handleFacilityRanches(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/facility/map' && request.method === 'GET') {
+        return handleFacilityMap(request, env, url, ctx);
+      }
+      if (url.pathname === '/api/barn/facility/stalls' && request.method === 'POST') {
+        return handleStallCreate(request, env, ctx);
+      }
+      if (url.pathname.startsWith('/api/barn/facility/stalls/')) {
+        const rest = url.pathname.slice('/api/barn/facility/stalls/'.length);
+        const [stallId, action] = rest.split('/');
+        if (!isUuid(stallId)) return json({ error: 'bad_id' }, 400);
+        if (!action && request.method === 'PATCH') {
+          return handleStallPatch(request, env, stallId, ctx);
+        }
+        if (action === 'archive' && request.method === 'POST') {
+          return handleStallArchive(request, env, stallId, ctx);
+        }
+        if (action === 'assign' && request.method === 'POST') {
+          return handleStallAssign(request, env, stallId, ctx);
+        }
+      }
+      if (url.pathname === '/api/barn/facility/turnout-groups' && request.method === 'POST') {
+        return handleTurnoutGroupCreate(request, env, ctx);
+      }
+      if (url.pathname.startsWith('/api/barn/facility/turnout-groups/')) {
+        const rest = url.pathname.slice('/api/barn/facility/turnout-groups/'.length);
+        const parts = rest.split('/');
+        const groupId = parts[0];
+        if (!isUuid(groupId)) return json({ error: 'bad_id' }, 400);
+        if (parts.length === 1 && request.method === 'PATCH') {
+          return handleTurnoutGroupPatch(request, env, groupId, ctx);
+        }
+        if (parts[1] === 'archive' && request.method === 'POST') {
+          return handleTurnoutGroupArchive(request, env, groupId, ctx);
+        }
+        if (parts[1] === 'members' && parts.length === 2 && request.method === 'POST') {
+          return handleTurnoutGroupMembersAdd(request, env, groupId, ctx);
+        }
+        if (parts[1] === 'members' && parts.length === 3 && request.method === 'DELETE') {
+          const animalId = parts[2];
+          if (!isUuid(animalId)) return json({ error: 'bad_id' }, 400);
+          return handleTurnoutGroupMemberRemove(request, env, groupId, animalId, ctx);
+        }
+      }
+      if (url.pathname === '/api/barn/facility/care-matrix' && request.method === 'GET') {
+        return handleCareMatrixGet(request, env, url, ctx);
+      }
+      if (url.pathname === '/api/barn/facility/care-matrix' && request.method === 'POST') {
+        return handleCareMatrixBatchUpsert(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/facility/print.pdf' && request.method === 'POST') {
+        return handleFacilityPrintPdf(request, env, ctx);
+      }
+      // --- Phase 8 Barn Mode — Module 04 (barn spending) ---
+      if (url.pathname === '/api/barn/spending' && request.method === 'GET') {
+        return handleSpendingGet(request, env, url, ctx);
+      }
+      if (url.pathname === '/api/barn/spending/export.csv' && request.method === 'GET') {
+        return handleSpendingCsv(request, env, url, ctx);
+      }
+      if (url.pathname === '/api/barn/spending/export.pdf' && request.method === 'GET') {
+        return handleSpendingPdf(request, env, url, ctx);
+      }
+      if (url.pathname.startsWith('/api/barn/spending/animals/')) {
+        const rest = url.pathname.slice('/api/barn/spending/animals/'.length);
+        const [animalId, leaf] = rest.split('/');
+        if (!isUuid(animalId)) return json({ error: 'bad_id' }, 400);
+        if (leaf === 'cost-basis' && request.method === 'GET') {
+          return handleAnimalCostBasisGet(request, env, animalId, ctx);
+        }
+        if (leaf === 'cost-basis' && request.method === 'PATCH') {
+          return handleAnimalCostBasisPatch(request, env, animalId, ctx);
+        }
+      }
+      // --- Phase 8 Barn Mode — Module 05 (subscription + SL comp + promo) ---
+      if (url.pathname === '/api/barn/subscription' && request.method === 'GET') {
+        return handleSubscriptionGet(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/subscription/checkout' && request.method === 'POST') {
+        return handleSubscriptionCheckout(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/subscription/portal' && request.method === 'POST') {
+        return handleSubscriptionPortal(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/promo-codes/redeem' && request.method === 'POST') {
+        return handlePromoRedeem(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/silver-lining/link' && request.method === 'POST') {
+        return handleSilverLiningLink(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/silver-lining/link/confirm' && request.method === 'POST') {
+        return handleSilverLiningLinkConfirm(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/silver-lining/status' && request.method === 'GET') {
+        return handleSilverLiningStatus(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/silver-lining/unlink' && request.method === 'POST') {
+        return handleSilverLiningUnlink(request, env, ctx);
+      }
+      if (url.pathname === '/api/_internal/silver-lining-verify-tick' && request.method === 'POST') {
+        return handleSilverLiningVerifyTick(request, env, ctx);
+      }
+      if (url.pathname === '/api/admin/promo-codes' && request.method === 'GET') {
+        return handleAdminPromoCodesList(request, env, url, ctx);
+      }
+      if (url.pathname === '/api/admin/promo-codes' && request.method === 'POST') {
+        return handleAdminPromoCodesCreate(request, env, ctx);
       }
       if (url.pathname === '/api/stripe/connect/onboard') {
         return handleStripeConnectOnboard(request, env, url);
@@ -2698,6 +2971,21 @@ async function handleIntegrationsHealth(request, env) {
   let subsPastDueCount = null;
   let invitedCount = null;
   let activatedCount = null;
+  // Phase 8 counters — default to null so a metric-read failure never
+  // shows up as a misleading zero.
+  let barnEventsCreated7d = null;
+  let barnExternalResponses7d = null;
+  let barnClaimProEmails7d = null;
+  let healthOverdueCount = null;
+  let healthPdfExports7d = null;
+  let facilityCareMatrixEntries7d = null;
+  let spendingInvoiceMirrors7d = null;
+  let subsBarnModePaidCount = null;
+  let subsBarnModeCompCount = null;
+  let silverLiningLinkedCount = null;
+  let silverLiningLastVerificationAt = null;
+  let silverLiningFailures24h = null;
+  let promoCodesRedeemed24h = null;
   if (env.SUPABASE_SERVICE_ROLE_KEY) {
     const countFrom = async (path) => {
       try {
@@ -2747,6 +3035,67 @@ async function handleIntegrationsHealth(request, env) {
     );
     activatedCount = await countFrom(
       'invitations?select=id&accepted_at=not.is.null&archived_at=is.null&limit=1',
+    );
+
+    // Phase 8 — Barn Mode observability.
+    const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    barnEventsCreated7d = await countFrom(
+      `barn_events?select=id&created_at=gte.${encodeURIComponent(since7d)}&archived_at=is.null&limit=1`,
+    );
+    // External responder = public-token flow (responder_user_id is null).
+    barnExternalResponses7d = await countFrom(
+      `barn_event_responses?select=id&created_at=gte.${encodeURIComponent(since7d)}&responder_user_id=is.null&limit=1`,
+    );
+    barnClaimProEmails7d = await countFrom(
+      `professional_contacts?select=id&claim_email_sent_at=gte.${encodeURIComponent(since7d)}&limit=1`,
+    );
+    // Herd Health "overdue" isn't a stored status — it's derived. Count
+    // active acknowledgements instead (each row is an owner flagging a
+    // cell); the herd-health dashboard aggregate tells the full story.
+    healthOverdueCount = await countFrom(
+      `health_dashboard_acknowledgements?select=id&archived_at=is.null&limit=1`,
+    );
+    // PDF exports + invoice mirrors are proven via audit_log rows. Each
+    // path writes one on success so we reuse audit rather than add
+    // bespoke counters.
+    healthPdfExports7d = await countFrom(
+      `audit_log?select=id&action=eq.barn.herd_health.pdf&occurred_at=gte.${encodeURIComponent(since7d)}&limit=1`,
+    );
+    facilityCareMatrixEntries7d = await countFrom(
+      `care_matrix_entries?select=id&updated_at=gte.${encodeURIComponent(since7d)}&archived_at=is.null&limit=1`,
+    );
+    // Trainer-invoice → expense mirror rows carry source_invoice_id.
+    spendingInvoiceMirrors7d = await countFrom(
+      `expenses?select=id&source_invoice_id=not.is.null&created_at=gte.${encodeURIComponent(since7d)}&archived_at=is.null&limit=1`,
+    );
+
+    subsBarnModePaidCount = await countFrom(
+      `subscriptions?select=id&tier=eq.barn_mode&status=in.(active,trialing)&comp_source=is.null&archived_at=is.null&limit=1`,
+    );
+    subsBarnModeCompCount = await countFrom(
+      `subscriptions?select=id&comp_source=not.is.null&status=in.(active,trialing)&archived_at=is.null&limit=1`,
+    );
+
+    silverLiningLinkedCount = await countFrom(
+      `silver_lining_links?select=id&archived_at=is.null&limit=1`,
+    );
+    try {
+      const r = await supabaseSelect(
+        env,
+        'silver_lining_links',
+        'select=last_verified_at&archived_at=is.null&order=last_verified_at.desc.nullsfirst&limit=1',
+        { serviceRole: true },
+      );
+      if (r.ok && Array.isArray(r.data) && r.data[0]?.last_verified_at) {
+        silverLiningLastVerificationAt = r.data[0].last_verified_at;
+      }
+    } catch { /* ignore */ }
+    silverLiningFailures24h = await countFrom(
+      `silver_lining_links?select=id&last_verification_status=in.(error,not_found)&last_verified_at=gte.${encodeURIComponent(since24h)}&limit=1`,
+    );
+    promoCodesRedeemed24h = await countFrom(
+      `promo_codes?select=id&redeemed_at=gte.${encodeURIComponent(since24h)}&limit=1`,
     );
   }
 
@@ -2807,6 +3156,34 @@ async function handleIntegrationsHealth(request, env) {
     onboarding: {
       invited_count:            invitedCount,
       activated_count:          activatedCount,
+    },
+    // Phase 8 — Barn Mode observability block.
+    barn: {
+      events_created_7d:        barnEventsCreated7d,
+      external_responses_7d:    barnExternalResponses7d,
+      claim_pro_emails_sent_7d: barnClaimProEmails7d,
+    },
+    health: {
+      overdue_count:            healthOverdueCount,
+      pdf_exports_7d:           healthPdfExports7d,
+    },
+    facility: {
+      care_matrix_entries_7d:   facilityCareMatrixEntries7d,
+    },
+    spending: {
+      invoice_mirrors_7d:       spendingInvoiceMirrors7d,
+    },
+    subscriptions: {
+      barn_mode_paid_count:     subsBarnModePaidCount,
+      barn_mode_comp_count:     subsBarnModeCompCount,
+    },
+    silver_lining: {
+      linked_count:                  silverLiningLinkedCount,
+      last_verification_run_at:      silverLiningLastVerificationAt,
+      verification_failures_24h:     silverLiningFailures24h,
+    },
+    promo_codes: {
+      redeemed_24h:             promoCodesRedeemed24h,
     },
     r2,
     rate_limiter: {
@@ -6613,6 +6990,15 @@ async function handleChargeRefunded(env, event) {
 
 async function handleCheckoutSessionCompleted(env, event) {
   const sess = event.data?.object;
+
+  // Phase 8 — Barn Mode subscription checkout: route before the Phase 6
+  // ecommerce branch. These sessions have mode=subscription and carry
+  // metadata.ml_source='barn_mode_subscription' (no ml_order_id).
+  if (sess?.mode === 'subscription'
+      && sess?.metadata?.ml_source === 'barn_mode_subscription') {
+    return handleBarnModeCheckoutCompleted(env, sess, event.id);
+  }
+
   const orderId = sess?.metadata?.ml_order_id || null;
   if (!orderId) return { ok: true, ignored: true, reason: 'no_order_metadata' };
 
@@ -7580,4 +7966,2792 @@ async function handleChat(request, env, ctx) {
       'x-model':               CHAT_MODEL,
     },
   });
+}
+
+/* =============================================================
+   Phase 8 — Barn Mode Module 01 — Professional Contacts CRUD
+   ============================================================= */
+
+const BARN_CONTACT_RATE = { limit: 30, windowSec: 60 };
+const BARN_CONTACT_ROLES = new Set(['trainer', 'vet', 'farrier', 'staff', 'other']);
+
+function normalizeContactBody(body, { requireAll = true } = {}) {
+  const out = {};
+  const errs = [];
+
+  if (body.name !== undefined || requireAll) {
+    if (typeof body.name !== 'string' || body.name.trim().length < 1 || body.name.trim().length > 120) {
+      errs.push('name must be 1..120 chars');
+    } else {
+      out.name = body.name.trim();
+    }
+  }
+  if (body.role !== undefined || requireAll) {
+    if (!BARN_CONTACT_ROLES.has(body.role)) {
+      errs.push('role must be one of trainer|vet|farrier|staff|other');
+    } else {
+      out.role = body.role;
+    }
+  }
+  if (body.email !== undefined) {
+    if (body.email === null || body.email === '') {
+      out.email = null;
+    } else if (!isEmail(body.email)) {
+      errs.push('email format invalid');
+    } else {
+      out.email = body.email.trim().toLowerCase();
+    }
+  }
+  if (body.phone_e164 !== undefined) {
+    if (body.phone_e164 === null || body.phone_e164 === '') {
+      out.phone_e164 = null;
+    } else if (!isE164(body.phone_e164)) {
+      errs.push('phone_e164 must be E.164 (+<country><number>)');
+    } else {
+      out.phone_e164 = body.phone_e164;
+    }
+  }
+  if (body.company !== undefined) {
+    if (body.company === null || body.company === '') {
+      out.company = null;
+    } else if (typeof body.company !== 'string' || body.company.length > 200) {
+      errs.push('company must be <=200 chars');
+    } else {
+      out.company = body.company.trim();
+    }
+  }
+  if (body.notes !== undefined) {
+    if (body.notes === null || body.notes === '') {
+      out.notes = null;
+    } else if (typeof body.notes !== 'string' || body.notes.length > 2000) {
+      errs.push('notes must be <=2000 chars');
+    } else {
+      out.notes = body.notes;
+    }
+  }
+  if (body.sms_opt_in !== undefined) {
+    if (typeof body.sms_opt_in !== 'boolean') {
+      errs.push('sms_opt_in must be boolean');
+    } else {
+      out.sms_opt_in = body.sms_opt_in;
+    }
+  }
+
+  return { patch: out, errs };
+}
+
+async function handleProContactsList(request, env, url) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:barn_contacts_list:${actorId}`, BARN_CONTACT_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429,
+      { 'retry-after': String(rl.resetSec) });
+  }
+
+  const role = url.searchParams.get('role');
+  const includeArchived = url.searchParams.get('include_archived') === '1';
+
+  const filters = [`owner_id=eq.${actorId}`];
+  if (role && BARN_CONTACT_ROLES.has(role)) filters.push(`role=eq.${role}`);
+  if (!includeArchived) filters.push('archived_at=is.null');
+  const q = `select=*&${filters.join('&')}&order=name.asc`;
+
+  const r = await barnSrSelect(env, 'professional_contacts', q);
+  if (!r.ok) return json({ error: 'list_failed', status: r.status }, 500);
+  return json({ contacts: r.data || [] });
+}
+
+async function handleProContactCreate(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:barn_contacts_create:${actorId}`, BARN_CONTACT_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429,
+      { 'retry-after': String(rl.resetSec) });
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const { patch, errs } = normalizeContactBody(body, { requireAll: true });
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+
+  // Best-effort lazy-link: if the email matches a Maneline user, stamp linked_user_id.
+  let linkedUserId = null;
+  if (patch.email) {
+    const hit = await lookupUserByEmail(env, patch.email);
+    if (hit && hit.userId) linkedUserId = hit.userId;
+  }
+
+  const insert = await barnSrInsertReturning(env, 'professional_contacts', {
+    owner_id: actorId,
+    name: patch.name,
+    role: patch.role,
+    email: patch.email ?? null,
+    phone_e164: patch.phone_e164 ?? null,
+    company: patch.company ?? null,
+    notes: patch.notes ?? null,
+    sms_opt_in: patch.sms_opt_in ?? false,
+    linked_user_id: linkedUserId,
+  });
+  if (!insert.ok || !insert.data) {
+    return json({ error: 'insert_failed', status: insert.status, detail: insert.data }, 500);
+  }
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.pro_contact.create',
+    target_table: 'professional_contacts',
+    target_id: insert.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { role: patch.role, linked_user_id: linkedUserId },
+  }, ctx);
+
+  return json({ contact: insert.data }, 201);
+}
+
+async function handleProContactUpdate(request, env, id, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:barn_contacts_update:${actorId}`, BARN_CONTACT_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429,
+      { 'retry-after': String(rl.resetSec) });
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const { patch, errs } = normalizeContactBody(body, { requireAll: false });
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+  if (Object.keys(patch).length === 0) return json({ error: 'no_fields_to_update' }, 400);
+
+  if (patch.email !== undefined) {
+    if (patch.email === null) {
+      patch.linked_user_id = null;
+    } else {
+      const hit = await lookupUserByEmail(env, patch.email);
+      patch.linked_user_id = hit?.userId || null;
+    }
+  }
+
+  const filter = `id=eq.${id}&owner_id=eq.${actorId}&archived_at=is.null`;
+  const upd = await barnSrPatchReturning(env, 'professional_contacts', filter, patch);
+  if (!upd.ok) return json({ error: 'update_failed', status: upd.status }, 500);
+  if (!upd.data) return json({ error: 'not_found' }, 404);
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.pro_contact.update',
+    target_table: 'professional_contacts',
+    target_id: id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { fields: Object.keys(patch) },
+  }, ctx);
+
+  return json({ contact: upd.data });
+}
+
+async function handleProContactArchive(request, env, id, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:barn_contacts_archive:${actorId}`, BARN_CONTACT_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429,
+      { 'retry-after': String(rl.resetSec) });
+  }
+
+  const arch = await barnSrArchive(env, 'professional_contacts', id, actorId);
+  if (!arch.ok) return json({ error: 'archive_failed', status: arch.status }, 500);
+  if (!arch.data) return json({ error: 'not_found' }, 404);
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.pro_contact.archive',
+    target_table: 'professional_contacts',
+    target_id: id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+  }, ctx);
+
+  return json({ contact: arch.data });
+}
+
+/* =============================================================
+   Phase 8 — Barn Mode Module 01 — Events CRUD + respond
+   ============================================================= */
+
+const BARN_EVENT_RATE   = { limit: 60, windowSec: 60 };
+const BARN_CREATE_RATE  = { limit: 30, windowSec: 60 };
+const BARN_RESPOND_RATE = { limit: 30, windowSec: 60 };
+const BARN_PUBLIC_GET_RATE     = { limit: 60, windowSec: 60 };
+const BARN_PUBLIC_RESPOND_RATE = { limit: 20, windowSec: 60 };
+const EVENT_STATUSES     = new Set(['scheduled','in_progress','completed','cancelled']);
+const RESPONSE_STATUSES  = new Set(['confirmed','declined','countered','cancelled']);
+const DELIVERY_CHANNELS  = new Set(['in_app','email','email_sms']);
+
+function validateIsoTimestamp(s) {
+  if (typeof s !== 'string') return null;
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+async function assertOwnerOwnsAnimals(env, ownerId, animalIds) {
+  if (!animalIds.length) return { ok: true };
+  const inList = animalIds.map(encodeURIComponent).join(',');
+  const q = `select=id&id=in.(${inList})&owner_id=eq.${ownerId}&archived_at=is.null`;
+  const r = await barnSrSelect(env, 'animals', q);
+  if (!r.ok) return { ok: false, status: 500, error: 'animals_check_failed' };
+  const owned = new Set((r.data || []).map((x) => x.id));
+  const missing = animalIds.filter((id) => !owned.has(id));
+  if (missing.length) return { ok: false, status: 403, error: 'animal_not_owned', missing };
+  return { ok: true };
+}
+
+async function fireInvitationEmail(env, { event, attendee, ownerName }) {
+  if (!attendee.email) return { skipped: true, reason: 'no_email' };
+  if (attendee.delivery_channel === 'in_app') return { skipped: true, reason: 'in_app_only' };
+  if (!isResendConfigured(env)) return { skipped: true, reason: 'resend_not_configured' };
+
+  const link = attendee.public_token ? publicEventUrl(env, attendee.public_token) : null;
+  const startHuman = new Date(event.start_at).toUTCString();
+  const subject = `${ownerName || 'Mane Line'} invited you: ${event.title}`;
+  const html = `
+    <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#0f172a">
+      <h2 style="color:#0f172a;margin:0 0 12px">${escapeHtml(event.title)}</h2>
+      <p style="margin:8px 0"><strong>When:</strong> ${escapeHtml(startHuman)} (${event.duration_minutes} min)</p>
+      ${event.location_text ? `<p style="margin:8px 0"><strong>Where:</strong> ${escapeHtml(event.location_text)}</p>` : ''}
+      ${event.notes ? `<p style="margin:8px 0;white-space:pre-wrap">${escapeHtml(event.notes)}</p>` : ''}
+      ${link ? `
+        <p style="margin:24px 0">
+          <a href="${link}" style="background:#0f172a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">
+            Respond (confirm / decline / propose new time)
+          </a>
+        </p>
+        <p style="font-size:12px;color:#64748b">Or paste this link: ${link}</p>` : ''}
+      <p style="font-size:12px;color:#64748b;margin-top:32px">Sent via Mane Line — your clients' barn in a box.</p>
+    </div>
+  `;
+  try {
+    await sendResendEmail(env, {
+      to: attendee.email,
+      subject,
+      html,
+      tags: [{ name: 'category', value: 'barn_invite' }],
+    });
+    return { sent: true };
+  } catch (err) {
+    return { error: err?.message || String(err) };
+  }
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+async function handleBarnEventsList(request, env, url) {
+  let actorId, jwt;
+  try { ({ actorId, jwt } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:barn_events_list:${actorId}`, BARN_EVENT_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const from = url.searchParams.get('from');
+  const to   = url.searchParams.get('to');
+  const filters = ['archived_at=is.null'];
+  if (from) filters.push(`start_at=gte.${encodeURIComponent(from)}`);
+  if (to)   filters.push(`start_at=lte.${encodeURIComponent(to)}`);
+  const q = `select=*&${filters.join('&')}&order=start_at.asc&limit=500`;
+
+  // Use caller JWT so RLS (owner-own + trainer-via-grants) applies.
+  const r = await supabaseSelect(env, 'barn_events', q, { userJwt: jwt });
+  if (!r.ok) return json({ error: 'list_failed', status: r.status }, 500);
+  return json({ events: r.data || [] });
+}
+
+async function handleBarnEventGet(request, env, id) {
+  let actorId, jwt;
+  try { ({ actorId, jwt } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const evQ = `select=*&id=eq.${id}&archived_at=is.null&limit=1`;
+  const er = await supabaseSelect(env, 'barn_events', evQ, { userJwt: jwt });
+  if (!er.ok) return json({ error: 'get_failed', status: er.status }, 500);
+  const event = Array.isArray(er.data) ? er.data[0] : null;
+  if (!event) return json({ error: 'not_found' }, 404);
+
+  const atQ = `select=*&event_id=eq.${id}&archived_at=is.null&order=created_at.asc`;
+  const ar = await supabaseSelect(env, 'barn_event_attendees', atQ, { userJwt: jwt });
+
+  const resQ = `select=*&event_id=eq.${id}&order=created_at.desc&limit=100`;
+  const rr = await supabaseSelect(env, 'barn_event_responses', resQ, { userJwt: jwt });
+
+  return json({
+    event,
+    attendees: ar.ok ? (ar.data || []) : [],
+    responses: rr.ok ? (rr.data || []) : [],
+  });
+}
+
+async function handleBarnEventCreate(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:barn_event_create:${actorId}`, BARN_CREATE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const errs = [];
+  const title = typeof body.title === 'string' ? body.title.trim() : '';
+  if (title.length < 1 || title.length > 200) errs.push('title must be 1..200 chars');
+
+  const startAt = validateIsoTimestamp(body.start_at);
+  if (!startAt) errs.push('start_at must be ISO-8601 timestamp');
+
+  const duration = Number.parseInt(body.duration_minutes ?? 60, 10);
+  if (!Number.isFinite(duration) || duration < 5 || duration > 1440) errs.push('duration_minutes must be 5..1440');
+
+  const location = body.location_text == null ? null : String(body.location_text).trim();
+  if (location && location.length > 300) errs.push('location_text <=300 chars');
+
+  const notes = body.notes == null ? null : String(body.notes);
+  if (notes && notes.length > 4000) errs.push('notes <=4000 chars');
+
+  const animalIds = Array.isArray(body.animal_ids) ? body.animal_ids.filter((x) => typeof x === 'string') : [];
+  for (const aid of animalIds) if (!isUuid(aid)) errs.push(`animal_ids has non-uuid: ${aid}`);
+
+  const ranchId = typeof body.ranch_id === 'string' && body.ranch_id ? body.ranch_id : null;
+  if (ranchId && !isUuid(ranchId)) errs.push('ranch_id must be uuid');
+
+  const attendees = Array.isArray(body.attendees) ? body.attendees : [];
+  if (attendees.length > 20) errs.push('max 20 attendees per event');
+
+  const recurrence = body.recurrence;
+  let rrule = null;
+  if (recurrence != null) {
+    if (typeof recurrence !== 'object' || typeof recurrence.rrule !== 'string') {
+      errs.push('recurrence must be {rrule, series_end_at?}');
+    } else {
+      rrule = parseRruleMinimal(recurrence.rrule);
+      if (!rrule) errs.push('recurrence.rrule could not be parsed');
+    }
+  }
+
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+
+  // Ownership check on animals.
+  const ownedCheck = await assertOwnerOwnsAnimals(env, actorId, animalIds);
+  if (!ownedCheck.ok) return json({ error: ownedCheck.error, missing: ownedCheck.missing }, ownedCheck.status || 500);
+
+  // Resolve attendees.
+  const resolvedAttendees = [];
+  for (const a of attendees) {
+    const r = await resolveAttendeeForCreate(env, { ownerId: actorId, eventStartAt: startAt, input: a });
+    if (r.error) return json({ error: 'attendee_validation_failed', detail: r.error, attendee: a }, 400);
+    if (!DELIVERY_CHANNELS.has(r.row.delivery_channel)) return json({ error: 'bad_delivery_channel' }, 400);
+    resolvedAttendees.push(r.row);
+  }
+
+  // Insert optional recurrence rule first so we can stamp recurrence_rule_id.
+  let recurrenceRuleId = null;
+  if (rrule) {
+    const seriesEndAt = recurrence.series_end_at ? validateIsoTimestamp(recurrence.series_end_at) : null;
+    const ruleIns = await barnSrInsertReturning(env, 'barn_event_recurrence_rules', {
+      owner_id: actorId,
+      rrule_text: recurrence.rrule,
+      template_title: title,
+      template_duration: duration,
+      template_animal_ids: animalIds,
+      template_notes: notes,
+      series_start_at: startAt.toISOString(),
+      series_end_at: seriesEndAt ? seriesEndAt.toISOString() : null,
+    });
+    if (!ruleIns.ok || !ruleIns.data) return json({ error: 'recurrence_insert_failed' }, 500);
+    recurrenceRuleId = ruleIns.data.id;
+  }
+
+  // Insert base event.
+  const evIns = await barnSrInsertReturning(env, 'barn_events', {
+    owner_id: actorId,
+    ranch_id: ranchId,
+    title,
+    start_at: startAt.toISOString(),
+    duration_minutes: duration,
+    location_text: location,
+    animal_ids: animalIds,
+    notes,
+    created_by: actorId,
+    status: 'scheduled',
+    recurrence_rule_id: recurrenceRuleId,
+    prefill_source: body.prefill_source || 'manual',
+  });
+  if (!evIns.ok || !evIns.data) return json({ error: 'event_insert_failed', status: evIns.status, detail: evIns.data }, 500);
+  const event = evIns.data;
+
+  // Insert attendees stamped with event_id.
+  let insertedAttendees = [];
+  if (resolvedAttendees.length) {
+    const rows = resolvedAttendees.map((a) => ({ ...a, event_id: event.id }));
+    const many = await barnSrInsertMany(env, 'barn_event_attendees', rows);
+    if (!many.ok) return json({ error: 'attendee_insert_failed', status: many.status, detail: many.data }, 500);
+    insertedAttendees = many.data || [];
+  }
+
+  // Materialize recurrence instances (no attendees on instances — tech-debt).
+  let materializedCount = 0;
+  if (rrule) {
+    const horizon = recurrence.series_end_at
+      ? new Date(recurrence.series_end_at)
+      : new Date(Date.now() + 365 * 24 * 3600 * 1000);
+    const dates = materializeRecurrenceDates(startAt, rrule, { maxInstances: 52, horizon });
+    if (dates.length) {
+      const rows = dates.map((iso) => ({
+        owner_id: actorId,
+        ranch_id: ranchId,
+        title,
+        start_at: iso,
+        duration_minutes: duration,
+        location_text: location,
+        animal_ids: animalIds,
+        notes,
+        created_by: actorId,
+        status: 'scheduled',
+        recurrence_rule_id: recurrenceRuleId,
+        prefill_source: 'recurrence_materialize',
+      }));
+      const ins = await barnSrInsertMany(env, 'barn_events', rows);
+      if (ins.ok) {
+        materializedCount = (ins.data || []).length;
+        await barnSrPatchReturning(
+          env,
+          'barn_event_recurrence_rules',
+          `id=eq.${recurrenceRuleId}`,
+          { last_materialized_through: dates[dates.length - 1] },
+        );
+      }
+    }
+  }
+
+  // Fire invitation emails async; log outcomes to notifications_log.
+  const ownerProfile = await barnSrSelect(env, 'user_profiles',
+    `select=display_name&user_id=eq.${actorId}&limit=1`);
+  const ownerName = ownerProfile.ok && Array.isArray(ownerProfile.data) && ownerProfile.data[0]?.display_name
+    ? ownerProfile.data[0].display_name : null;
+
+  const emailPromise = (async () => {
+    for (const a of insertedAttendees) {
+      if (a.delivery_channel === 'in_app') {
+        await logBarnNotification(env, {
+          event_id: event.id,
+          attendee_id: a.id,
+          pro_contact_id: a.pro_contact_id,
+          channel: 'in_app',
+          bucket: null,
+          status: 'sent',
+        });
+        continue;
+      }
+      const r = await fireInvitationEmail(env, { event, attendee: a, ownerName });
+      await logBarnNotification(env, {
+        event_id: event.id,
+        attendee_id: a.id,
+        pro_contact_id: a.pro_contact_id,
+        channel: 'email',
+        bucket: null,
+        status: r.sent ? 'sent' : (r.skipped ? 'skipped' : 'failed'),
+        error: r.error || r.reason || null,
+      });
+    }
+  })().catch((err) => console.warn('[barn.invite] failed:', err?.message));
+  if (ctx?.waitUntil) ctx.waitUntil(emailPromise);
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.event.create',
+    target_table: 'barn_events',
+    target_id: event.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: {
+      attendee_count: insertedAttendees.length,
+      recurrence_rule_id: recurrenceRuleId,
+      materialized_count: materializedCount,
+    },
+  }, ctx);
+
+  return json({
+    event,
+    attendees: insertedAttendees,
+    recurrence_rule_id: recurrenceRuleId,
+    materialized_count: materializedCount,
+    public_token_count: insertedAttendees.filter((a) => a.public_token).length,
+  }, 201);
+}
+
+async function handleBarnEventUpdate(request, env, id, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:barn_event_update:${actorId}`, BARN_CREATE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const patch = {};
+  const errs = [];
+  if (body.title !== undefined) {
+    if (typeof body.title !== 'string' || body.title.trim().length < 1 || body.title.trim().length > 200) errs.push('bad title');
+    else patch.title = body.title.trim();
+  }
+  if (body.start_at !== undefined) {
+    const d = validateIsoTimestamp(body.start_at);
+    if (!d) errs.push('bad start_at'); else patch.start_at = d.toISOString();
+  }
+  if (body.duration_minutes !== undefined) {
+    const n = Number.parseInt(body.duration_minutes, 10);
+    if (!Number.isFinite(n) || n < 5 || n > 1440) errs.push('bad duration_minutes');
+    else patch.duration_minutes = n;
+  }
+  if (body.location_text !== undefined) {
+    if (body.location_text === null || body.location_text === '') patch.location_text = null;
+    else if (typeof body.location_text !== 'string' || body.location_text.length > 300) errs.push('bad location_text');
+    else patch.location_text = body.location_text.trim();
+  }
+  if (body.notes !== undefined) {
+    if (body.notes === null || body.notes === '') patch.notes = null;
+    else if (typeof body.notes !== 'string' || body.notes.length > 4000) errs.push('bad notes');
+    else patch.notes = body.notes;
+  }
+  if (body.status !== undefined) {
+    if (!EVENT_STATUSES.has(body.status)) errs.push('bad status');
+    else patch.status = body.status;
+  }
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+  if (Object.keys(patch).length === 0) return json({ error: 'no_fields_to_update' }, 400);
+
+  const filter = `id=eq.${id}&owner_id=eq.${actorId}&archived_at=is.null`;
+  const upd = await barnSrPatchReturning(env, 'barn_events', filter, patch);
+  if (!upd.ok) return json({ error: 'update_failed', status: upd.status }, 500);
+  if (!upd.data) return json({ error: 'not_found' }, 404);
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.event.update',
+    target_table: 'barn_events',
+    target_id: id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { fields: Object.keys(patch) },
+  }, ctx);
+
+  return json({ event: upd.data });
+}
+
+async function handleBarnEventCancel(request, env, id, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const filter = `id=eq.${id}&owner_id=eq.${actorId}&archived_at=is.null`;
+  const upd = await barnSrPatchReturning(env, 'barn_events', filter, { status: 'cancelled' });
+  if (!upd.ok) return json({ error: 'cancel_failed', status: upd.status }, 500);
+  if (!upd.data) return json({ error: 'not_found' }, 404);
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.event.cancel',
+    target_table: 'barn_events',
+    target_id: id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+  }, ctx);
+
+  return json({ event: upd.data });
+}
+
+async function handleBarnEventArchive(request, env, id, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const arch = await barnSrArchive(env, 'barn_events', id, actorId);
+  if (!arch.ok) return json({ error: 'archive_failed', status: arch.status }, 500);
+  if (!arch.data) return json({ error: 'not_found' }, 404);
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.event.archive',
+    target_table: 'barn_events',
+    target_id: id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+  }, ctx);
+
+  return json({ event: arch.data });
+}
+
+async function handleBarnEventRespond(request, env, id, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:barn_event_respond:${actorId}`, BARN_RESPOND_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const status = body.status;
+  if (!RESPONSE_STATUSES.has(status)) return json({ error: 'bad_status' }, 400);
+
+  const note = body.response_note == null ? null : String(body.response_note);
+  if (note && note.length > 1000) return json({ error: 'note_too_long' }, 400);
+
+  let counterStart = null;
+  if (status === 'countered') {
+    counterStart = validateIsoTimestamp(body.counter_start_at);
+    if (!counterStart) return json({ error: 'counter_start_at_required' }, 400);
+  }
+
+  // Find the caller's attendee row on this event.
+  const attQ = `select=id,linked_user_id,event_id&event_id=eq.${id}&linked_user_id=eq.${actorId}&archived_at=is.null&limit=1`;
+  const ar = await barnSrSelect(env, 'barn_event_attendees', attQ);
+  if (!ar.ok) return json({ error: 'attendee_lookup_failed' }, 500);
+  const attendee = Array.isArray(ar.data) ? ar.data[0] : null;
+  if (!attendee) return json({ error: 'not_an_attendee' }, 403);
+
+  const respIns = await barnSrInsertReturning(env, 'barn_event_responses', {
+    event_id: id,
+    attendee_id: attendee.id,
+    responder_channel: 'in_app',
+    responder_user_id: actorId,
+    status,
+    counter_start_at: counterStart ? counterStart.toISOString() : null,
+    response_note: note,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+  });
+  if (!respIns.ok || !respIns.data) return json({ error: 'response_insert_failed' }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'attendee',
+    action: 'barn.event.respond',
+    target_table: 'barn_event_responses',
+    target_id: respIns.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { event_id: id, status },
+  }, ctx);
+
+  return json({ response: respIns.data, current_status: status });
+}
+
+/* =============================================================
+   Phase 8 — Public token accept/decline (anon via signed token)
+   ============================================================= */
+
+async function loadAttendeeByToken(env, token) {
+  const q = `select=*,barn_events(id,owner_id,title,start_at,duration_minutes,location_text,animal_ids,notes,status,ranch_id)&public_token=eq.${encodeURIComponent(token)}&limit=1`;
+  const r = await barnSrSelect(env, 'barn_event_attendees', q);
+  if (!r.ok) return null;
+  const row = Array.isArray(r.data) ? r.data[0] : null;
+  if (!row) return null;
+  return row;
+}
+
+async function handlePublicEventGet(request, env, token) {
+  const rl = await rateLimit(env, `ratelimit:public_event_get:${token}`, BARN_PUBLIC_GET_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const att = await loadAttendeeByToken(env, token);
+  if (!att) return json({ error: 'not_found' }, 404);
+  if (att.archived_at) return json({ error: 'revoked' }, 410);
+  if (att.token_expires_at && new Date(att.token_expires_at) < new Date()) {
+    return json({ error: 'token_expired' }, 410);
+  }
+
+  // Fetch response history for this attendee.
+  const rq = `select=status,counter_start_at,response_note,created_at&attendee_id=eq.${att.id}&order=created_at.desc&limit=20`;
+  const rr = await barnSrSelect(env, 'barn_event_responses', rq);
+
+  return json({
+    event: att.barn_events || null,
+    attendee: {
+      id: att.id,
+      email: att.email,
+      delivery_channel: att.delivery_channel,
+      current_status: att.current_status,
+      token_expires_at: att.token_expires_at,
+    },
+    responses: rr.ok ? (rr.data || []) : [],
+  });
+}
+
+async function handlePublicEventRespond(request, env, token, ctx) {
+  const rl = await rateLimit(env, `ratelimit:public_event_respond:${token}`, BARN_PUBLIC_RESPOND_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const att = await loadAttendeeByToken(env, token);
+  if (!att) return json({ error: 'not_found' }, 404);
+  if (att.archived_at) return json({ error: 'revoked' }, 410);
+  if (att.token_expires_at && new Date(att.token_expires_at) < new Date()) {
+    return json({ error: 'token_expired' }, 410);
+  }
+  const event = att.barn_events;
+  if (!event) return json({ error: 'event_not_found' }, 404);
+  if (event.status === 'cancelled') return json({ error: 'event_cancelled' }, 410);
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const status = body.status;
+  if (!RESPONSE_STATUSES.has(status)) return json({ error: 'bad_status' }, 400);
+
+  const note = body.response_note == null ? null : String(body.response_note);
+  if (note && note.length > 1000) return json({ error: 'note_too_long' }, 400);
+
+  let counterStart = null;
+  if (status === 'countered') {
+    counterStart = validateIsoTimestamp(body.counter_start_at);
+    if (!counterStart) return json({ error: 'counter_start_at_required' }, 400);
+  }
+
+  const respIns = await barnSrInsertReturning(env, 'barn_event_responses', {
+    event_id: event.id,
+    attendee_id: att.id,
+    responder_channel: 'public_token',
+    responder_user_id: null,
+    status,
+    counter_start_at: counterStart ? counterStart.toISOString() : null,
+    response_note: note,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+  });
+  if (!respIns.ok || !respIns.data) return json({ error: 'response_insert_failed' }, 500);
+
+  ctx_audit(env, {
+    actor_id: null,
+    actor_role: 'public_attendee',
+    action: 'barn.event.public_respond',
+    target_table: 'barn_event_responses',
+    target_id: respIns.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { event_id: event.id, attendee_id: att.id, status },
+  }, ctx);
+
+  return json({ response: respIns.data, current_status: status });
+}
+
+async function handlePublicEventRevoke(request, env, token, ctx) {
+  const rl = await rateLimit(env, `ratelimit:public_event_revoke:${token}`, BARN_PUBLIC_RESPOND_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const att = await loadAttendeeByToken(env, token);
+  if (!att) return json({ error: 'not_found' }, 404);
+  if (att.archived_at) return json({ ok: true, already: 'revoked' });
+
+  // Archive the attendee + record a cancelled response for audit trail.
+  const arch = await barnSrPatchReturning(env, 'barn_event_attendees',
+    `id=eq.${att.id}`,
+    { archived_at: new Date().toISOString(), current_status: 'cancelled' });
+  if (!arch.ok) return json({ error: 'revoke_failed' }, 500);
+
+  await barnSrInsertReturning(env, 'barn_event_responses', {
+    event_id: att.event_id,
+    attendee_id: att.id,
+    responder_channel: 'public_token',
+    status: 'cancelled',
+    response_note: 'revoked via public token',
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+  });
+
+  ctx_audit(env, {
+    actor_id: null,
+    actor_role: 'public_attendee',
+    action: 'barn.event.public_revoke',
+    target_table: 'barn_event_attendees',
+    target_id: att.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+  }, ctx);
+
+  return json({ ok: true });
+}
+
+/* =============================================================
+   Phase 8 — Internal cron endpoints
+   All gated by X-Internal-Secret (timing-safe compare).
+   ============================================================= */
+
+const BARN_REMINDER_BUCKETS = [
+  { bucket: '48h', lowerMin: 47 * 60, upperMin: 49 * 60 },
+  { bucket: '24h', lowerMin: 23 * 60, upperMin: 25 * 60 },
+  { bucket: '2h',  lowerMin: 95,      upperMin: 125 },
+];
+
+async function handleBarnRemindersTick(request, env, ctx) {
+  const fail = await requireInternalSecret(request, env);
+  if (fail) return fail;
+
+  const now = Date.now();
+  const stats = { scanned: 0, fired: 0, skipped: 0, failed: 0 };
+
+  for (const b of BARN_REMINDER_BUCKETS) {
+    const lower = new Date(now + b.lowerMin * 60 * 1000).toISOString();
+    const upper = new Date(now + b.upperMin * 60 * 1000).toISOString();
+
+    const q = `select=id,owner_id,title,start_at,duration_minutes,location_text,notes,status`
+      + `&status=eq.scheduled&archived_at=is.null`
+      + `&start_at=gte.${encodeURIComponent(lower)}&start_at=lte.${encodeURIComponent(upper)}`;
+    const er = await barnSrSelect(env, 'barn_events', q);
+    if (!er.ok) continue;
+    const events = er.data || [];
+
+    for (const ev of events) {
+      stats.scanned += 1;
+
+      const atQ = `select=id,email,phone_e164,delivery_channel,pro_contact_id,linked_user_id,current_status`
+        + `&event_id=eq.${ev.id}&archived_at=is.null`;
+      const ar = await barnSrSelect(env, 'barn_event_attendees', atQ);
+      if (!ar.ok) continue;
+      const attendees = ar.data || [];
+
+      for (const a of attendees) {
+        if (a.current_status === 'cancelled' || a.current_status === 'declined') {
+          stats.skipped += 1; continue;
+        }
+        // Dedupe via prior log rows for this (event, attendee, bucket, channel).
+        const channel = a.delivery_channel === 'in_app' ? 'in_app' : 'email';
+        const dedupeQ = `select=id&event_id=eq.${ev.id}&attendee_id=eq.${a.id}`
+          + `&bucket=eq.${b.bucket}&channel=eq.${channel}&limit=1`;
+        const dr = await barnSrSelect(env, 'barn_event_notifications_log', dedupeQ);
+        if (dr.ok && Array.isArray(dr.data) && dr.data.length > 0) {
+          stats.skipped += 1; continue;
+        }
+
+        if (channel === 'in_app') {
+          await logBarnNotification(env, {
+            event_id: ev.id, attendee_id: a.id, pro_contact_id: a.pro_contact_id,
+            channel, bucket: b.bucket, status: 'sent',
+          });
+          stats.fired += 1;
+          continue;
+        }
+
+        // email reminder
+        if (!a.email || !isResendConfigured(env)) {
+          await logBarnNotification(env, {
+            event_id: ev.id, attendee_id: a.id, pro_contact_id: a.pro_contact_id,
+            channel, bucket: b.bucket, status: 'skipped',
+            error: !a.email ? 'no_email' : 'resend_not_configured',
+          });
+          stats.skipped += 1;
+          continue;
+        }
+        try {
+          const when = new Date(ev.start_at).toUTCString();
+          await sendResendEmail(env, {
+            to: a.email,
+            subject: `Reminder (${b.bucket}): ${ev.title}`,
+            html: `<div style="font-family:system-ui,sans-serif;max-width:520px;padding:24px">
+              <h2>${escapeHtml(ev.title)}</h2>
+              <p><strong>When:</strong> ${escapeHtml(when)} (${ev.duration_minutes} min)</p>
+              ${ev.location_text ? `<p><strong>Where:</strong> ${escapeHtml(ev.location_text)}</p>` : ''}
+              ${ev.notes ? `<p style="white-space:pre-wrap">${escapeHtml(ev.notes)}</p>` : ''}
+            </div>`,
+            tags: [{ name: 'category', value: 'barn_reminder' }, { name: 'bucket', value: b.bucket }],
+          });
+          await logBarnNotification(env, {
+            event_id: ev.id, attendee_id: a.id, pro_contact_id: a.pro_contact_id,
+            channel, bucket: b.bucket, status: 'sent',
+          });
+          stats.fired += 1;
+        } catch (err) {
+          await logBarnNotification(env, {
+            event_id: ev.id, attendee_id: a.id, pro_contact_id: a.pro_contact_id,
+            channel, bucket: b.bucket, status: 'failed', error: String(err?.message || err),
+          });
+          stats.failed += 1;
+        }
+      }
+    }
+  }
+
+  return json({ ok: true, stats });
+}
+
+async function handleBarnMaterializeRecurrences(request, env, _ctx) {
+  const fail = await requireInternalSecret(request, env);
+  if (fail) return fail;
+
+  const horizonIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
+
+  // Pick up active rules whose last_materialized_through is older than horizon - 30d.
+  const cutoff = new Date(Date.now() + (365 - 30) * 24 * 3600 * 1000).toISOString();
+  const rq = `select=*&archived_at=is.null`
+    + `&or=(last_materialized_through.is.null,last_materialized_through.lt.${encodeURIComponent(cutoff)})`
+    + `&limit=100`;
+  const rr = await barnSrSelect(env, 'barn_event_recurrence_rules', rq);
+  if (!rr.ok) return json({ error: 'rules_lookup_failed' }, 500);
+  const rules = rr.data || [];
+
+  const stats = { rules_scanned: rules.length, instances_inserted: 0 };
+
+  for (const rule of rules) {
+    const rrule = parseRruleMinimal(rule.rrule_text);
+    if (!rrule) continue;
+
+    const anchor = rule.last_materialized_through
+      ? new Date(rule.last_materialized_through)
+      : new Date(rule.series_start_at);
+
+    const horizon = rule.series_end_at
+      ? new Date(Math.min(new Date(rule.series_end_at).getTime(), Date.parse(horizonIso)))
+      : new Date(horizonIso);
+
+    const dates = materializeRecurrenceDates(anchor, rrule, { maxInstances: 200, horizon });
+    if (!dates.length) continue;
+
+    const rows = dates.map((iso) => ({
+      owner_id: rule.owner_id,
+      title: rule.template_title,
+      start_at: iso,
+      duration_minutes: rule.template_duration,
+      animal_ids: rule.template_animal_ids || [],
+      notes: rule.template_notes || null,
+      created_by: rule.owner_id,
+      status: 'scheduled',
+      recurrence_rule_id: rule.id,
+      prefill_source: 'recurrence_materialize',
+    }));
+    const ins = await barnSrInsertMany(env, 'barn_events', rows);
+    if (ins.ok) {
+      stats.instances_inserted += (ins.data || []).length;
+      await barnSrPatchReturning(env, 'barn_event_recurrence_rules',
+        `id=eq.${rule.id}`,
+        { last_materialized_through: dates[dates.length - 1] });
+    }
+  }
+
+  return json({ ok: true, stats });
+}
+
+async function handleBarnProClaimEmail(request, env, _ctx) {
+  const fail = await requireInternalSecret(request, env);
+  if (fail) return fail;
+
+  // Find eligible pro_contacts: >=3 confirms, never claim-emailed, not linked, has email.
+  const q = `select=id,owner_id,name,role,email`
+    + `&response_count_confirmed=gte.3`
+    + `&claim_email_sent_at=is.null`
+    + `&linked_user_id=is.null`
+    + `&email=not.is.null`
+    + `&archived_at=is.null`
+    + `&limit=50`;
+  const r = await barnSrSelect(env, 'professional_contacts', q);
+  if (!r.ok) return json({ error: 'scan_failed' }, 500);
+  const candidates = r.data || [];
+
+  const stats = { candidates: candidates.length, sent: 0, skipped: 0, failed: 0 };
+  const nowIso = new Date().toISOString();
+
+  for (const c of candidates) {
+    if (!isResendConfigured(env)) {
+      await logBarnNotification(env, {
+        pro_contact_id: c.id, channel: 'claim_pro_email', bucket: 'claim_pro',
+        status: 'skipped', error: 'resend_not_configured',
+      });
+      stats.skipped += 1; continue;
+    }
+    try {
+      const signupUrl = `${(env.PUBLIC_APP_URL || 'https://maneline.co').replace(/\/+$/, '')}/signup?role=${encodeURIComponent(c.role)}&email=${encodeURIComponent(c.email)}`;
+      await sendResendEmail(env, {
+        to: c.email,
+        subject: 'Your clients have been booking you through Mane Line',
+        html: `<div style="font-family:system-ui,sans-serif;max-width:520px;padding:24px">
+          <h2>Hi ${escapeHtml(c.name)},</h2>
+          <p>Three or more of your Mane Line clients have confirmed bookings with you lately. Claim your free ${escapeHtml(c.role)} account and your schedule will start appearing in one place.</p>
+          <p><a href="${signupUrl}" style="background:#0f172a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Claim my account</a></p>
+          <p style="font-size:12px;color:#64748b">Sent by Mane Line — your clients' barn in a box.</p>
+        </div>`,
+        tags: [{ name: 'category', value: 'claim_pro_email' }],
+      });
+      await barnSrPatchReturning(env, 'professional_contacts',
+        `id=eq.${c.id}`,
+        { claim_email_sent_at: nowIso });
+      await logBarnNotification(env, {
+        pro_contact_id: c.id, channel: 'claim_pro_email', bucket: 'claim_pro', status: 'sent',
+      });
+      stats.sent += 1;
+    } catch (err) {
+      await logBarnNotification(env, {
+        pro_contact_id: c.id, channel: 'claim_pro_email', bucket: 'claim_pro',
+        status: 'failed', error: String(err?.message || err),
+      });
+      stats.failed += 1;
+    }
+  }
+
+  return json({ ok: true, stats });
+}
+
+/* =============================================================
+   Phase 8 — Barn Mode Module 02 — Herd Health Dashboard
+   ============================================================= */
+
+const HERD_HEALTH_READ_RATE  = { limit: 60, windowSec: 60 };
+const HERD_HEALTH_WRITE_RATE = { limit: 30, windowSec: 60 };
+const HERD_HEALTH_PDF_RATE   = { limit: 5,  windowSec: 60 };
+
+/**
+ * Phase 8.5 Barn Mode gate stub. Until Module 05 ships, this returns
+ * true for every owner. TECH_DEBT(phase-8:02-02).
+ */
+async function isBarnModeEntitled(_env, _ownerId) {
+  return true;
+}
+
+function normalizeThresholdPatchBody(body) {
+  const errs = [];
+  if (!body || typeof body !== 'object' || !Array.isArray(body.thresholds)) {
+    errs.push('body.thresholds must be an array');
+    return { rows: [], errs };
+  }
+  const rows = [];
+  for (const r of body.thresholds) {
+    if (!r || typeof r !== 'object') { errs.push('each threshold must be an object'); continue; }
+    if (!isHerdHealthRecordType(r.record_type)) {
+      errs.push(`record_type must be one of: ${HERD_HEALTH_RECORD_TYPES.join(', ')}`);
+      continue;
+    }
+    const days = Number(r.interval_days);
+    if (!Number.isInteger(days) || days < 1 || days > 3650) {
+      errs.push('interval_days must be an integer between 1 and 3650');
+      continue;
+    }
+    if (typeof r.enabled !== 'boolean') {
+      errs.push('enabled must be boolean');
+      continue;
+    }
+    rows.push({ record_type: r.record_type, interval_days: days, enabled: r.enabled });
+  }
+  return { rows, errs };
+}
+
+function normalizeAcknowledgementBody(body) {
+  const errs = [];
+  const out = {};
+  if (!body || typeof body !== 'object') {
+    errs.push('body must be an object');
+    return { out, errs };
+  }
+  if (!isUuid(body.animal_id)) errs.push('animal_id must be uuid');
+  else out.animal_id = body.animal_id;
+  if (!isHerdHealthRecordType(body.record_type)) {
+    errs.push(`record_type must be one of: ${HERD_HEALTH_RECORD_TYPES.join(', ')}`);
+  } else {
+    out.record_type = body.record_type;
+  }
+  const d = body.dismissed_until ? new Date(body.dismissed_until) : null;
+  if (!d || Number.isNaN(d.getTime())) errs.push('dismissed_until must be an ISO timestamp');
+  else if (d.getTime() <= Date.now()) errs.push('dismissed_until must be in the future');
+  else if (d.getTime() > Date.now() + 365 * 24 * 3600 * 1000) {
+    errs.push('dismissed_until must be within 365 days');
+  } else {
+    out.dismissed_until = d.toISOString();
+  }
+  if (body.reason !== undefined && body.reason !== null) {
+    if (typeof body.reason !== 'string' || body.reason.length > 500) {
+      errs.push('reason must be <=500 chars');
+    } else {
+      out.reason = body.reason.trim() || null;
+    }
+  } else {
+    out.reason = null;
+  }
+  return { out, errs };
+}
+
+async function handleHerdHealthGet(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:herd_health_get:${actorId}`, HERD_HEALTH_READ_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429,
+      { 'retry-after': String(rl.resetSec) });
+  }
+
+  const thr = await listOrSeedThresholds(env, actorId);
+  if (!thr.ok) return json({ error: 'thresholds_failed', status: thr.status }, 500);
+
+  const animals = await hhListOwnerAnimals(env, actorId);
+  if (!animals.ok) return json({ error: 'animals_failed', status: animals.status }, 500);
+
+  const grid = await computeHerdHealth(env, actorId);
+  if (!grid.ok) return json({ error: 'compute_failed', status: grid.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.herd_health.read',
+    target_table: 'health_thresholds',
+    target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: {
+      animal_count: animals.data.length,
+      threshold_count: thr.data.length,
+      cell_count: grid.data.length,
+    },
+  }, ctx);
+
+  return json({
+    record_types: HERD_HEALTH_RECORD_TYPES,
+    thresholds: thr.data,
+    animals: animals.data,
+    cells: grid.data,
+  });
+}
+
+async function handleHerdHealthThresholdsPatch(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:herd_health_thr:${actorId}`, HERD_HEALTH_WRITE_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429,
+      { 'retry-after': String(rl.resetSec) });
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const { rows, errs } = normalizeThresholdPatchBody(body);
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+  if (rows.length === 0) return json({ error: 'no_thresholds_to_update' }, 400);
+
+  const results = [];
+  for (const row of rows) {
+    const r = await upsertThreshold(env, actorId, row);
+    if (!r.ok) return json({ error: 'upsert_failed', status: r.status, record_type: row.record_type }, 500);
+    if (r.data) results.push(r.data);
+  }
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.herd_health.thresholds_update',
+    target_table: 'health_thresholds',
+    target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { record_types: rows.map((r) => r.record_type) },
+  }, ctx);
+
+  return json({ thresholds: results });
+}
+
+async function handleHerdHealthThresholdsReset(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:herd_health_reset:${actorId}`, HERD_HEALTH_WRITE_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429,
+      { 'retry-after': String(rl.resetSec) });
+  }
+
+  const r = await resetThresholdsToDefaults(env, actorId);
+  if (!r.ok) return json({ error: 'reset_failed', status: r.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.herd_health.thresholds_reset',
+    target_table: 'health_thresholds',
+    target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { count: r.data.length },
+  }, ctx);
+
+  return json({ thresholds: r.data });
+}
+
+async function handleHerdHealthAcknowledge(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:herd_health_ack:${actorId}`, HERD_HEALTH_WRITE_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429,
+      { 'retry-after': String(rl.resetSec) });
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const { out, errs } = normalizeAcknowledgementBody(body);
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+
+  const animal = await hhGetOwnerAnimal(env, actorId, out.animal_id);
+  if (!animal.ok) return json({ error: 'animal_lookup_failed', status: animal.status }, 500);
+  if (!animal.data) return json({ error: 'animal_not_found' }, 404);
+
+  const ins = await hhInsertAcknowledgement(env, actorId, out);
+  if (!ins.ok || !ins.data) return json({ error: 'insert_failed', status: ins.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.herd_health.acknowledge',
+    target_table: 'health_dashboard_acknowledgements',
+    target_id: ins.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: {
+      animal_id: out.animal_id,
+      record_type: out.record_type,
+      dismissed_until: out.dismissed_until,
+    },
+  }, ctx);
+
+  return json({ acknowledgement: ins.data }, 201);
+}
+
+async function handleHerdHealthAnimalDetail(request, env, animalId, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:herd_health_animal:${actorId}`, HERD_HEALTH_READ_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429,
+      { 'retry-after': String(rl.resetSec) });
+  }
+
+  const animal = await hhGetOwnerAnimal(env, actorId, animalId);
+  if (!animal.ok) return json({ error: 'animal_lookup_failed', status: animal.status }, 500);
+  if (!animal.data) return json({ error: 'not_found' }, 404);
+
+  const [records, thresholds, grid] = await Promise.all([
+    hhListAnimalVetRecords(env, actorId, animalId),
+    listOrSeedThresholds(env, actorId),
+    computeHerdHealth(env, actorId),
+  ]);
+  if (!records.ok) return json({ error: 'records_failed', status: records.status }, 500);
+  if (!thresholds.ok) return json({ error: 'thresholds_failed', status: thresholds.status }, 500);
+  if (!grid.ok) return json({ error: 'compute_failed', status: grid.status }, 500);
+
+  const cells = grid.data.filter((c) => c.animal_id === animalId);
+
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.herd_health.animal_detail',
+    target_table: 'animals',
+    target_id: animalId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { record_count: records.data.length },
+  }, ctx);
+
+  return json({
+    animal: animal.data,
+    records: records.data,
+    thresholds: thresholds.data,
+    cells,
+    record_types: HERD_HEALTH_RECORD_TYPES,
+  });
+}
+
+async function handleHerdHealthReportPdf(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const entitled = await isBarnModeEntitled(env, actorId);
+  if (!entitled) {
+    return json({
+      error: 'barn_mode_required',
+      message: 'Upgrade to Barn Mode to export the Herd Health PDF.',
+    }, 402);
+  }
+
+  const rl = await rateLimit(env, `ratelimit:herd_health_pdf:${actorId}`, HERD_HEALTH_PDF_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429,
+      { 'retry-after': String(rl.resetSec) });
+  }
+
+  // TECH_DEBT(phase-8:02-01) — the Cloudflare Browser Rendering
+  // pipeline for the Herd Health PDF reuses the Phase 7 R2 flow but
+  // the HTML template + BROWSER-binding render path isn't wired
+  // through yet; endpoint stubs to 501 until Module 06 observability
+  // sweep ships the template alongside the other PDF types.
+  ctx_audit(env, {
+    actor_id: actorId,
+    actor_role: 'owner',
+    action: 'barn.herd_health.report_export_attempt',
+    target_table: 'audit_log',
+    target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { outcome: 'not_implemented' },
+  }, ctx);
+  return json({ error: 'pdf_not_implemented', tech_debt: 'phase-8:02-01' }, 501);
+}
+
+// Silence unused-var lint for future wiring (HERD_HEALTH_RECORD_TYPE_SET +
+// HERD_HEALTH_DEFAULTS + hhInsertAcknowledgement are re-exported for
+// Module 03+ work so they don't need to be re-imported).
+void HERD_HEALTH_RECORD_TYPE_SET;
+void HERD_HEALTH_DEFAULTS;
+
+/* =============================================================
+   Phase 8 — Barn Mode Module 03 — Facility Map + Care Matrix
+   ============================================================= */
+
+const FACILITY_READ_RATE   = { limit: 60, windowSec: 60 };
+const FACILITY_WRITE_RATE  = { limit: 30, windowSec: 60 };
+const FACILITY_PDF_RATE    = { limit: 5,  windowSec: 60 };
+
+function validStallLabel(s) {
+  return typeof s === 'string' && s.trim().length >= 1 && s.trim().length <= 60;
+}
+function validGroupName(s) {
+  return typeof s === 'string' && s.trim().length >= 1 && s.trim().length <= 80;
+}
+function validNotes(s) {
+  return s === null || s === undefined || (typeof s === 'string' && s.length <= 500);
+}
+function validColorHex(s) {
+  return s === null || s === undefined || (typeof s === 'string' && /^#[0-9a-fA-F]{6}$/.test(s));
+}
+function validYmd(s) {
+  return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(new Date(`${s}T00:00:00Z`).getTime());
+}
+
+async function handleFacilityRanches(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_ranches:${actorId}`, FACILITY_READ_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const r = await fmListOwnerRanches(env, actorId);
+  if (!r.ok) return json({ error: 'ranches_failed', status: r.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.ranches_read',
+    target_table: 'ranches', target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { count: r.data.length },
+  }, ctx);
+
+  return json({ ranches: r.data });
+}
+
+async function handleFacilityMap(request, env, url, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const ranchId = url.searchParams.get('ranch_id');
+  if (!isUuid(ranchId)) return json({ error: 'bad_ranch_id' }, 400);
+
+  const rl = await rateLimit(env, `ratelimit:facility_map:${actorId}`, FACILITY_READ_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const ranch = await fmGetOwnerRanch(env, actorId, ranchId);
+  if (!ranch) return json({ error: 'ranch_not_found' }, 404);
+
+  const map = await fmReadFacilityMap(env, ranchId);
+  if (!map.ok) return json({ error: 'map_failed', status: map.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.map_read',
+    target_table: 'stalls', target_id: ranchId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: {
+      stalls: map.data.stalls.length,
+      groups: map.data.groups.length,
+      assignments: map.data.assignments.length,
+      members: map.data.members.length,
+    },
+  }, ctx);
+
+  return json({ ranch, ...map.data });
+}
+
+async function handleStallCreate(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_stall_ins:${actorId}`, FACILITY_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const errs = [];
+  if (!isUuid(body?.ranch_id)) errs.push('ranch_id must be uuid');
+  if (!validStallLabel(body?.label)) errs.push('label must be 1-60 chars');
+  if (!validNotes(body?.notes)) errs.push('notes must be <=500 chars');
+  if (body?.position_row !== null && body?.position_row !== undefined && !Number.isInteger(body.position_row)) errs.push('position_row must be integer');
+  if (body?.position_col !== null && body?.position_col !== undefined && !Number.isInteger(body.position_col)) errs.push('position_col must be integer');
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+
+  const ranch = await fmGetOwnerRanch(env, actorId, body.ranch_id);
+  if (!ranch) return json({ error: 'ranch_not_found' }, 404);
+
+  const ins = await fmInsertStall(env, body.ranch_id, {
+    label: body.label.trim(),
+    notes: body.notes ?? null,
+    position_row: body.position_row ?? null,
+    position_col: body.position_col ?? null,
+  });
+  if (!ins.ok || !ins.data) return json({ error: 'insert_failed', status: ins.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.stall_create',
+    target_table: 'stalls', target_id: ins.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { ranch_id: body.ranch_id, label: body.label },
+  }, ctx);
+
+  return json({ stall: ins.data }, 201);
+}
+
+async function handleStallPatch(request, env, stallId, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_stall_patch:${actorId}`, FACILITY_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const owned = await fmGetOwnerStall(env, actorId, stallId);
+  if (!owned.ok) return json({ error: 'lookup_failed', status: owned.status }, 500);
+  if (!owned.data) return json({ error: 'stall_not_found' }, 404);
+
+  const patch = {};
+  const errs = [];
+  if (body?.label !== undefined) {
+    if (!validStallLabel(body.label)) errs.push('label must be 1-60 chars');
+    else patch.label = body.label.trim();
+  }
+  if (body?.notes !== undefined) {
+    if (!validNotes(body.notes)) errs.push('notes must be <=500 chars');
+    else patch.notes = body.notes;
+  }
+  if (body?.position_row !== undefined) {
+    if (body.position_row !== null && !Number.isInteger(body.position_row)) errs.push('position_row must be integer or null');
+    else patch.position_row = body.position_row;
+  }
+  if (body?.position_col !== undefined) {
+    if (body.position_col !== null && !Number.isInteger(body.position_col)) errs.push('position_col must be integer or null');
+    else patch.position_col = body.position_col;
+  }
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+  if (Object.keys(patch).length === 0) return json({ error: 'no_fields' }, 400);
+
+  const r = await fmPatchStall(env, stallId, patch);
+  if (!r.ok || !r.data) return json({ error: 'patch_failed', status: r.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.stall_patch',
+    target_table: 'stalls', target_id: stallId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { fields: Object.keys(patch) },
+  }, ctx);
+
+  return json({ stall: r.data });
+}
+
+async function handleStallArchive(request, env, stallId, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_stall_arch:${actorId}`, FACILITY_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const owned = await fmGetOwnerStall(env, actorId, stallId);
+  if (!owned.ok) return json({ error: 'lookup_failed', status: owned.status }, 500);
+  if (!owned.data) return json({ error: 'stall_not_found' }, 404);
+
+  const r = await fmArchiveStall(env, stallId);
+  if (!r.ok || !r.data) return json({ error: 'archive_failed', status: r.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.stall_archive',
+    target_table: 'stalls', target_id: stallId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: {},
+  }, ctx);
+
+  return json({ stall: r.data });
+}
+
+async function handleStallAssign(request, env, stallId, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_stall_assign:${actorId}`, FACILITY_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const animalId = body?.animal_id ?? null;
+  if (animalId !== null && !isUuid(animalId)) return json({ error: 'bad_animal_id' }, 400);
+
+  const owned = await fmGetOwnerStall(env, actorId, stallId);
+  if (!owned.ok) return json({ error: 'lookup_failed', status: owned.status }, 500);
+  if (!owned.data) return json({ error: 'stall_not_found' }, 404);
+
+  if (animalId) {
+    const a = await hhGetOwnerAnimal(env, actorId, animalId);
+    if (!a.ok) return json({ error: 'animal_lookup_failed', status: a.status }, 500);
+    if (!a.data) return json({ error: 'animal_not_found' }, 404);
+  }
+
+  const r = await fmAssignStall(env, actorId, stallId, animalId);
+  if (!r.ok) return json({ error: 'assign_failed', status: r.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: animalId ? 'barn.facility.stall_assign' : 'barn.facility.stall_unassign',
+    target_table: 'stall_assignments',
+    target_id: r.data ? r.data.id : null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { stall_id: stallId, animal_id: animalId },
+  }, ctx);
+
+  return json({ assignment: r.data });
+}
+
+async function handleTurnoutGroupCreate(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_tg_ins:${actorId}`, FACILITY_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const errs = [];
+  if (!isUuid(body?.ranch_id)) errs.push('ranch_id must be uuid');
+  if (!validGroupName(body?.name)) errs.push('name must be 1-80 chars');
+  if (!validColorHex(body?.color_hex)) errs.push('color_hex must be #RRGGBB');
+  if (!validNotes(body?.notes)) errs.push('notes must be <=500 chars');
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+
+  const ranch = await fmGetOwnerRanch(env, actorId, body.ranch_id);
+  if (!ranch) return json({ error: 'ranch_not_found' }, 404);
+
+  const ins = await fmInsertTurnoutGroup(env, body.ranch_id, {
+    name: body.name.trim(),
+    color_hex: body.color_hex ?? null,
+    notes: body.notes ?? null,
+  });
+  if (!ins.ok || !ins.data) return json({ error: 'insert_failed', status: ins.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.turnout_group_create',
+    target_table: 'turnout_groups', target_id: ins.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { ranch_id: body.ranch_id, name: body.name },
+  }, ctx);
+
+  return json({ group: ins.data }, 201);
+}
+
+async function handleTurnoutGroupPatch(request, env, groupId, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_tg_patch:${actorId}`, FACILITY_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const owned = await fmGetOwnerTurnoutGroup(env, actorId, groupId);
+  if (!owned.ok) return json({ error: 'lookup_failed', status: owned.status }, 500);
+  if (!owned.data) return json({ error: 'group_not_found' }, 404);
+
+  const patch = {};
+  const errs = [];
+  if (body?.name !== undefined) {
+    if (!validGroupName(body.name)) errs.push('name must be 1-80 chars');
+    else patch.name = body.name.trim();
+  }
+  if (body?.color_hex !== undefined) {
+    if (!validColorHex(body.color_hex)) errs.push('color_hex must be #RRGGBB or null');
+    else patch.color_hex = body.color_hex;
+  }
+  if (body?.notes !== undefined) {
+    if (!validNotes(body.notes)) errs.push('notes must be <=500 chars');
+    else patch.notes = body.notes;
+  }
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+  if (Object.keys(patch).length === 0) return json({ error: 'no_fields' }, 400);
+
+  const r = await fmPatchTurnoutGroup(env, groupId, patch);
+  if (!r.ok || !r.data) return json({ error: 'patch_failed', status: r.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.turnout_group_patch',
+    target_table: 'turnout_groups', target_id: groupId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { fields: Object.keys(patch) },
+  }, ctx);
+
+  return json({ group: r.data });
+}
+
+async function handleTurnoutGroupArchive(request, env, groupId, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_tg_arch:${actorId}`, FACILITY_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const owned = await fmGetOwnerTurnoutGroup(env, actorId, groupId);
+  if (!owned.ok) return json({ error: 'lookup_failed', status: owned.status }, 500);
+  if (!owned.data) return json({ error: 'group_not_found' }, 404);
+
+  const r = await fmArchiveTurnoutGroup(env, groupId);
+  if (!r.ok || !r.data) return json({ error: 'archive_failed', status: r.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.turnout_group_archive',
+    target_table: 'turnout_groups', target_id: groupId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: {},
+  }, ctx);
+
+  return json({ group: r.data });
+}
+
+async function handleTurnoutGroupMembersAdd(request, env, groupId, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_tg_mem_add:${actorId}`, FACILITY_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const animalIds = Array.isArray(body?.animal_ids) ? body.animal_ids : [];
+  if (animalIds.length === 0 || animalIds.length > 50) {
+    return json({ error: 'animal_ids must be 1-50 uuids' }, 400);
+  }
+  for (const id of animalIds) {
+    if (!isUuid(id)) return json({ error: 'bad_animal_id', value: id }, 400);
+  }
+
+  const owned = await fmGetOwnerTurnoutGroup(env, actorId, groupId);
+  if (!owned.ok) return json({ error: 'lookup_failed', status: owned.status }, 500);
+  if (!owned.data) return json({ error: 'group_not_found' }, 404);
+
+  for (const id of animalIds) {
+    const a = await hhGetOwnerAnimal(env, actorId, id);
+    if (!a.ok) return json({ error: 'animal_lookup_failed', status: a.status }, 500);
+    if (!a.data) return json({ error: 'animal_not_found', animal_id: id }, 404);
+  }
+
+  const r = await fmAddTurnoutMembers(env, actorId, groupId, animalIds);
+  if (!r.ok) return json({ error: 'add_failed', status: r.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.turnout_members_add',
+    target_table: 'turnout_group_members', target_id: groupId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { group_id: groupId, animal_count: animalIds.length },
+  }, ctx);
+
+  return json({ members: r.data }, 201);
+}
+
+async function handleTurnoutGroupMemberRemove(request, env, groupId, animalId, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_tg_mem_rem:${actorId}`, FACILITY_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const owned = await fmGetOwnerTurnoutGroup(env, actorId, groupId);
+  if (!owned.ok) return json({ error: 'lookup_failed', status: owned.status }, 500);
+  if (!owned.data) return json({ error: 'group_not_found' }, 404);
+
+  const r = await fmRemoveTurnoutMember(env, groupId, animalId);
+  if (!r.ok) return json({ error: 'remove_failed', status: r.status }, 500);
+  if (!r.data) return json({ error: 'member_not_found' }, 404);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.turnout_member_remove',
+    target_table: 'turnout_group_members', target_id: r.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { group_id: groupId, animal_id: animalId },
+  }, ctx);
+
+  return json({ member: r.data });
+}
+
+async function handleCareMatrixGet(request, env, url, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const ranchId = url.searchParams.get('ranch_id');
+  const ymd = url.searchParams.get('date');
+  if (!isUuid(ranchId)) return json({ error: 'bad_ranch_id' }, 400);
+  if (!validYmd(ymd)) return json({ error: 'bad_date' }, 400);
+
+  const rl = await rateLimit(env, `ratelimit:facility_cm_get:${actorId}`, FACILITY_READ_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const ranch = await fmGetOwnerRanch(env, actorId, ranchId);
+  if (!ranch) return json({ error: 'ranch_not_found' }, 404);
+
+  const r = await fmListCareMatrix(env, ranchId, ymd);
+  if (!r.ok) return json({ error: 'care_matrix_failed', status: r.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.care_matrix_read',
+    target_table: 'care_matrix_entries', target_id: ranchId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { date: ymd, animal_count: r.data.animal_ids.length, entry_count: r.data.entries.length },
+  }, ctx);
+
+  return json({
+    ranch_id: ranchId,
+    date: ymd,
+    columns: CARE_MATRIX_COLUMNS,
+    animal_ids: r.data.animal_ids,
+    entries: r.data.entries,
+  });
+}
+
+async function handleCareMatrixBatchUpsert(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_cm_upsert:${actorId}`, FACILITY_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  if (!isUuid(body?.ranch_id)) return json({ error: 'bad_ranch_id' }, 400);
+  if (!validYmd(body?.date)) return json({ error: 'bad_date' }, 400);
+  const entries = Array.isArray(body?.entries) ? body.entries : null;
+  if (!entries || entries.length === 0 || entries.length > 200) {
+    return json({ error: 'entries must be 1-200 items' }, 400);
+  }
+
+  const ranch = await fmGetOwnerRanch(env, actorId, body.ranch_id);
+  if (!ranch) return json({ error: 'ranch_not_found' }, 404);
+
+  // Every animal_id must belong to the caller.
+  const seen = new Set();
+  for (const e of entries) {
+    if (!e || typeof e !== 'object') return json({ error: 'entry must be object' }, 400);
+    if (!isUuid(e.animal_id)) return json({ error: 'bad_animal_id', value: e.animal_id }, 400);
+    if (seen.has(e.animal_id)) return json({ error: 'duplicate_animal_id', value: e.animal_id }, 400);
+    seen.add(e.animal_id);
+    if (e.notes !== undefined && e.notes !== null && (typeof e.notes !== 'string' || e.notes.length > 1000)) {
+      return json({ error: 'notes must be <=1000 chars' }, 400);
+    }
+  }
+  for (const id of seen) {
+    const a = await hhGetOwnerAnimal(env, actorId, id);
+    if (!a.ok) return json({ error: 'animal_lookup_failed', status: a.status }, 500);
+    if (!a.data) return json({ error: 'animal_not_found', animal_id: id }, 404);
+  }
+
+  const r = await fmBatchUpsertCareMatrix(env, actorId, body.date, entries);
+  if (!r.ok) return json({ error: 'upsert_failed', status: r.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.care_matrix_upsert',
+    target_table: 'care_matrix_entries', target_id: body.ranch_id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { date: body.date, count: entries.length },
+  }, ctx);
+
+  return json({ entries: r.data });
+}
+
+async function handleFacilityPrintPdf(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const entitled = await isBarnModeEntitled(env, actorId);
+  if (!entitled) {
+    return json({
+      error: 'barn_mode_required',
+      message: 'Upgrade to Barn Mode to export the Facility Map PDF.',
+    }, 402);
+  }
+
+  const rl = await rateLimit(env, `ratelimit:facility_pdf:${actorId}`, FACILITY_PDF_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  // TECH_DEBT(phase-8:03-01) — Facility / Care Matrix PDF reuses the
+  // Module 02 template pipeline; stub returns 501 until Module 06
+  // observability sweep ships the PDF templates alongside the BROWSER
+  // binding.
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.pdf_export_attempt',
+    target_table: 'audit_log', target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { outcome: 'not_implemented' },
+  }, ctx);
+
+  return json({ error: 'pdf_not_implemented', tech_debt: 'phase-8:03-01' }, 501);
+}
+
+/* =============================================================
+   Phase 8 — Barn Mode Module 04 — Barn Spending
+   ============================================================= */
+
+const SPENDING_READ_RATE  = { limit: 60, windowSec: 60 };
+const SPENDING_WRITE_RATE = { limit: 30, windowSec: 60 };
+const SPENDING_EXPORT_RATE = { limit: 10, windowSec: 60 };
+
+function validYear(y) {
+  return Number.isInteger(y) && y >= 2000 && y <= 2100;
+}
+
+function csvEscape(v) {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+async function handleSpendingGet(request, env, url, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const year = Number(url.searchParams.get('year'));
+  if (!validYear(year)) return json({ error: 'bad_year' }, 400);
+  const groupBy = url.searchParams.get('group_by') || 'category';
+  if (!['category', 'animal', 'ranch'].includes(groupBy)) {
+    return json({ error: 'bad_group_by' }, 400);
+  }
+
+  const rl = await rateLimit(env, `ratelimit:spending_get:${actorId}`, SPENDING_READ_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const exp = await spListExpensesYear(env, actorId, year);
+  if (!exp.ok) return json({ error: 'expenses_failed', status: exp.status }, 500);
+
+  const animals = await spListAnimalsBasis(env, actorId);
+  if (!animals.ok) return json({ error: 'animals_failed', status: animals.status }, 500);
+
+  const ranchMap = await spListRanchMap(env, actorId);
+  if (!ranchMap.ok) return json({ error: 'ranch_map_failed', status: ranchMap.status }, 500);
+
+  const animalNameById = new Map(animals.data.map((a) => [a.id, a.barn_name]));
+
+  // Rollups.
+  const totalsByKey = new Map();
+  const monthlyTotals = new Array(12).fill(0);
+  let grandTotal = 0;
+  for (const row of exp.data) {
+    const amt = Number(row.amount_cents) || 0;
+    grandTotal += amt;
+    const m = Number(row.occurred_on.slice(5, 7)) - 1;
+    if (m >= 0 && m < 12) monthlyTotals[m] += amt;
+
+    let key;
+    let label;
+    if (groupBy === 'category') {
+      key = row.category;
+      label = row.category;
+    } else if (groupBy === 'animal') {
+      key = row.animal_id;
+      label = animalNameById.get(row.animal_id) || '(unknown)';
+    } else {
+      key = ranchMap.data.byAnimal.get(row.animal_id) || 'unassigned';
+      label = ranchMap.data.ranchNames.get(key) || 'Unassigned';
+    }
+    const prev = totalsByKey.get(key) || { key, label, total_cents: 0, entry_count: 0 };
+    prev.total_cents += amt;
+    prev.entry_count += 1;
+    totalsByKey.set(key, prev);
+  }
+
+  const totals = Array.from(totalsByKey.values()).sort((a, b) => b.total_cents - a.total_cents);
+  const monthlyTimeline = monthlyTotals.map((v, i) => ({
+    month: `${year}-${String(i + 1).padStart(2, '0')}`,
+    total_cents: v,
+  }));
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.spending.read',
+    target_table: 'expenses', target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { year, group_by: groupBy, entry_count: exp.data.length, grand_total_cents: grandTotal },
+  }, ctx);
+
+  return json({
+    year,
+    group_by: groupBy,
+    grand_total_cents: grandTotal,
+    totals,
+    monthly_timeline: monthlyTimeline,
+    categories: EXPENSE_CATEGORIES,
+  });
+}
+
+async function handleSpendingCsv(request, env, url, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const year = Number(url.searchParams.get('year'));
+  if (!validYear(year)) return json({ error: 'bad_year' }, 400);
+
+  const rl = await rateLimit(env, `ratelimit:spending_csv:${actorId}`, SPENDING_EXPORT_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const exp = await spListExpensesYear(env, actorId, year);
+  if (!exp.ok) return json({ error: 'expenses_failed', status: exp.status }, 500);
+
+  const header = [
+    'occurred_on', 'animal_id', 'animal_name', 'category',
+    'amount_cents', 'amount_usd', 'currency', 'vendor', 'notes',
+    'source_invoice_id', 'billable_to_owner', 'recorder_role',
+  ];
+  const lines = [header.join(',')];
+  for (const row of exp.data) {
+    const amountUsd = (Number(row.amount_cents) / 100).toFixed(2);
+    lines.push([
+      csvEscape(row.occurred_on),
+      csvEscape(row.animal_id),
+      csvEscape(row.animal?.barn_name ?? ''),
+      csvEscape(row.category),
+      csvEscape(row.amount_cents),
+      csvEscape(amountUsd),
+      csvEscape('usd'),
+      csvEscape(row.vendor ?? ''),
+      csvEscape(row.notes ?? ''),
+      csvEscape(row.source_invoice_id ?? ''),
+      csvEscape(row.billable_to_owner ? 'true' : 'false'),
+      csvEscape(row.recorder_role ?? ''),
+    ].join(','));
+  }
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.spending.csv_export',
+    target_table: 'expenses', target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { year, row_count: exp.data.length },
+  }, ctx);
+
+  return new Response(lines.join('\n') + '\n', {
+    status: 200,
+    headers: {
+      'content-type': 'text/csv; charset=utf-8',
+      'content-disposition': `attachment; filename="barn-spending-${year}.csv"`,
+      'cache-control': 'no-store',
+    },
+  });
+}
+
+async function handleSpendingPdf(request, env, url, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const year = Number(url.searchParams.get('year'));
+  if (!validYear(year)) return json({ error: 'bad_year' }, 400);
+
+  const rl = await rateLimit(env, `ratelimit:spending_pdf:${actorId}`, SPENDING_EXPORT_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  // TECH_DEBT(phase-8:04-01) — PDF export reuses Module 02 template
+  // pipeline; stubs to 501 until BROWSER binding ships.
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.spending.pdf_export_attempt',
+    target_table: 'audit_log', target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { year, outcome: 'not_implemented' },
+  }, ctx);
+
+  return json({ error: 'pdf_not_implemented', tech_debt: 'phase-8:04-01' }, 501);
+}
+
+async function handleAnimalCostBasisGet(request, env, animalId, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:spending_basis_get:${actorId}`, SPENDING_READ_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const a = await spGetAnimalBasis(env, actorId, animalId);
+  if (!a.ok) return json({ error: 'animal_lookup_failed', status: a.status }, 500);
+  if (!a.data) return json({ error: 'not_found' }, 404);
+
+  const sum = await spSumAnimalSpend(env, animalId);
+  if (!sum.ok) return json({ error: 'sum_failed', status: sum.status }, 500);
+
+  const cumulative = sum.data;
+  let annualized = null;
+  if (a.data.acquired_at) {
+    const daysOwned = Math.max(
+      1,
+      Math.floor((Date.now() - new Date(a.data.acquired_at).getTime()) / (24 * 3600 * 1000))
+    );
+    annualized = Math.round((cumulative * 365) / daysOwned);
+  }
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.spending.cost_basis_read',
+    target_table: 'animals', target_id: animalId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: {},
+  }, ctx);
+
+  return json({
+    animal: a.data,
+    cumulative_spend_cents: cumulative,
+    annualized_spend_cents: annualized,
+  });
+}
+
+async function handleAnimalCostBasisPatch(request, env, animalId, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:spending_basis_patch:${actorId}`, SPENDING_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const errs = [];
+  const patch = {};
+
+  if (body?.acquired_at !== undefined) {
+    if (body.acquired_at === null) {
+      patch.acquired_at = null;
+    } else if (typeof body.acquired_at !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.acquired_at)) {
+      errs.push('acquired_at must be YYYY-MM-DD');
+    } else {
+      patch.acquired_at = body.acquired_at;
+    }
+  }
+  if (body?.acquired_price_cents !== undefined) {
+    if (body.acquired_price_cents === null) {
+      patch.acquired_price_cents = null;
+    } else if (!Number.isInteger(body.acquired_price_cents) || body.acquired_price_cents < 0) {
+      errs.push('acquired_price_cents must be integer >= 0 or null');
+    } else {
+      patch.acquired_price_cents = body.acquired_price_cents;
+    }
+  }
+  if (body?.disposition !== undefined) {
+    if (body.disposition === null) {
+      patch.disposition = null;
+    } else if (!DISPOSITION_VALUES.includes(body.disposition)) {
+      errs.push(`disposition must be one of: ${DISPOSITION_VALUES.join(', ')}`);
+    } else {
+      patch.disposition = body.disposition;
+    }
+  }
+  if (body?.disposition_at !== undefined) {
+    if (body.disposition_at === null) {
+      patch.disposition_at = null;
+    } else if (typeof body.disposition_at !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.disposition_at)) {
+      errs.push('disposition_at must be YYYY-MM-DD');
+    } else {
+      patch.disposition_at = body.disposition_at;
+    }
+  }
+  if (body?.disposition_amount_cents !== undefined) {
+    if (body.disposition_amount_cents === null) {
+      patch.disposition_amount_cents = null;
+    } else if (!Number.isInteger(body.disposition_amount_cents) || body.disposition_amount_cents < 0) {
+      errs.push('disposition_amount_cents must be integer >= 0 or null');
+    } else {
+      patch.disposition_amount_cents = body.disposition_amount_cents;
+    }
+  }
+
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+  if (Object.keys(patch).length === 0) return json({ error: 'no_fields' }, 400);
+
+  // App-level enforcement of the "disposition_at implies non-still-owned"
+  // rule before the DB constraint fires — gives a Zod-style 400.
+  const effectiveDisp = patch.disposition !== undefined
+    ? patch.disposition
+    : undefined;
+  const effectiveDispAt = patch.disposition_at !== undefined
+    ? patch.disposition_at
+    : undefined;
+  if (effectiveDispAt !== undefined && effectiveDispAt !== null) {
+    if (effectiveDisp === undefined) {
+      // Need to know the current row's disposition.
+      const cur = await spGetAnimalBasis(env, actorId, animalId);
+      if (!cur.ok) return json({ error: 'animal_lookup_failed', status: cur.status }, 500);
+      if (!cur.data) return json({ error: 'not_found' }, 404);
+      if (!cur.data.disposition || cur.data.disposition === 'still_owned') {
+        return json({
+          error: 'validation_failed',
+          errors: ['disposition_at requires a non-still_owned disposition'],
+        }, 400);
+      }
+    } else if (effectiveDisp === 'still_owned' || effectiveDisp === null) {
+      return json({
+        error: 'validation_failed',
+        errors: ['disposition_at requires a non-still_owned disposition'],
+      }, 400);
+    }
+  }
+
+  const owned = await spGetAnimalBasis(env, actorId, animalId);
+  if (!owned.ok) return json({ error: 'animal_lookup_failed', status: owned.status }, 500);
+  if (!owned.data) return json({ error: 'not_found' }, 404);
+
+  const r = await spPatchAnimalBasis(env, animalId, patch);
+  if (!r.ok || !r.data) return json({ error: 'patch_failed', status: r.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.spending.cost_basis_update',
+    target_table: 'animals', target_id: animalId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { fields: Object.keys(patch) },
+  }, ctx);
+
+  return json({ animal: r.data });
+}
+
+/* =============================================================
+   Phase 8 Module 05 — Barn Mode subscription + SL comp + promo
+   ============================================================= */
+
+const SUBSCRIPTION_READ_RATE   = { limit: 60, windowSec: 60 };
+const SUBSCRIPTION_WRITE_RATE  = { limit: 10, windowSec: 60 };
+const PROMO_REDEEM_RATE        = { limit: 10, windowSec: 300 };
+const SL_WRITE_RATE            = { limit: 10, windowSec: 60 };
+const ADMIN_PROMO_WRITE_RATE   = { limit: 30, windowSec: 60 };
+
+async function requireSilverLiningAdmin(request, env) {
+  const authHeader = request.headers.get('authorization') || '';
+  const jwt = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  if (!jwt) throw json({ error: 'unauthorized' }, 401);
+
+  const who = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+    headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${jwt}` },
+  });
+  if (!who.ok) throw json({ error: 'unauthorized' }, 401);
+  const whoData = await who.json().catch(() => null);
+  const actorId = whoData?.id;
+  if (!actorId) throw json({ error: 'unauthorized' }, 401);
+
+  const profileRes = await supabaseSelect(
+    env,
+    'user_profiles',
+    `select=role,status&user_id=eq.${encodeURIComponent(actorId)}&limit=1`,
+    { serviceRole: true }
+  );
+  const profile = Array.isArray(profileRes.data) ? profileRes.data[0] : null;
+  if (!profile || profile.role !== 'silver_lining' || profile.status !== 'active') {
+    throw json({ error: 'forbidden' }, 403);
+  }
+  return { actorId, jwt };
+}
+
+async function fetchOwnerEmail(env, jwt) {
+  const who = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+    headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${jwt}` },
+  });
+  if (!who.ok) return null;
+  const d = await who.json().catch(() => null);
+  return d?.email || null;
+}
+
+async function handleSubscriptionGet(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:sub_get:${actorId}`, SUBSCRIPTION_READ_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const sub = await getSubscriptionForOwner(env, actorId);
+  if (!sub.ok) return json({ error: 'sub_lookup_failed', status: sub.status }, 500);
+
+  const horses = await countOwnerHorses(env, actorId);
+  const events = await listEntitlementEvents(env, actorId, 20);
+  const link   = await getSilverLiningLinkForOwner(env, actorId);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.subscription.read',
+    target_table: 'subscriptions', target_id: sub.data?.id ?? null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { has_sub: !!sub.data, horse_count: horses.data },
+  }, ctx);
+
+  return json({
+    subscription:      sub.data || null,
+    horse_count:       horses.data,
+    horse_limit_free:  3,
+    on_barn_mode:      ownerHasBarnMode(sub.data),
+    silver_lining:     link.data || null,
+    entitlement_events: events.data || [],
+    stripe_configured: isStripePlatformConfigured(env),
+  });
+}
+
+async function handleSubscriptionCheckout(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId, jwt;
+  try { ({ actorId, jwt } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:sub_checkout:${actorId}`, SUBSCRIPTION_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  if (!isStripePlatformConfigured(env)) {
+    // TECH_DEBT(phase-8:05-01) — STRIPE_PRICE_BARN_MODE_MONTHLY not provisioned.
+    ctx_audit(env, {
+      actor_id: actorId, actor_role: 'owner',
+      action: 'barn.subscription.checkout_unconfigured',
+      target_table: 'subscriptions', target_id: null,
+      ip: clientIp(request),
+      user_agent: request.headers.get('user-agent') || null,
+      metadata: { tech_debt: 'phase-8:05-01' },
+    }, ctx);
+    return json({ error: 'stripe_not_configured', tech_debt: 'phase-8:05-01' }, 501);
+  }
+
+  let body;
+  try { body = await request.json(); } catch { body = {}; }
+  const price = body?.price === 'annual' ? 'annual' : 'monthly';
+  const priceId = price === 'annual'
+    ? env.STRIPE_PRICE_BARN_MODE_ANNUAL
+    : env.STRIPE_PRICE_BARN_MODE_MONTHLY;
+  if (!priceId) {
+    return json({ error: 'stripe_price_missing', tech_debt: 'phase-8:05-01' }, 501);
+  }
+
+  const sub = await getSubscriptionForOwner(env, actorId);
+  if (!sub.ok) return json({ error: 'sub_lookup_failed' }, 500);
+  const email = await fetchOwnerEmail(env, jwt);
+  const custRes = await ensurePlatformStripeCustomer(env, {
+    ownerId: actorId,
+    email,
+    existingCustomerId: sub.data?.stripe_customer_id || null,
+  });
+  if (!custRes.ok) return json({ error: 'stripe_customer_failed', status: custRes.status, message: custRes.message }, 502);
+  const customerId = custRes.data?.id;
+
+  const base = env.PUBLIC_APP_URL || 'https://maneline.co';
+  const successUrl = `${base}/app/settings/subscription?stripe=success&session_id={CHECKOUT_SESSION_ID}`;
+  const cancelUrl  = `${base}/app/settings/subscription?stripe=cancel`;
+
+  const sess = await createBarnModeCheckoutSession(env, {
+    ownerId: actorId,
+    customerId,
+    priceId,
+    successUrl,
+    cancelUrl,
+    idempotencyKey: `barn_mode_checkout:${actorId}:${price}`,
+  });
+  if (!sess.ok) return json({ error: 'stripe_checkout_failed', status: sess.status, message: sess.message }, 502);
+
+  if (!sub.data) {
+    await insertSubscriptionRow(env, {
+      owner_id: actorId,
+      tier: 'free',
+      status: 'active',
+      stripe_customer_id: customerId,
+    });
+  } else if (!sub.data.stripe_customer_id) {
+    await patchSubscription(env, sub.data.id, { stripe_customer_id: customerId });
+  }
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.subscription.checkout_start',
+    target_table: 'subscriptions', target_id: sub.data?.id ?? null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { price, session_id: sess.data?.id },
+  }, ctx);
+
+  return json({ checkout_url: sess.data?.url, session_id: sess.data?.id });
+}
+
+async function handleSubscriptionPortal(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:sub_portal:${actorId}`, SUBSCRIPTION_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  if (!env.STRIPE_SECRET_KEY) {
+    return json({ error: 'stripe_not_configured', tech_debt: 'phase-8:05-01' }, 501);
+  }
+
+  const sub = await getSubscriptionForOwner(env, actorId);
+  if (!sub.ok) return json({ error: 'sub_lookup_failed' }, 500);
+  if (!sub.data?.stripe_customer_id) {
+    return json({ error: 'no_stripe_customer' }, 400);
+  }
+
+  const base = env.PUBLIC_APP_URL || 'https://maneline.co';
+  const portal = await createBillingPortalSession(env, {
+    customerId: sub.data.stripe_customer_id,
+    returnUrl: `${base}/app/settings/subscription`,
+  });
+  if (!portal.ok) return json({ error: 'stripe_portal_failed', status: portal.status, message: portal.message }, 502);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.subscription.portal_open',
+    target_table: 'subscriptions', target_id: sub.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: {},
+  }, ctx);
+
+  return json({ portal_url: portal.data?.url });
+}
+
+async function handlePromoRedeem(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:promo_redeem:${actorId}`, PROMO_REDEEM_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const raw = typeof body?.code === 'string' ? body.code.trim().toUpperCase() : '';
+  if (!raw || raw.length > 32) return json({ error: 'bad_code' }, 400);
+
+  const promo = await findPromoByCode(env, raw);
+  if (!promo.ok) return json({ error: 'promo_lookup_failed' }, 500);
+  if (!promo.data) return json({ error: 'invalid_code' }, 404);
+
+  if (promo.data.redeemed_at && promo.data.single_use) {
+    return json({ error: 'already_redeemed' }, 409);
+  }
+  if (promo.data.expires_at && new Date(promo.data.expires_at).getTime() < Date.now()) {
+    return json({ error: 'expired' }, 410);
+  }
+
+  if (promo.data.single_use) {
+    const claim = await markPromoRedeemed(env, promo.data.id, actorId);
+    if (!claim.ok || !claim.data) {
+      return json({ error: 'already_redeemed' }, 409);
+    }
+  }
+
+  const sub = await getSubscriptionForOwner(env, actorId);
+  if (!sub.ok) return json({ error: 'sub_lookup_failed' }, 500);
+
+  const months = promo.data.grants_barn_mode_months;
+  const expiresAt = new Date(Date.now() + months * 30 * 24 * 3600 * 1000).toISOString();
+  const patch = {
+    tier: 'barn_mode',
+    status: 'active',
+    comp_source: 'promo_code',
+    comp_campaign: promo.data.campaign,
+    comp_expires_at: expiresAt,
+  };
+
+  const prev = sub.data;
+  const next = prev
+    ? await patchSubscription(env, prev.id, patch)
+    : await insertSubscriptionRow(env, { owner_id: actorId, ...patch });
+  if (!next.ok || !next.data) {
+    return json({ error: 'sub_patch_failed' }, 500);
+  }
+
+  await insertEntitlementEvent(env, {
+    owner_id: actorId,
+    event: 'comp_attached',
+    reason: `promo_code:${promo.data.campaign}`,
+    source: 'promo_code',
+    prev_tier: prev?.tier ?? null,
+    next_tier: 'barn_mode',
+    prev_comp_source: prev?.comp_source ?? null,
+    next_comp_source: 'promo_code',
+    metadata: { code: promo.data.code, months, campaign: promo.data.campaign },
+  });
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.promo_code.redeem',
+    target_table: 'promo_codes', target_id: promo.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { campaign: promo.data.campaign, months },
+  }, ctx);
+
+  return json({
+    status: 'redeemed',
+    comp_source: 'promo_code',
+    comp_campaign: promo.data.campaign,
+    comp_expires_at: expiresAt,
+  });
+}
+
+// Silver Lining endpoints — the happy path needs the Shopify admin
+// token, which is a 🔴 dependency in the tech-debt ledger (phase-8:05-03).
+// Until that token lands, we keep the routes wired but return 501 with
+// the TECH_DEBT slug so the SPA shows the "coming soon" state.
+async function handleSilverLiningLink(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:sl_link:${actorId}`, SL_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  if (!env.SILVER_LINING_SHOPIFY_ADMIN_TOKEN || !env.SILVER_LINING_SHOPIFY_STORE_DOMAIN) {
+    ctx_audit(env, {
+      actor_id: actorId, actor_role: 'owner',
+      action: 'barn.silver_lining.link_unconfigured',
+      target_table: 'silver_lining_links', target_id: null,
+      ip: clientIp(request),
+      user_agent: request.headers.get('user-agent') || null,
+      metadata: { tech_debt: 'phase-8:05-03' },
+    }, ctx);
+    return json({ error: 'silver_lining_not_configured', tech_debt: 'phase-8:05-03' }, 501);
+  }
+
+  // When the Shopify token is live, this handler verifies the email +
+  // order number via Shopify Admin API, creates a platform SetupIntent
+  // so the card is on file for conversion, and returns both identifiers
+  // for the SPA's confirm step. The verification + link-insert body is
+  // TECH_DEBT(phase-8:05-04) — see ledger for the remaining work.
+  return json({ error: 'silver_lining_link_pending', tech_debt: 'phase-8:05-04' }, 501);
+}
+
+async function handleSilverLiningLinkConfirm(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:sl_link_confirm:${actorId}`, SL_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.silver_lining.link_confirm_unconfigured',
+    target_table: 'silver_lining_links', target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { tech_debt: 'phase-8:05-04' },
+  }, ctx);
+  return json({ error: 'silver_lining_link_pending', tech_debt: 'phase-8:05-04' }, 501);
+}
+
+async function handleSilverLiningStatus(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:sl_status:${actorId}`, SUBSCRIPTION_READ_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const link = await getSilverLiningLinkForOwner(env, actorId);
+  if (!link.ok) return json({ error: 'sl_lookup_failed' }, 500);
+
+  return json({ silver_lining: link.data || null });
+}
+
+async function handleSilverLiningUnlink(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:sl_unlink:${actorId}`, SL_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const link = await getSilverLiningLinkForOwner(env, actorId);
+  if (!link.ok) return json({ error: 'sl_lookup_failed' }, 500);
+  if (!link.data) return json({ error: 'not_linked' }, 404);
+  if (new Date(link.data.sticky_until).getTime() > Date.now()) {
+    return json({ error: 'sticky', sticky_until: link.data.sticky_until }, 409);
+  }
+
+  const upd = await patchSilverLiningLink(env, link.data.id, {
+    archived_at: new Date().toISOString(),
+  });
+  if (!upd.ok) return json({ error: 'unlink_failed' }, 500);
+
+  const sub = await getSubscriptionForOwner(env, actorId);
+  if (sub.ok && sub.data?.comp_source === 'silver_lining_sns') {
+    await patchSubscription(env, sub.data.id, {
+      comp_source: null,
+      comp_expires_at: null,
+    });
+    await insertEntitlementEvent(env, {
+      owner_id: actorId,
+      event: 'comp_detached',
+      reason: 'user_unlink',
+      source: 'user_action',
+      prev_tier: sub.data.tier,
+      next_tier: sub.data.tier,
+      prev_comp_source: 'silver_lining_sns',
+      next_comp_source: null,
+      metadata: {},
+    });
+  }
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.silver_lining.unlink',
+    target_table: 'silver_lining_links', target_id: link.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: {},
+  }, ctx);
+
+  return json({ status: 'unlinked' });
+}
+
+async function handleSilverLiningVerifyTick(request, env, ctx) {
+  const gate = await requireInternalSecret(request, env);
+  if (gate) return gate;
+
+  if (!env.SILVER_LINING_SHOPIFY_ADMIN_TOKEN || !env.SILVER_LINING_SHOPIFY_STORE_DOMAIN) {
+    // TECH_DEBT(phase-8:05-04) — cron body depends on SL token delivery.
+    return json({ error: 'silver_lining_not_configured', tech_debt: 'phase-8:05-04' }, 501);
+  }
+
+  // Live body: loop every silver_lining_links row (archived_at is null
+  // AND (last_verified_at is null OR last_verified_at < now() - 22h)),
+  // hit Shopify /customers/:id/subscription_contracts, apply the
+  // grant / grace / convert state machine described in §E of the spec.
+  ctx_audit(env, {
+    actor_id: null, actor_role: 'system',
+    action: 'barn.silver_lining.cron_tick_pending',
+    target_table: 'silver_lining_links', target_id: null,
+    ip: clientIp(request),
+    user_agent: 'pg_cron',
+    metadata: { tech_debt: 'phase-8:05-04' },
+  }, ctx);
+  return json({ error: 'sl_cron_pending', tech_debt: 'phase-8:05-04' }, 501);
+}
+
+async function handleAdminPromoCodesList(request, env, url, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireSilverLiningAdmin(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const campaign = url.searchParams.get('campaign') || null;
+  const rows = await listPromoCodes(env, campaign);
+  if (!rows.ok) return json({ error: 'promo_list_failed' }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'silver_lining',
+    action: 'admin.promo_codes.list',
+    target_table: 'promo_codes', target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { campaign, row_count: rows.data.length },
+  }, ctx);
+
+  return json({ codes: rows.data });
+}
+
+async function handleAdminPromoCodesCreate(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireSilverLiningAdmin(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:admin_promo_create:${actorId}`, ADMIN_PROMO_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+  const campaign = typeof body?.campaign === 'string' ? body.campaign.trim() : '';
+  const months = Number(body?.grants_barn_mode_months);
+  const count = Math.max(1, Math.min(500, Number(body?.count) || 1));
+  const singleUse = body?.single_use !== false;
+  const notes = typeof body?.notes === 'string' ? body.notes.trim().slice(0, 500) : null;
+  let expiresAt = null;
+  if (typeof body?.expires_at === 'string' && body.expires_at.trim()) {
+    const d = new Date(body.expires_at);
+    if (!Number.isNaN(d.getTime())) expiresAt = d.toISOString();
+  }
+
+  if (!campaign || campaign.length > 64) return json({ error: 'bad_campaign' }, 400);
+  if (!Number.isFinite(months) || months < 1 || months > 36) return json({ error: 'bad_months' }, 400);
+
+  const rows = [];
+  for (let i = 0; i < count; i++) {
+    rows.push({
+      code: generatePromoCode(),
+      campaign,
+      grants_barn_mode_months: months,
+      single_use: singleUse,
+      expires_at: expiresAt,
+      created_by: actorId,
+      notes,
+    });
+  }
+  const ins = await insertPromoCodesBulk(env, rows);
+  if (!ins.ok) return json({ error: 'promo_insert_failed', status: ins.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'silver_lining',
+    action: 'admin.promo_codes.create',
+    target_table: 'promo_codes', target_id: null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { campaign, months, count, single_use: singleUse },
+  }, ctx);
+
+  return json({ codes: ins.data }, 201);
 }

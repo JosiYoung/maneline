@@ -9,6 +9,7 @@ import OnboardingIndex from './OnboardingIndex';
 import OnCallIndex from './OnCallIndex';
 import OrdersIndex from './OrdersIndex';
 import PlatformFeesIndex from './PlatformFeesIndex';
+import PromoCodesIndex from './PromoCodesIndex';
 import SubscriptionsIndex from './SubscriptionsIndex';
 import SubscriptionDetail from './SubscriptionDetail';
 import SupportTicketsIndex from './SupportTicketsIndex';
@@ -31,6 +32,7 @@ const TABS = [
   { to: '/admin/orders', label: 'Orders', end: false },
   { to: '/admin/invoices', label: 'Invoices', end: false },
   { to: '/admin/subscriptions', label: 'Subscriptions', end: false },
+  { to: '/admin/promo-codes', label: 'Promo codes', end: false },
   { to: '/admin/support', label: 'Support', end: false },
   { to: '/admin/on-call', label: 'On-call', end: false },
   { to: '/admin/settings/fees', label: 'Fees', end: false },
@@ -69,6 +71,7 @@ export default function AdminIndex() {
           <Route path="invoices" element={<InvoicesIndex />} />
           <Route path="subscriptions" element={<SubscriptionsIndex />} />
           <Route path="subscriptions/:id" element={<SubscriptionDetail />} />
+          <Route path="promo-codes" element={<PromoCodesIndex />} />
           <Route path="support" element={<SupportTicketsIndex />} />
           <Route path="on-call" element={<OnCallIndex />} />
           <Route path="settings/fees" element={<PlatformFeesIndex />} />

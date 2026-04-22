@@ -239,6 +239,44 @@ Deno.serve(async (_req) => {
       "on_call_schedule",
       "sms_dispatches",
       "stripe_subscriptions",
+      // Phase 7 — trainer business (invoices, recurring line items,
+      // invoice settings + branding). No card data — Stripe ids and
+      // cents amounts only.
+      "invoices",
+      "invoice_line_items",
+      "recurring_line_items",
+      "trainer_invoice_settings",
+      "trainer_customer_map",
+      "trainer_goals",
+      // Phase 8 Module 01 — Barn Calendar + Professional Contacts.
+      "professional_contacts",
+      "barn_event_recurrence_rules",
+      "barn_events",
+      "barn_event_attendees",
+      "barn_event_responses",
+      "barn_event_notifications_log",
+      "user_notification_prefs",
+      // Phase 8 Module 02 — Herd Health dashboard. Thresholds are
+      // per-owner overrides; acknowledgements carry snoozed / dismissed
+      // cells (owner action).
+      "health_thresholds",
+      "health_dashboard_acknowledgements",
+      // Phase 8 Module 03 — Facility Map + Care Matrix.
+      "stalls",
+      "stall_assignments",
+      "turnout_groups",
+      "turnout_group_members",
+      "care_matrix_entries",
+      // Phase 8 Module 04 — Barn Spending cost-basis overlay (expenses
+      // table is already backed up above).
+      "animal_cost_basis",
+      // Phase 8 Module 05 — subscriptions (Barn Mode entitlement entity,
+      // NOT the Phase 6.5 stripe_subscriptions cache), SL link ledger,
+      // promo codes, and append-only entitlement-events audit.
+      "subscriptions",
+      "silver_lining_links",
+      "promo_codes",
+      "barn_mode_entitlement_events",
     ] as const;
 
     // Per-table sort override. Most tables sort by created_at (default).
@@ -272,7 +310,7 @@ Deno.serve(async (_req) => {
       source: "supabase",
       tables: [...TABLES],
       generator: "maneline-nightly-backup",
-      version: "6.0",
+      version: "8.0",
     };
     for (const t of TABLES) manifest[`${t}_count`] = tableData[t].length;
 

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -14,9 +15,11 @@ import {
   ANIMALS_QUERY_KEY,
   createAnimal,
   updateAnimal,
+  BarnModeRequiredError,
   type Animal,
   type AnimalInput,
 } from "@/lib/animals";
+import { BarnModePaywallDialog } from "./BarnModePaywallDialog";
 
 // Species → allowed sex values. Keeps the Sex select honest (no
 // dog-shaped "stallion" entries).
@@ -68,6 +71,9 @@ export type AnimalFormProps =
 export function AnimalForm(props: AnimalFormProps) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const [paywall, setPaywall] = useState<{ open: boolean; count: number | null }>({
+    open: false, count: null,
+  });
 
   const {
     register,
@@ -105,6 +111,10 @@ export function AnimalForm(props: AnimalFormProps) {
       navigate(props.mode === "create" ? "/app/animals" : `/app/animals/${animal.id}`);
     },
     onError: (err) => {
+      if (err instanceof BarnModeRequiredError) {
+        setPaywall({ open: true, count: err.currentHorseCount });
+        return;
+      }
       notify.error(mapSupabaseError(err as Error));
     },
   });
@@ -112,6 +122,12 @@ export function AnimalForm(props: AnimalFormProps) {
   const disabled = isSubmitting || mutation.isPending;
 
   return (
+    <>
+    <BarnModePaywallDialog
+      open={paywall.open}
+      onClose={() => setPaywall({ open: false, count: null })}
+      currentHorseCount={paywall.count}
+    />
     <form
       onSubmit={handleSubmit((values) => mutation.mutate(values))}
       className="space-y-5"
@@ -206,6 +222,7 @@ export function AnimalForm(props: AnimalFormProps) {
         </Button>
       </div>
     </form>
+    </>
   );
 }
 

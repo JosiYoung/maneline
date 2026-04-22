@@ -27,6 +27,29 @@ export type AnimalInput = {
 
 export const ANIMALS_QUERY_KEY = ["animals"] as const;
 
+// Phase 8 — the DB trigger `enforce_horse_limit` raises P0001 with message
+// `barn_mode_required: ...` when a free-tier owner tries to add a 4th horse.
+// The SPA hard-paywall dialog catches this specific error type.
+export class BarnModeRequiredError extends Error {
+  readonly currentHorseCount: number | null;
+  constructor(message: string, currentHorseCount: number | null) {
+    super(message);
+    this.name = "BarnModeRequiredError";
+    this.currentHorseCount = currentHorseCount;
+  }
+}
+
+function isBarnModePaywallError(err: unknown): { horseCount: number | null } | null {
+  if (!err || typeof err !== "object") return null;
+  const anyErr = err as { message?: unknown; code?: unknown };
+  const msg = typeof anyErr.message === "string" ? anyErr.message : "";
+  if (!msg.startsWith("barn_mode_required")) return null;
+  // Message format: `barn_mode_required: owner <uuid> has <N> horses and no Barn Mode subscription`
+  const m = /has\s+(\d+)\s+horses/.exec(msg);
+  const n = m ? Number(m[1]) : NaN;
+  return { horseCount: Number.isFinite(n) ? n : null };
+}
+
 export async function listAnimals(options: { includeArchived?: boolean } = {}): Promise<Animal[]> {
   const { includeArchived = false } = options;
 
@@ -74,7 +97,16 @@ export async function createAnimal(input: AnimalInput): Promise<Animal> {
     .insert(row)
     .select("*")
     .single();
-  if (error) throw error;
+  if (error) {
+    const paywall = isBarnModePaywallError(error);
+    if (paywall) {
+      throw new BarnModeRequiredError(
+        "Barn Mode is required to track more than 3 horses.",
+        paywall.horseCount,
+      );
+    }
+    throw error;
+  }
   return data;
 }
 
