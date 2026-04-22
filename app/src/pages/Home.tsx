@@ -27,7 +27,7 @@ export default function Home() {
       <main style={{ background: 'var(--color-bg)', color: 'var(--color-ink)' }}>
         <StoryBand />
         <TodayChapter />
-        <ProtocolBrainChapter />
+        <ProtocolLibraryChapter />
         <TrainerChapter authed={authed} />
         <VetChapter />
         <MarketplaceChapter />
@@ -230,7 +230,7 @@ function ChaosScene() {
   return (
     <section
       data-scene="1"
-      className="relative flex h-screen items-center px-6 md:px-16"
+      className="relative flex h-[85vh] items-center px-6 md:px-16"
     >
       <div className="max-w-xl">
         <div
@@ -276,7 +276,7 @@ function OnePageScene() {
   return (
     <section
       data-scene="2"
-      className="relative flex h-screen items-end px-6 pb-28 md:px-16"
+      className="relative flex h-[85vh] items-center px-6 md:px-16"
     >
       <div className="max-w-2xl">
         <h2
@@ -575,9 +575,9 @@ function AnimalCard(props: {
   );
 }
 
-/* ---- Chapter 2 — Protocol Brain ------------------------------- */
+/* ---- Chapter 2 — Protocol Library ----------------------------- */
 
-function ProtocolBrainChapter() {
+function ProtocolLibraryChapter() {
   return (
     <section
       style={{
@@ -613,9 +613,9 @@ function ProtocolBrainChapter() {
                 marginBottom: 20,
               }}
             >
-              Tell Protocol Brain in plain English. It searches a library of
-              200+ numbered equine-herbal protocols, cites the one that fits,
-              and hands you a plan. One tap adds the right supplements to your
+              Ask the Protocol Library in plain English. It searches 200+
+              numbered equine-herbal protocols, cites the one that fits, and
+              hands you a plan. One tap adds the right supplements to your
               order and schedules the daily dose.
             </p>
             <BulletList
@@ -675,8 +675,8 @@ function ChatCard() {
           🌿
         </div>
         <div>
-          <div style={{ fontWeight: 700, fontSize: 14 }}>Protocol Brain</div>
-          <div style={{ fontSize: 11, opacity: 0.7 }}>Protocol Brain · always awake</div>
+          <div style={{ fontWeight: 700, fontSize: 14 }}>Protocol Library</div>
+          <div style={{ fontSize: 11, opacity: 0.7 }}>Protocol Library · always open</div>
         </div>
       </div>
 
@@ -684,12 +684,12 @@ function ChatCard() {
         My mare&apos;s been grumpy under saddle and off her feed since the
         weather turned. Nothing&apos;s wrong on the scope.
       </ChatBubble>
-      <ChatBubble side="brain">
+      <ChatBubble side="lib">
         Sounds like a classic seasonal gut story. Start with{' '}
         <strong>Protocol #14 — Gastric Comfort</strong>, 30 days, plus a
         magnesium top-dress for the mood piece.
       </ChatBubble>
-      <ChatBubble side="brain">
+      <ChatBubble side="lib">
         Want me to add both to your next order and schedule the daily dose on
         her Today card?
       </ChatBubble>
@@ -730,7 +730,7 @@ function ChatBubble({
   side,
   children,
 }: {
-  side: 'you' | 'brain';
+  side: 'you' | 'lib';
   children: React.ReactNode;
 }) {
   const isYou = side === 'you';
@@ -1046,7 +1046,7 @@ function MarketplaceChapter() {
         <ChapterBody>
           Twenty-five years of equine herbal blends, finally sitting on the
           same screen as your horse&apos;s daily chart. Browse, get a
-          recommendation from Protocol Brain, buy, and log the dose — all in
+          recommendation from the Protocol Library, buy, and log the dose — all in
           the same two taps.
         </ChapterBody>
       </div>
@@ -1230,7 +1230,7 @@ function HowItWorksChapter() {
     {
       n: '4',
       t: 'Ride on with the barn in your pocket',
-      b: 'Today view, Protocol Brain, invoices, records — all in one app.',
+      b: 'Today view, Protocol Library, invoices, records — all in one app.',
     },
   ];
   return (
@@ -1455,7 +1455,7 @@ function PricingChapter() {
               'Unlimited animals',
               'Today view, records, photo timeline',
               'Records export to PDF',
-              'Protocol Brain chat (50 msgs / mo)',
+              'Protocol Library chat (50 msgs / mo)',
               'Invite unlimited trainers & vets',
             ]}
             cta={{ label: 'Start free', to: '/signup' }}
@@ -1613,7 +1613,7 @@ function FAQChapter() {
   const faqs = [
     {
       q: 'Is Mane Line really free for owners?',
-      a: 'Yes. Always. Unlimited animals, unlimited records, unlimited trainer & vet invites. Protocol Brain has a generous message cap; heavy users can upgrade, but nothing core is paywalled.',
+      a: 'Yes. Always. Unlimited animals, unlimited records, unlimited trainer & vet invites. The Protocol Library chat has a generous message cap; heavy users can upgrade, but nothing core is paywalled.',
     },
     {
       q: 'Am I locked into any one supplement brand?',
