@@ -24,6 +24,7 @@ import {
   listExpensesForSession,
 } from "@/lib/expenses";
 import type { SessionStatus } from "@/lib/database.types";
+import { RatingPrompt } from "@/components/ratings/RatingPrompt";
 
 // SessionDetail — /trainer/sessions/:id.
 //
@@ -184,6 +185,13 @@ export default function SessionDetail() {
               )}
             </CardContent>
           </Card>
+
+          <RatingPrompt
+            sessionId={q.data.id}
+            rateeId={q.data.owner_id}
+            rateeLabel="the owner"
+            eligible={q.data.status === "approved" || q.data.status === "paid"}
+          />
 
           <div className="flex flex-wrap items-center justify-end gap-3">
             <Button asChild variant="outline">

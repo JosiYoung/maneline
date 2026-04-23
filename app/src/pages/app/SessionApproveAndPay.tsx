@@ -32,6 +32,7 @@ import { notify } from "@/lib/toast";
 import { mapSupabaseError } from "@/lib/errors";
 import { EXPENSES_QUERY_KEY, listExpensesForSession } from "@/lib/expenses";
 import { ExpensesList } from "@/components/expenses/ExpensesList";
+import { RatingPrompt } from "@/components/ratings/RatingPrompt";
 
 // SessionApproveAndPay — /app/sessions/:id/pay
 //
@@ -220,6 +221,13 @@ export default function SessionApproveAndPay() {
           amountLabel={amountLabel ?? undefined}
         />
       )}
+
+      <RatingPrompt
+        sessionId={session.id}
+        rateeId={session.trainer_id}
+        rateeLabel={session.trainer_display_name ?? "the trainer"}
+        eligible={session.status === "approved" || session.status === "paid"}
+      />
     </div>
   );
 }
