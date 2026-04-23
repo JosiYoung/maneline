@@ -31,6 +31,7 @@ import {
   type Animal,
 } from "@/lib/trainerAnimals";
 import { ProtocolsSection } from "@/components/owner/ProtocolsSection";
+import { HorseMessageThread } from "@/components/messaging/HorseMessageThread";
 
 // AnimalReadOnly — /trainer/animals/:id.
 //
@@ -120,6 +121,7 @@ export default function AnimalReadOnly() {
               <TabsTrigger value="sessions">Sessions</TabsTrigger>
               <TabsTrigger value="expenses">Expenses</TabsTrigger>
               <TabsTrigger value="protocols">Protocols</TabsTrigger>
+              <TabsTrigger value="messages">Messages</TabsTrigger>
             </TabsList>
 
             <TabsContent value="protocols">
@@ -225,6 +227,13 @@ export default function AnimalReadOnly() {
                   emptyText="No expenses logged on this animal yet."
                 />
               )}
+            </TabsContent>
+
+            <TabsContent value="messages">
+              <HorseMessageThread
+                animalId={id}
+                animalName={animalQ.data.barn_name}
+              />
             </TabsContent>
           </Tabs>
         </>

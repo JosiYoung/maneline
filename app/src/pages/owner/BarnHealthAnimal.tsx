@@ -18,6 +18,7 @@ import {
   type HerdHealthCell,
   type HerdHealthRecordType,
 } from "@/lib/barn";
+import { HorseMessageThread } from "@/components/messaging/HorseMessageThread";
 
 export default function BarnHealthAnimal() {
   const { id } = useParams<{ id: string }>();
@@ -144,6 +145,16 @@ export default function BarnHealthAnimal() {
               )}
             </CardContent>
           </Card>
+
+          <section aria-labelledby="horse-messages-heading" className="space-y-2">
+            <h2 id="horse-messages-heading" className="font-display text-lg text-primary">
+              Messages
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              Async chat with anyone who has access to {q.data.animal.name}. Text only.
+            </p>
+            <HorseMessageThread animalId={animalId} animalName={q.data.animal.name} />
+          </section>
         </>
       ) : null}
     </div>
