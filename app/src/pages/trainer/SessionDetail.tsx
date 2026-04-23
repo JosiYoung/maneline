@@ -1,11 +1,14 @@
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
-import { ChevronLeft, Clock } from "lucide-react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { ChevronLeft, Clock, Plus } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ArchiveSessionDialog } from "@/components/trainer/ArchiveSessionDialog";
+import { ExpenseForm } from "@/components/expenses/ExpenseForm";
+import { ExpensesList } from "@/components/expenses/ExpensesList";
 
 import {
   SESSIONS_QUERY_KEY,
@@ -16,23 +19,34 @@ import {
   sessionStatusLabel,
   sessionTypeLabel,
 } from "@/lib/sessions";
+import {
+  EXPENSES_QUERY_KEY,
+  listExpensesForSession,
+} from "@/lib/expenses";
 import type { SessionStatus } from "@/lib/database.types";
 
 // SessionDetail — /trainer/sessions/:id.
 //
-// Read-only review of a logged session with an archive affordance.
-// Editing inline is out of scope for Prompt 2.5 (RLS allows UPDATE only
-// while status='logged', so a follow-up prompt can add an edit form
-// once we decide how to present "I already approved this" for the
-// owner). For now: log, review, archive.
+// Trainer view of a logged session. Includes an expenses panel so the
+// trainer can attach incidental costs (supplies ordered, treatments, etc.)
+// directly to this session — visible to the owner on their approve-and-pay
+// view.
 export default function SessionDetail() {
   const { id = "" } = useParams();
+  const queryClient = useQueryClient();
+  const [addingExpense, setAddingExpense] = useState(false);
 
   const q = useQuery({
     queryKey: [...SESSIONS_QUERY_KEY, id],
     queryFn: () => getSession(id),
     enabled: Boolean(id),
     retry: false,
+  });
+
+  const expensesQ = useQuery({
+    queryKey: [...EXPENSES_QUERY_KEY, "session", id],
+    queryFn: () => listExpensesForSession(id),
+    enabled: Boolean(id) && q.isSuccess,
   });
 
   return (
@@ -123,6 +137,53 @@ export default function SessionDetail() {
               </CardContent>
             </Card>
           )}
+
+          {/* Expenses tied to this session */}
+          <Card>
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+              <CardTitle>Session expenses</CardTitle>
+              {!addingExpense && (
+                <Button size="sm" onClick={() => setAddingExpense(true)}>
+                  <Plus size={14} className="mr-1" />
+                  Add expense
+                </Button>
+              )}
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {addingExpense && (
+                <div className="rounded-md border border-accent/40 bg-accent/5 p-4">
+                  <ExpenseForm
+                    animalId={q.data.animal_id}
+                    recorderRole="trainer"
+                    sessionId={id}
+                    onCreated={() => {
+                      setAddingExpense(false);
+                      queryClient.invalidateQueries({
+                        queryKey: [...EXPENSES_QUERY_KEY, "session", id],
+                      });
+                    }}
+                    onCancel={() => setAddingExpense(false)}
+                  />
+                </div>
+              )}
+
+              {expensesQ.isLoading && (
+                <div className="h-16 animate-pulse rounded-md bg-muted/40" />
+              )}
+              {expensesQ.isError && (
+                <p className="text-sm text-destructive">
+                  Couldn't load expenses. Try refreshing.
+                </p>
+              )}
+              {expensesQ.isSuccess && (
+                <ExpensesList
+                  expenses={expensesQ.data}
+                  showAnimal={false}
+                  emptyText="No expenses logged for this session yet."
+                />
+              )}
+            </CardContent>
+          </Card>
 
           <div className="flex flex-wrap items-center justify-end gap-3">
             <Button asChild variant="outline">

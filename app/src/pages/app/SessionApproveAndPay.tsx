@@ -30,6 +30,8 @@ import {
 import { PaymentForm } from "@/components/shared/PaymentForm";
 import { notify } from "@/lib/toast";
 import { mapSupabaseError } from "@/lib/errors";
+import { EXPENSES_QUERY_KEY, listExpensesForSession } from "@/lib/expenses";
+import { ExpensesList } from "@/components/expenses/ExpensesList";
 
 // SessionApproveAndPay — /app/sessions/:id/pay
 //
@@ -51,6 +53,12 @@ export default function SessionApproveAndPay() {
     queryKey: [...SESSIONS_QUERY_KEY, id],
     queryFn: () => getSession(id),
     enabled: Boolean(id),
+  });
+
+  const expensesQuery = useQuery({
+    queryKey: [...EXPENSES_QUERY_KEY, "session", id],
+    queryFn: () => listExpensesForSession(id),
+    enabled: Boolean(id) && sessionQuery.isSuccess,
   });
 
   // Existing payment row (if any). Useful when a user reloads mid-flow.
@@ -150,6 +158,21 @@ export default function SessionApproveAndPay() {
           <StatusRow status={session.status} />
         </CardContent>
       </Card>
+
+      {expensesQuery.isSuccess && expensesQuery.data.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Session expenses</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ExpensesList
+              expenses={expensesQuery.data}
+              showAnimal={false}
+              emptyText=""
+            />
+          </CardContent>
+        </Card>
+      )}
 
       {session.status === "paid" ? (
         <Card>

@@ -18,7 +18,8 @@ export type UploadKind =
   | "vet_record"
   | "animal_photo"
   | "animal_video"
-  | "trainer_logo";
+  | "trainer_logo"
+  | "expense_receipt";
 
 export type PresignResult = {
   put_url: string;
@@ -49,6 +50,11 @@ export type CommitInput =
   | {
       kind: "trainer_logo";
       object_key: string;
+    }
+  | {
+      kind: "expense_receipt";
+      object_key: string;
+      animal_id: string;
     };
 
 export type CommitResult = { id: string; r2_object_id: string };
@@ -153,6 +159,14 @@ export const VET_RECORD_MIME = new Set([
 export const TRAINER_LOGO_MIME = new Set([
   "image/png",
   "image/jpeg",
+  "image/webp",
+]);
+
+export const EXPENSE_RECEIPT_MIME = new Set([
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/heic",
   "image/webp",
 ]);
 

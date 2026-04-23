@@ -120,6 +120,8 @@ export type CreateExpenseInput = {
   notes?: string | null;
   product_id?: string | null;
   order_id?: string | null;
+  receipt_r2_object_id?: string | null;
+  session_id?: string | null;
 };
 
 /**
@@ -147,11 +149,28 @@ export async function createExpense(
       notes:         input.notes ?? null,
       product_id:    input.product_id ?? null,
       order_id:      input.order_id ?? null,
+      receipt_r2_object_id: input.receipt_r2_object_id ?? null,
+      session_id:           input.session_id ?? null,
     })
     .select("*")
     .single();
   if (error) throw error;
   return data as Expense;
+}
+
+/** Expenses tied to a specific training session, newest first. */
+export async function listExpensesForSession(
+  sessionId: string,
+): Promise<ExpenseWithContext[]> {
+  const { data, error } = await supabase
+    .from("expenses")
+    .select("*")
+    .eq("session_id", sessionId)
+    .is("archived_at", null)
+    .order("occurred_on", { ascending: false });
+  if (error) throw error;
+  if (!data || data.length === 0) return [];
+  return decorate(data as Expense[]);
 }
 
 export type UpdateExpenseInput = {

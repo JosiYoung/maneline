@@ -54,7 +54,7 @@ export type Database = {
           owner_id: string
           ranch_id: string | null
           revoked_at: string | null
-          scope: string
+          scope: GrantScope
           trainer_id: string
           updated_at: string
         }
@@ -69,7 +69,7 @@ export type Database = {
           owner_id: string
           ranch_id?: string | null
           revoked_at?: string | null
-          scope: string
+          scope: GrantScope
           trainer_id: string
           updated_at?: string
         }
@@ -84,11 +84,18 @@ export type Database = {
           owner_id?: string
           ranch_id?: string | null
           revoked_at?: string | null
-          scope?: string
+          scope?: GrantScope
           trainer_id?: string
           updated_at?: string
         }
         Relationships: [
+          {
+            foreignKeyName: "animal_access_grants_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
           {
             foreignKeyName: "animal_access_grants_animal_id_fkey"
             columns: ["animal_id"]
@@ -149,6 +156,13 @@ export type Database = {
             foreignKeyName: "animal_archive_events_animal_id_fkey"
             columns: ["animal_id"]
             isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
+          {
+            foreignKeyName: "animal_archive_events_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
             referencedRelation: "animals"
             referencedColumns: ["id"]
           },
@@ -192,6 +206,13 @@ export type Database = {
           updated_at?: string
         }
         Relationships: [
+          {
+            foreignKeyName: "animal_media_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
           {
             foreignKeyName: "animal_media_animal_id_fkey"
             columns: ["animal_id"]
@@ -253,6 +274,13 @@ export type Database = {
             foreignKeyName: "animal_protocols_animal_id_fkey"
             columns: ["animal_id"]
             isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
+          {
+            foreignKeyName: "animal_protocols_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
             referencedRelation: "animals"
             referencedColumns: ["id"]
           },
@@ -267,11 +295,17 @@ export type Database = {
       }
       animals: {
         Row: {
+          acquired_at: string | null
+          acquired_price_cents: number | null
           archived_at: string | null
           barn_name: string
           breed: string | null
+          color_hex: string | null
           created_at: string
           discipline: string | null
+          disposition: string | null
+          disposition_amount_cents: number | null
+          disposition_at: string | null
           id: string
           owner_id: string
           sex: AnimalSex | null
@@ -281,11 +315,17 @@ export type Database = {
           year_born: number | null
         }
         Insert: {
+          acquired_at?: string | null
+          acquired_price_cents?: number | null
           archived_at?: string | null
           barn_name: string
           breed?: string | null
+          color_hex?: string | null
           created_at?: string
           discipline?: string | null
+          disposition?: string | null
+          disposition_amount_cents?: number | null
+          disposition_at?: string | null
           id?: string
           owner_id: string
           sex?: AnimalSex | null
@@ -295,11 +335,17 @@ export type Database = {
           year_born?: number | null
         }
         Update: {
+          acquired_at?: string | null
+          acquired_price_cents?: number | null
           archived_at?: string | null
           barn_name?: string
           breed?: string | null
+          color_hex?: string | null
           created_at?: string
           discipline?: string | null
+          disposition?: string | null
+          disposition_amount_cents?: number | null
+          disposition_at?: string | null
           id?: string
           owner_id?: string
           sex?: AnimalSex | null
@@ -374,6 +420,415 @@ export type Database = {
           user_agent?: string | null
         }
         Relationships: []
+      }
+      barn_event_attendees: {
+        Row: {
+          archived_at: string | null
+          created_at: string
+          current_status: string
+          delivery_channel: string
+          email: string | null
+          event_id: string
+          id: string
+          last_notified_at: string | null
+          linked_user_id: string | null
+          phone_e164: string | null
+          pro_contact_id: string | null
+          public_token: string | null
+          token_expires_at: string | null
+        }
+        Insert: {
+          archived_at?: string | null
+          created_at?: string
+          current_status?: string
+          delivery_channel: string
+          email?: string | null
+          event_id: string
+          id?: string
+          last_notified_at?: string | null
+          linked_user_id?: string | null
+          phone_e164?: string | null
+          pro_contact_id?: string | null
+          public_token?: string | null
+          token_expires_at?: string | null
+        }
+        Update: {
+          archived_at?: string | null
+          created_at?: string
+          current_status?: string
+          delivery_channel?: string
+          email?: string | null
+          event_id?: string
+          id?: string
+          last_notified_at?: string | null
+          linked_user_id?: string | null
+          phone_e164?: string | null
+          pro_contact_id?: string | null
+          public_token?: string | null
+          token_expires_at?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "barn_event_attendees_event_id_fkey"
+            columns: ["event_id"]
+            isOneToOne: false
+            referencedRelation: "barn_events"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "barn_event_attendees_pro_contact_id_fkey"
+            columns: ["pro_contact_id"]
+            isOneToOne: false
+            referencedRelation: "professional_contacts"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      barn_event_notifications_log: {
+        Row: {
+          attendee_id: string | null
+          bucket: string | null
+          channel: string
+          created_at: string
+          error: string | null
+          event_id: string | null
+          id: string
+          pro_contact_id: string | null
+          status: string
+        }
+        Insert: {
+          attendee_id?: string | null
+          bucket?: string | null
+          channel: string
+          created_at?: string
+          error?: string | null
+          event_id?: string | null
+          id?: string
+          pro_contact_id?: string | null
+          status: string
+        }
+        Update: {
+          attendee_id?: string | null
+          bucket?: string | null
+          channel?: string
+          created_at?: string
+          error?: string | null
+          event_id?: string | null
+          id?: string
+          pro_contact_id?: string | null
+          status?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "barn_event_notifications_log_attendee_id_fkey"
+            columns: ["attendee_id"]
+            isOneToOne: false
+            referencedRelation: "barn_event_attendees"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "barn_event_notifications_log_event_id_fkey"
+            columns: ["event_id"]
+            isOneToOne: false
+            referencedRelation: "barn_events"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "barn_event_notifications_log_pro_contact_id_fkey"
+            columns: ["pro_contact_id"]
+            isOneToOne: false
+            referencedRelation: "professional_contacts"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      barn_event_recurrence_rules: {
+        Row: {
+          archived_at: string | null
+          created_at: string
+          id: string
+          last_materialized_through: string | null
+          owner_id: string
+          rrule_text: string
+          series_end_at: string | null
+          series_start_at: string
+          template_animal_ids: string[]
+          template_duration: number
+          template_notes: string | null
+          template_title: string
+          updated_at: string
+        }
+        Insert: {
+          archived_at?: string | null
+          created_at?: string
+          id?: string
+          last_materialized_through?: string | null
+          owner_id: string
+          rrule_text: string
+          series_end_at?: string | null
+          series_start_at: string
+          template_animal_ids?: string[]
+          template_duration?: number
+          template_notes?: string | null
+          template_title: string
+          updated_at?: string
+        }
+        Update: {
+          archived_at?: string | null
+          created_at?: string
+          id?: string
+          last_materialized_through?: string | null
+          owner_id?: string
+          rrule_text?: string
+          series_end_at?: string | null
+          series_start_at?: string
+          template_animal_ids?: string[]
+          template_duration?: number
+          template_notes?: string | null
+          template_title?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      barn_event_responses: {
+        Row: {
+          attendee_id: string
+          counter_start_at: string | null
+          created_at: string
+          event_id: string
+          id: string
+          ip: unknown
+          responder_channel: string
+          responder_user_id: string | null
+          response_note: string | null
+          status: string
+          user_agent: string | null
+        }
+        Insert: {
+          attendee_id: string
+          counter_start_at?: string | null
+          created_at?: string
+          event_id: string
+          id?: string
+          ip?: unknown
+          responder_channel: string
+          responder_user_id?: string | null
+          response_note?: string | null
+          status: string
+          user_agent?: string | null
+        }
+        Update: {
+          attendee_id?: string
+          counter_start_at?: string | null
+          created_at?: string
+          event_id?: string
+          id?: string
+          ip?: unknown
+          responder_channel?: string
+          responder_user_id?: string | null
+          response_note?: string | null
+          status?: string
+          user_agent?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "barn_event_responses_attendee_id_fkey"
+            columns: ["attendee_id"]
+            isOneToOne: false
+            referencedRelation: "barn_event_attendees"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "barn_event_responses_event_id_fkey"
+            columns: ["event_id"]
+            isOneToOne: false
+            referencedRelation: "barn_events"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      barn_events: {
+        Row: {
+          animal_ids: string[]
+          archived_at: string | null
+          created_at: string
+          created_by: string
+          duration_minutes: number
+          id: string
+          location_text: string | null
+          notes: string | null
+          owner_id: string
+          prefill_source: string | null
+          ranch_id: string | null
+          recurrence_rule_id: string | null
+          start_at: string
+          status: string
+          title: string
+          updated_at: string
+        }
+        Insert: {
+          animal_ids?: string[]
+          archived_at?: string | null
+          created_at?: string
+          created_by: string
+          duration_minutes?: number
+          id?: string
+          location_text?: string | null
+          notes?: string | null
+          owner_id: string
+          prefill_source?: string | null
+          ranch_id?: string | null
+          recurrence_rule_id?: string | null
+          start_at: string
+          status?: string
+          title: string
+          updated_at?: string
+        }
+        Update: {
+          animal_ids?: string[]
+          archived_at?: string | null
+          created_at?: string
+          created_by?: string
+          duration_minutes?: number
+          id?: string
+          location_text?: string | null
+          notes?: string | null
+          owner_id?: string
+          prefill_source?: string | null
+          ranch_id?: string | null
+          recurrence_rule_id?: string | null
+          start_at?: string
+          status?: string
+          title?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "barn_events_ranch_id_fkey"
+            columns: ["ranch_id"]
+            isOneToOne: false
+            referencedRelation: "ranches"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "barn_events_recurrence_rule_id_fkey"
+            columns: ["recurrence_rule_id"]
+            isOneToOne: false
+            referencedRelation: "barn_event_recurrence_rules"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      barn_mode_entitlement_events: {
+        Row: {
+          created_at: string
+          event: string
+          id: string
+          metadata: Json
+          next_comp_source: string | null
+          next_tier: string | null
+          owner_id: string
+          prev_comp_source: string | null
+          prev_tier: string | null
+          reason: string | null
+          source: string
+        }
+        Insert: {
+          created_at?: string
+          event: string
+          id?: string
+          metadata?: Json
+          next_comp_source?: string | null
+          next_tier?: string | null
+          owner_id: string
+          prev_comp_source?: string | null
+          prev_tier?: string | null
+          reason?: string | null
+          source: string
+        }
+        Update: {
+          created_at?: string
+          event?: string
+          id?: string
+          metadata?: Json
+          next_comp_source?: string | null
+          next_tier?: string | null
+          owner_id?: string
+          prev_comp_source?: string | null
+          prev_tier?: string | null
+          reason?: string | null
+          source?: string
+        }
+        Relationships: []
+      }
+      care_matrix_entries: {
+        Row: {
+          animal_id: string
+          archived_at: string | null
+          blanket: boolean
+          created_at: string
+          entry_date: string
+          feed_am: boolean
+          feed_pm: boolean
+          hay: boolean
+          id: string
+          meds_given: boolean
+          notes: string | null
+          supplements_given: boolean
+          turnout: boolean
+          updated_at: string
+          updated_by: string | null
+        }
+        Insert: {
+          animal_id: string
+          archived_at?: string | null
+          blanket?: boolean
+          created_at?: string
+          entry_date: string
+          feed_am?: boolean
+          feed_pm?: boolean
+          hay?: boolean
+          id?: string
+          meds_given?: boolean
+          notes?: string | null
+          supplements_given?: boolean
+          turnout?: boolean
+          updated_at?: string
+          updated_by?: string | null
+        }
+        Update: {
+          animal_id?: string
+          archived_at?: string | null
+          blanket?: boolean
+          created_at?: string
+          entry_date?: string
+          feed_am?: boolean
+          feed_pm?: boolean
+          hay?: boolean
+          id?: string
+          meds_given?: boolean
+          notes?: string | null
+          supplements_given?: boolean
+          turnout?: boolean
+          updated_at?: string
+          updated_by?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "care_matrix_entries_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
+          {
+            foreignKeyName: "care_matrix_entries_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animals"
+            referencedColumns: ["id"]
+          },
+        ]
       }
       chatbot_runs: {
         Row: {
@@ -511,6 +966,9 @@ export type Database = {
           receipt_r2_object_id: string | null
           recorder_id: string
           recorder_role: string
+          session_id: string | null
+          source_invoice_id: string | null
+          source_product_id: string | null
           tax_rate_bps: number
           updated_at: string
           vendor: string | null
@@ -532,6 +990,9 @@ export type Database = {
           receipt_r2_object_id?: string | null
           recorder_id: string
           recorder_role: string
+          session_id?: string | null
+          source_invoice_id?: string | null
+          source_product_id?: string | null
           tax_rate_bps?: number
           updated_at?: string
           vendor?: string | null
@@ -553,11 +1014,21 @@ export type Database = {
           receipt_r2_object_id?: string | null
           recorder_id?: string
           recorder_role?: string
+          session_id?: string | null
+          source_invoice_id?: string | null
+          source_product_id?: string | null
           tax_rate_bps?: number
           updated_at?: string
           vendor?: string | null
         }
         Relationships: [
+          {
+            foreignKeyName: "expenses_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
           {
             foreignKeyName: "expenses_animal_id_fkey"
             columns: ["animal_id"]
@@ -584,6 +1055,176 @@ export type Database = {
             columns: ["receipt_r2_object_id"]
             isOneToOne: false
             referencedRelation: "r2_objects"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "expenses_session_id_fkey"
+            columns: ["session_id"]
+            isOneToOne: false
+            referencedRelation: "training_sessions"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "expenses_source_invoice_id_fkey"
+            columns: ["source_invoice_id"]
+            isOneToOne: false
+            referencedRelation: "invoices"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      health_dashboard_acknowledgements: {
+        Row: {
+          animal_id: string
+          archived_at: string | null
+          created_at: string
+          dismissed_until: string
+          id: string
+          owner_id: string
+          reason: string | null
+          record_type: string
+        }
+        Insert: {
+          animal_id: string
+          archived_at?: string | null
+          created_at?: string
+          dismissed_until: string
+          id?: string
+          owner_id: string
+          reason?: string | null
+          record_type: string
+        }
+        Update: {
+          animal_id?: string
+          archived_at?: string | null
+          created_at?: string
+          dismissed_until?: string
+          id?: string
+          owner_id?: string
+          reason?: string | null
+          record_type?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "health_dashboard_acknowledgements_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
+          {
+            foreignKeyName: "health_dashboard_acknowledgements_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animals"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      health_thresholds: {
+        Row: {
+          created_at: string
+          enabled: boolean
+          id: string
+          interval_days: number
+          owner_id: string
+          record_type: string
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          enabled?: boolean
+          id?: string
+          interval_days: number
+          owner_id: string
+          record_type: string
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          enabled?: boolean
+          id?: string
+          interval_days?: number
+          owner_id?: string
+          record_type?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      horse_message_reads: {
+        Row: {
+          animal_id: string
+          last_read_at: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          animal_id: string
+          last_read_at?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          animal_id?: string
+          last_read_at?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "horse_message_reads_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
+          {
+            foreignKeyName: "horse_message_reads_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animals"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      horse_messages: {
+        Row: {
+          animal_id: string
+          archived_at: string | null
+          body: string
+          created_at: string
+          id: string
+          sender_id: string
+        }
+        Insert: {
+          animal_id: string
+          archived_at?: string | null
+          body: string
+          created_at?: string
+          id?: string
+          sender_id: string
+        }
+        Update: {
+          animal_id?: string
+          archived_at?: string | null
+          body?: string
+          created_at?: string
+          id?: string
+          sender_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "horse_messages_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
+          {
+            foreignKeyName: "horse_messages_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animals"
             referencedColumns: ["id"]
           },
         ]
@@ -1179,6 +1820,60 @@ export type Database = {
         }
         Relationships: []
       }
+      professional_contacts: {
+        Row: {
+          archived_at: string | null
+          claim_email_sent_at: string | null
+          company: string | null
+          created_at: string
+          email: string | null
+          id: string
+          linked_user_id: string | null
+          name: string
+          notes: string | null
+          owner_id: string
+          phone_e164: string | null
+          response_count_confirmed: number
+          role: string
+          sms_opt_in: boolean
+          updated_at: string
+        }
+        Insert: {
+          archived_at?: string | null
+          claim_email_sent_at?: string | null
+          company?: string | null
+          created_at?: string
+          email?: string | null
+          id?: string
+          linked_user_id?: string | null
+          name: string
+          notes?: string | null
+          owner_id: string
+          phone_e164?: string | null
+          response_count_confirmed?: number
+          role: string
+          sms_opt_in?: boolean
+          updated_at?: string
+        }
+        Update: {
+          archived_at?: string | null
+          claim_email_sent_at?: string | null
+          company?: string | null
+          created_at?: string
+          email?: string | null
+          id?: string
+          linked_user_id?: string | null
+          name?: string
+          notes?: string | null
+          owner_id?: string
+          phone_e164?: string | null
+          response_count_confirmed?: number
+          role?: string
+          sms_opt_in?: boolean
+          updated_at?: string
+        }
+        Relationships: []
+      }
       profiles: {
         Row: {
           created_at: string | null
@@ -1212,6 +1907,51 @@ export type Database = {
           marketing_opt_in?: boolean | null
           phone?: string | null
           updated_at?: string | null
+        }
+        Relationships: []
+      }
+      promo_codes: {
+        Row: {
+          archived_at: string | null
+          campaign: string
+          code: string
+          created_at: string
+          created_by: string | null
+          expires_at: string | null
+          grants_barn_mode_months: number
+          id: string
+          notes: string | null
+          redeemed_at: string | null
+          redeemed_by_owner_id: string | null
+          single_use: boolean
+        }
+        Insert: {
+          archived_at?: string | null
+          campaign: string
+          code: string
+          created_at?: string
+          created_by?: string | null
+          expires_at?: string | null
+          grants_barn_mode_months: number
+          id?: string
+          notes?: string | null
+          redeemed_at?: string | null
+          redeemed_by_owner_id?: string | null
+          single_use?: boolean
+        }
+        Update: {
+          archived_at?: string | null
+          campaign?: string
+          code?: string
+          created_at?: string
+          created_by?: string | null
+          expires_at?: string | null
+          grants_barn_mode_months?: number
+          id?: string
+          notes?: string | null
+          redeemed_at?: string | null
+          redeemed_by_owner_id?: string | null
+          single_use?: boolean
         }
         Relationships: []
       }
@@ -1326,6 +2066,7 @@ export type Database = {
         Row: {
           address: string | null
           city: string | null
+          color_hex: string | null
           created_at: string
           id: string
           name: string
@@ -1336,6 +2077,7 @@ export type Database = {
         Insert: {
           address?: string | null
           city?: string | null
+          color_hex?: string | null
           created_at?: string
           id?: string
           name: string
@@ -1346,6 +2088,7 @@ export type Database = {
         Update: {
           address?: string | null
           city?: string | null
+          color_hex?: string | null
           created_at?: string
           id?: string
           name?: string
@@ -1401,6 +2144,13 @@ export type Database = {
           updated_at?: string
         }
         Relationships: [
+          {
+            foreignKeyName: "recurring_line_items_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
           {
             foreignKeyName: "recurring_line_items_animal_id_fkey"
             columns: ["animal_id"]
@@ -1542,6 +2292,47 @@ export type Database = {
           },
         ]
       }
+      session_ratings: {
+        Row: {
+          archived_at: string | null
+          comment: string | null
+          created_at: string
+          id: string
+          ratee_id: string
+          rater_id: string
+          session_id: string
+          stars: number
+        }
+        Insert: {
+          archived_at?: string | null
+          comment?: string | null
+          created_at?: string
+          id?: string
+          ratee_id: string
+          rater_id: string
+          session_id: string
+          stars: number
+        }
+        Update: {
+          archived_at?: string | null
+          comment?: string | null
+          created_at?: string
+          id?: string
+          ratee_id?: string
+          rater_id?: string
+          session_id?: string
+          stars?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "session_ratings_session_id_fkey"
+            columns: ["session_id"]
+            isOneToOne: false
+            referencedRelation: "training_sessions"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       shopify_sync_cursor: {
         Row: {
           id: number
@@ -1568,6 +2359,57 @@ export type Database = {
           last_run_at?: string | null
           products_archived?: number
           products_upserted?: number
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      silver_lining_links: {
+        Row: {
+          archived_at: string | null
+          consecutive_failure_count: number
+          created_at: string
+          id: string
+          last_verification_error: string | null
+          last_verification_status: string | null
+          last_verified_at: string | null
+          linked_at: string
+          owner_id: string
+          silver_lining_customer_id: string
+          sticky_until: string
+          stripe_payment_method_id: string | null
+          stripe_setup_intent_id: string | null
+          updated_at: string
+        }
+        Insert: {
+          archived_at?: string | null
+          consecutive_failure_count?: number
+          created_at?: string
+          id?: string
+          last_verification_error?: string | null
+          last_verification_status?: string | null
+          last_verified_at?: string | null
+          linked_at?: string
+          owner_id: string
+          silver_lining_customer_id: string
+          sticky_until: string
+          stripe_payment_method_id?: string | null
+          stripe_setup_intent_id?: string | null
+          updated_at?: string
+        }
+        Update: {
+          archived_at?: string | null
+          consecutive_failure_count?: number
+          created_at?: string
+          id?: string
+          last_verification_error?: string | null
+          last_verification_status?: string | null
+          last_verified_at?: string | null
+          linked_at?: string
+          owner_id?: string
+          silver_lining_customer_id?: string
+          sticky_until?: string
+          stripe_payment_method_id?: string | null
+          stripe_setup_intent_id?: string | null
           updated_at?: string
         }
         Relationships: []
@@ -1621,6 +2463,105 @@ export type Database = {
             columns: ["ticket_id"]
             isOneToOne: false
             referencedRelation: "support_tickets"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      stall_assignments: {
+        Row: {
+          animal_id: string
+          assigned_at: string
+          assigned_by: string | null
+          created_at: string
+          id: string
+          notes: string | null
+          stall_id: string
+          unassigned_at: string | null
+        }
+        Insert: {
+          animal_id: string
+          assigned_at?: string
+          assigned_by?: string | null
+          created_at?: string
+          id?: string
+          notes?: string | null
+          stall_id: string
+          unassigned_at?: string | null
+        }
+        Update: {
+          animal_id?: string
+          assigned_at?: string
+          assigned_by?: string | null
+          created_at?: string
+          id?: string
+          notes?: string | null
+          stall_id?: string
+          unassigned_at?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "stall_assignments_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
+          {
+            foreignKeyName: "stall_assignments_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animals"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "stall_assignments_stall_id_fkey"
+            columns: ["stall_id"]
+            isOneToOne: false
+            referencedRelation: "stalls"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      stalls: {
+        Row: {
+          archived_at: string | null
+          created_at: string
+          id: string
+          label: string
+          notes: string | null
+          position_col: number | null
+          position_row: number | null
+          ranch_id: string
+          updated_at: string
+        }
+        Insert: {
+          archived_at?: string | null
+          created_at?: string
+          id?: string
+          label: string
+          notes?: string | null
+          position_col?: number | null
+          position_row?: number | null
+          ranch_id: string
+          updated_at?: string
+        }
+        Update: {
+          archived_at?: string | null
+          created_at?: string
+          id?: string
+          label?: string
+          notes?: string | null
+          position_col?: number | null
+          position_row?: number | null
+          ranch_id?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "stalls_ranch_id_fkey"
+            columns: ["ranch_id"]
+            isOneToOne: false
+            referencedRelation: "ranches"
             referencedColumns: ["id"]
           },
         ]
@@ -1760,6 +2701,72 @@ export type Database = {
         }
         Relationships: []
       }
+      subscriptions: {
+        Row: {
+          archived_at: string | null
+          cancel_at_period_end: boolean
+          comp_campaign: string | null
+          comp_expires_at: string | null
+          comp_source: string | null
+          created_at: string
+          current_period_end: string | null
+          current_period_start: string | null
+          id: string
+          last_webhook_event_at: string | null
+          owner_id: string
+          role_scope: string
+          status: string
+          stripe_customer_id: string | null
+          stripe_price_id: string | null
+          stripe_setup_intent_id: string | null
+          stripe_subscription_id: string | null
+          tier: string
+          updated_at: string
+        }
+        Insert: {
+          archived_at?: string | null
+          cancel_at_period_end?: boolean
+          comp_campaign?: string | null
+          comp_expires_at?: string | null
+          comp_source?: string | null
+          created_at?: string
+          current_period_end?: string | null
+          current_period_start?: string | null
+          id?: string
+          last_webhook_event_at?: string | null
+          owner_id: string
+          role_scope?: string
+          status?: string
+          stripe_customer_id?: string | null
+          stripe_price_id?: string | null
+          stripe_setup_intent_id?: string | null
+          stripe_subscription_id?: string | null
+          tier?: string
+          updated_at?: string
+        }
+        Update: {
+          archived_at?: string | null
+          cancel_at_period_end?: boolean
+          comp_campaign?: string | null
+          comp_expires_at?: string | null
+          comp_source?: string | null
+          created_at?: string
+          current_period_end?: string | null
+          current_period_start?: string | null
+          id?: string
+          last_webhook_event_at?: string | null
+          owner_id?: string
+          role_scope?: string
+          status?: string
+          stripe_customer_id?: string | null
+          stripe_price_id?: string | null
+          stripe_setup_intent_id?: string | null
+          stripe_subscription_id?: string | null
+          tier?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
       supplement_doses: {
         Row: {
           animal_id: string
@@ -1795,6 +2802,13 @@ export type Database = {
           notes?: string | null
         }
         Relationships: [
+          {
+            foreignKeyName: "supplement_doses_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
           {
             foreignKeyName: "supplement_doses_animal_id_fkey"
             columns: ["animal_id"]
@@ -1870,7 +2884,7 @@ export type Database = {
           application: Json
           created_at: string
           id: string
-          status: string
+          status: TrainerApplicationStatus
           submitted_at: string
           updated_at: string
           user_id: string
@@ -1879,7 +2893,7 @@ export type Database = {
           application?: Json
           created_at?: string
           id?: string
-          status?: string
+          status?: TrainerApplicationStatus
           submitted_at?: string
           updated_at?: string
           user_id: string
@@ -1888,7 +2902,7 @@ export type Database = {
           application?: Json
           created_at?: string
           id?: string
-          status?: string
+          status?: TrainerApplicationStatus
           submitted_at?: string
           updated_at?: string
           user_id?: string
@@ -2108,10 +3122,143 @@ export type Database = {
             foreignKeyName: "training_sessions_animal_id_fkey"
             columns: ["animal_id"]
             isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
+          {
+            foreignKeyName: "training_sessions_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
             referencedRelation: "animals"
             referencedColumns: ["id"]
           },
         ]
+      }
+      turnout_group_members: {
+        Row: {
+          added_by: string | null
+          animal_id: string
+          created_at: string
+          group_id: string
+          id: string
+          joined_at: string
+          left_at: string | null
+        }
+        Insert: {
+          added_by?: string | null
+          animal_id: string
+          created_at?: string
+          group_id: string
+          id?: string
+          joined_at?: string
+          left_at?: string | null
+        }
+        Update: {
+          added_by?: string | null
+          animal_id?: string
+          created_at?: string
+          group_id?: string
+          id?: string
+          joined_at?: string
+          left_at?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "turnout_group_members_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
+          {
+            foreignKeyName: "turnout_group_members_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animals"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "turnout_group_members_group_id_fkey"
+            columns: ["group_id"]
+            isOneToOne: false
+            referencedRelation: "turnout_groups"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      turnout_groups: {
+        Row: {
+          archived_at: string | null
+          color_hex: string | null
+          created_at: string
+          id: string
+          name: string
+          notes: string | null
+          ranch_id: string
+          updated_at: string
+        }
+        Insert: {
+          archived_at?: string | null
+          color_hex?: string | null
+          created_at?: string
+          id?: string
+          name: string
+          notes?: string | null
+          ranch_id: string
+          updated_at?: string
+        }
+        Update: {
+          archived_at?: string | null
+          color_hex?: string | null
+          created_at?: string
+          id?: string
+          name?: string
+          notes?: string | null
+          ranch_id?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "turnout_groups_ranch_id_fkey"
+            columns: ["ranch_id"]
+            isOneToOne: false
+            referencedRelation: "ranches"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      user_notification_prefs: {
+        Row: {
+          email_enabled: boolean
+          in_app_enabled: boolean
+          reminder_24h: boolean
+          reminder_2h: boolean
+          reminder_48h: boolean
+          sms_enabled: boolean
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          email_enabled?: boolean
+          in_app_enabled?: boolean
+          reminder_24h?: boolean
+          reminder_2h?: boolean
+          reminder_48h?: boolean
+          sms_enabled?: boolean
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          email_enabled?: boolean
+          in_app_enabled?: boolean
+          reminder_24h?: boolean
+          reminder_2h?: boolean
+          reminder_48h?: boolean
+          sms_enabled?: boolean
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
       }
       user_profiles: {
         Row: {
@@ -2124,6 +3271,7 @@ export type Database = {
           status: UserStatus
           updated_at: string
           user_id: string
+          welcome_tour_barn_seen_at: string | null
           welcome_tour_seen_at: string | null
         }
         Insert: {
@@ -2136,6 +3284,7 @@ export type Database = {
           status?: UserStatus
           updated_at?: string
           user_id: string
+          welcome_tour_barn_seen_at?: string | null
           welcome_tour_seen_at?: string | null
         }
         Update: {
@@ -2148,6 +3297,7 @@ export type Database = {
           status?: UserStatus
           updated_at?: string
           user_id?: string
+          welcome_tour_barn_seen_at?: string | null
           welcome_tour_seen_at?: string | null
         }
         Relationships: []
@@ -2164,7 +3314,7 @@ export type Database = {
           notes: string | null
           owner_id: string
           r2_object_id: string
-          record_type: 'coggins' | 'vaccine' | 'dental' | 'farrier' | 'other'
+          record_type: "coggins" | "vaccine" | "dental" | "farrier" | "other"
           updated_at: string
         }
         Insert: {
@@ -2178,7 +3328,7 @@ export type Database = {
           notes?: string | null
           owner_id: string
           r2_object_id: string
-          record_type: 'coggins' | 'vaccine' | 'dental' | 'farrier' | 'other'
+          record_type: "coggins" | "vaccine" | "dental" | "farrier" | "other"
           updated_at?: string
         }
         Update: {
@@ -2192,10 +3342,17 @@ export type Database = {
           notes?: string | null
           owner_id?: string
           r2_object_id?: string
-          record_type?: 'coggins' | 'vaccine' | 'dental' | 'farrier' | 'other'
+          record_type?: "coggins" | "vaccine" | "dental" | "farrier" | "other"
           updated_at?: string
         }
         Relationships: [
+          {
+            foreignKeyName: "vet_records_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
           {
             foreignKeyName: "vet_records_animal_id_fkey"
             columns: ["animal_id"]
@@ -2263,6 +3420,13 @@ export type Database = {
             foreignKeyName: "vet_share_tokens_animal_id_fkey"
             columns: ["animal_id"]
             isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
+          {
+            foreignKeyName: "vet_share_tokens_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
             referencedRelation: "animals"
             referencedColumns: ["id"]
           },
@@ -2270,6 +3434,70 @@ export type Database = {
       }
     }
     Views: {
+      animal_cost_basis: {
+        Row: {
+          acquired_at: string | null
+          acquired_price_cents: number | null
+          animal_id: string | null
+          cumulative_spend_cents: number | null
+          disposition: string | null
+          disposition_amount_cents: number | null
+          disposition_at: string | null
+          first_expense_on: string | null
+          last_expense_on: string | null
+          owner_id: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "animals_owner_id_fkey"
+            columns: ["owner_id"]
+            isOneToOne: false
+            referencedRelation: "profiles"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      expense_year_rollup: {
+        Row: {
+          animal_id: string | null
+          category: string | null
+          entry_count: number | null
+          owner_id: string | null
+          ranch_id: string | null
+          total_cents: number | null
+          year_start: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "animals_owner_id_fkey"
+            columns: ["owner_id"]
+            isOneToOne: false
+            referencedRelation: "profiles"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "expenses_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animal_cost_basis"
+            referencedColumns: ["animal_id"]
+          },
+          {
+            foreignKeyName: "expenses_animal_id_fkey"
+            columns: ["animal_id"]
+            isOneToOne: false
+            referencedRelation: "animals"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "stalls_ranch_id_fkey"
+            columns: ["ranch_id"]
+            isOneToOne: false
+            referencedRelation: "ranches"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       v_my_connect_account: {
         Row: {
           charges_enabled: boolean | null
@@ -2327,6 +3555,19 @@ export type Database = {
       am_i_owner_of: { Args: { animal_id: string }; Returns: boolean }
       check_has_pin: { Args: { p_email: string }; Returns: boolean }
       clear_pin: { Args: never; Returns: undefined }
+      compute_herd_health: {
+        Args: { p_owner_id: string }
+        Returns: {
+          animal_id: string
+          dismissed_until: string
+          enabled: boolean
+          interval_days: number
+          last_record_at: string
+          next_due_at: string
+          record_type: string
+          status: string
+        }[]
+      }
       do_i_have_access_to_animal: {
         Args: { animal_id: string }
         Returns: boolean
@@ -2338,6 +3579,7 @@ export type Database = {
         Returns: undefined
       }
       get_my_role: { Args: never; Returns: string }
+      horse_messages_unread_total: { Args: never; Returns: number }
       invoice_is_overdue: { Args: { p_invoice_id: string }; Returns: boolean }
       is_expense_owner_or_granted_trainer: {
         Args: { p_expense_id: string }
@@ -2370,14 +3612,35 @@ export type Database = {
           isSetofReturn: false
         }
       }
+      my_rating_for_session: {
+        Args: { p_session_id: string }
+        Returns: {
+          comment: string
+          created_at: string
+          id: string
+          stars: number
+        }[]
+      }
       owner_record_count: { Args: { p_owner_id: string }; Returns: number }
       products_public_count: { Args: never; Returns: number }
       session_is_payable: { Args: { p_session_id: string }; Returns: boolean }
       set_pin: { Args: never; Returns: undefined }
       signed_url_ttl_seconds: { Args: never; Returns: number }
+      trainer_distinct_horse_count: {
+        Args: { p_trainer_id: string }
+        Returns: number
+      }
+      trainer_has_pro: { Args: { p_trainer_id: string }; Returns: boolean }
       trainer_month_start: {
         Args: { p_at?: string; p_trainer_id: string }
         Returns: string
+      }
+      user_rating_summary: {
+        Args: { p_user_id: string }
+        Returns: {
+          avg_stars: number
+          rating_count: number
+        }[]
       }
     }
     Enums: {

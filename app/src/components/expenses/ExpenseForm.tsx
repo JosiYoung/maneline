@@ -1,9 +1,9 @@
-import { forwardRef, useState } from "react";
+import { forwardRef, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
-import { ShoppingBag } from "lucide-react";
+import { Paperclip, ShoppingBag, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -28,6 +28,13 @@ import {
   type ShopProduct,
 } from "@/lib/shop";
 import { ProductPicker } from "@/components/shop/ProductPicker";
+import {
+  EXPENSE_RECEIPT_MIME,
+  MAX_UPLOAD_BYTES,
+  commitUpload,
+  requestPresign,
+  uploadToR2,
+} from "@/lib/uploads";
 
 // ExpenseForm — shared between owner (on AnimalDetail) and trainer
 // (on ExpensesIndex + AnimalReadOnly). The caller passes the role so
@@ -72,6 +79,7 @@ export interface ExpenseFormProps {
   animalId: string;
   recorderRole: ExpenseRecorderRole;
   defaultCategory?: ExpenseCategory;
+  sessionId?: string | null;
   onCreated?: () => void;
   onCancel?: () => void;
 }
@@ -80,6 +88,7 @@ export function ExpenseForm({
   animalId,
   recorderRole,
   defaultCategory = "other",
+  sessionId,
   onCreated,
   onCancel,
 }: ExpenseFormProps) {
@@ -109,6 +118,54 @@ export function ExpenseForm({
   const category = watch("category");
   const [selectedProduct, setSelectedProduct] = useState<ShopProduct | null>(null);
   const [buying, setBuying] = useState(false);
+  const [receipt, setReceipt] = useState<{
+    r2_object_id: string;
+    name: string;
+  } | null>(null);
+  const [receiptUploading, setReceiptUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  async function handleReceiptSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!EXPENSE_RECEIPT_MIME.has(file.type)) {
+      notify.error("Use PDF, JPG, PNG, HEIC, or WEBP.");
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      notify.error("Receipt must be 25 MB or less.");
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
+    setReceiptUploading(true);
+    try {
+      const presign = await requestPresign({
+        kind: "expense_receipt",
+        contentType: file.type,
+        byteSize: file.size,
+        animalId,
+      });
+      await uploadToR2(presign.put_url, file);
+      const committed = await commitUpload({
+        kind: "expense_receipt",
+        object_key: presign.object_key,
+        animal_id: animalId,
+      });
+      setReceipt({ r2_object_id: committed.r2_object_id, name: file.name });
+      notify.success("Receipt attached.");
+    } catch (err) {
+      const msg = mapSupabaseError(err as Error);
+      notify.error(msg);
+    } finally {
+      setReceiptUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  function removeReceipt() {
+    setReceipt(null);
+  }
 
   function handleProductSelect(product: ShopProduct | null) {
     setSelectedProduct(product);
@@ -164,6 +221,8 @@ export function ExpenseForm({
           amount_cents: cents,
           vendor:       values.vendor?.trim() || null,
           notes:        values.notes?.trim() || null,
+          receipt_r2_object_id: receipt?.r2_object_id ?? null,
+          session_id:           sessionId ?? null,
         },
         recorderRole,
       );
@@ -179,6 +238,7 @@ export function ExpenseForm({
         vendor: "",
         notes: "",
       });
+      setReceipt(null);
       setSubmitError(null);
       onCreated?.();
     },
@@ -306,6 +366,49 @@ export function ExpenseForm({
         />
       </Field>
 
+      <div className="space-y-1.5">
+        <Label htmlFor="expense-receipt">Receipt (optional)</Label>
+        {receipt ? (
+          <div className="flex items-center justify-between gap-2 rounded-md border border-input bg-muted/30 px-3 py-2">
+            <span className="flex min-w-0 items-center gap-2 text-sm">
+              <Paperclip className="h-4 w-4 shrink-0" aria-hidden="true" />
+              <span className="truncate">{receipt.name}</span>
+            </span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={removeReceipt}
+              disabled={disabled}
+              aria-label="Remove receipt"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        ) : (
+          <>
+            <input
+              ref={fileInputRef}
+              id="expense-receipt"
+              type="file"
+              accept="application/pdf,image/jpeg,image/png,image/heic,image/webp"
+              onChange={handleReceiptSelect}
+              disabled={disabled || receiptUploading}
+              className={cn(
+                "flex h-10 w-full rounded-md border border-input bg-card px-3 py-2 text-sm",
+                "file:mr-3 file:rounded file:border-0 file:bg-muted file:px-2 file:py-1 file:text-xs file:font-medium",
+                "disabled:cursor-not-allowed disabled:opacity-50",
+              )}
+            />
+            <p className="text-xs text-muted-foreground">
+              {receiptUploading
+                ? "Uploading…"
+                : "PDF, JPG, PNG, HEIC, or WEBP. Max 25 MB."}
+            </p>
+          </>
+        )}
+      </div>
+
       {submitError && (
         <p className="text-sm text-destructive" role="alert">
           {submitError}
@@ -336,7 +439,7 @@ export function ExpenseForm({
               : `Buy now · ${formatPrice(selectedProduct.price_cents)}`}
           </Button>
         )}
-        <Button type="submit" disabled={disabled || buying}>
+        <Button type="submit" disabled={disabled || buying || receiptUploading}>
           {disabled ? "Saving…" : "Save expense"}
         </Button>
       </div>
