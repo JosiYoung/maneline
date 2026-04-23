@@ -236,6 +236,12 @@ import {
   createBarnModeCheckoutSession,
   createBillingPortalSession,
   handleBarnModeCheckoutCompleted,
+  isTrainerProConfigured,
+  getSubscriptionForTrainer,
+  countTrainerDistinctHorses,
+  trainerHasPro,
+  createTrainerProCheckoutSession,
+  ensurePlatformTrainerStripeCustomer,
 } from './worker/subscription.js';
 import { sendEmail as sendResendEmail, isResendConfigured } from './worker/resend.js';
 
@@ -480,6 +486,16 @@ export default {
       }
       if (url.pathname === '/api/barn/subscription/portal' && request.method === 'POST') {
         return handleSubscriptionPortal(request, env, ctx);
+      }
+      // --- Phase 9 — Trainer Pro subscription ---
+      if (url.pathname === '/api/trainer/subscription' && request.method === 'GET') {
+        return handleTrainerSubscriptionGet(request, env, ctx);
+      }
+      if (url.pathname === '/api/trainer/subscription/checkout' && request.method === 'POST') {
+        return handleTrainerSubscriptionCheckout(request, env, ctx);
+      }
+      if (url.pathname === '/api/trainer/subscription/portal' && request.method === 'POST') {
+        return handleTrainerSubscriptionPortal(request, env, ctx);
       }
       if (url.pathname === '/api/barn/promo-codes/redeem' && request.method === 'POST') {
         return handlePromoRedeem(request, env, ctx);
@@ -3260,6 +3276,16 @@ const ALLOWED_CONTENT_TYPES = {
     'image/jpeg': 'jpg',
     'image/webp': 'webp',
   },
+  // Phase 8 — expense receipt. Owner or trainer with animal-access can
+  // attach a receipt file to an expense. The FK lives on
+  // expenses.receipt_r2_object_id; commit inserts only r2_objects.
+  expense_receipt: {
+    'application/pdf': 'pdf',
+    'image/jpeg':      'jpg',
+    'image/png':       'png',
+    'image/heic':      'heic',
+    'image/webp':      'webp',
+  },
 };
 
 // Logos are kept small so the invoice PDF header renders fast. 2 MB is
@@ -3496,7 +3522,7 @@ async function handleUploadSign(request, env) {
 
   const kindTypes = ALLOWED_CONTENT_TYPES[kind];
   if (!kindTypes) {
-    return json({ error: 'bad_kind', detail: 'kind must be vet_record, animal_photo, or animal_video' }, 400);
+    return json({ error: 'bad_kind', detail: 'kind must be vet_record, animal_photo, animal_video, trainer_logo, or expense_receipt' }, 400);
   }
   const ext = kindTypes[contentType];
   if (!ext) {
@@ -3509,10 +3535,24 @@ async function handleUploadSign(request, env) {
   // Records uploads must always attach to an animal the caller owns;
   // /sign rejects early so we don't waste a signature on an orphan object.
   // trainer_logo and records_export are animal-less by design.
+  // expense_receipt widens to trainers with an active grant on the animal,
+  // mirroring the expense INSERT policies.
   if (animalId) {
-    const ownsIt = await assertCallerOwnsAnimal(env, jwt, animalId);
-    if (!ownsIt) {
-      return json({ error: 'forbidden', detail: 'not the owner of that animal' }, 403);
+    if (kind === 'expense_receipt') {
+      const ok = await supabaseRpc(
+        env,
+        'do_i_have_access_to_animal',
+        { animal_id: animalId },
+        { userJwt: jwt }
+      );
+      if (!ok.ok || ok.data !== true) {
+        return json({ error: 'forbidden', detail: 'no access to that animal' }, 403);
+      }
+    } else {
+      const ownsIt = await assertCallerOwnsAnimal(env, jwt, animalId);
+      if (!ownsIt) {
+        return json({ error: 'forbidden', detail: 'not the owner of that animal' }, 403);
+      }
     }
   } else if (kind !== 'records_export' && kind !== 'trainer_logo') {
     return json({ error: 'bad_request', detail: 'animal_id required for this kind' }, 400);
@@ -3611,8 +3651,18 @@ async function handleUploadCommit(request, env) {
   }
 
   if (animalId) {
-    const ownsIt = await assertCallerOwnsAnimal(env, jwt, animalId);
-    if (!ownsIt) return json({ error: 'forbidden' }, 403);
+    if (kind === 'expense_receipt') {
+      const ok = await supabaseRpc(
+        env,
+        'do_i_have_access_to_animal',
+        { animal_id: animalId },
+        { userJwt: jwt }
+      );
+      if (!ok.ok || ok.data !== true) return json({ error: 'forbidden' }, 403);
+    } else {
+      const ownsIt = await assertCallerOwnsAnimal(env, jwt, animalId);
+      if (!ownsIt) return json({ error: 'forbidden' }, 403);
+    }
   } else if (kind !== 'records_export' && kind !== 'trainer_logo') {
     return json({ error: 'bad_request', detail: 'animal_id required' }, 400);
   }
@@ -3724,6 +3774,21 @@ async function handleUploadCommit(request, env) {
     });
 
     return json({ id: actorId, r2_object_id: r2ObjectId });
+  } else if (kind === 'expense_receipt') {
+    // No typed row — the FK lives on expenses.receipt_r2_object_id and
+    // is set by the subsequent createExpense call. The r2_objects row is
+    // the durable handle; orphaning is OK (owner never saved the expense).
+    ctx_audit(env, {
+      actor_id: actorId,
+      actor_role: 'owner',
+      action: 'expense.receipt_upload',
+      target_table: 'r2_objects',
+      target_id: r2ObjectId,
+      ip: clientIp(request),
+      user_agent: request.headers.get('user-agent') || null,
+      metadata: { r2_object_id: r2ObjectId, object_key: objectKey, animal_id: animalId },
+    });
+    return json({ id: r2ObjectId, r2_object_id: r2ObjectId });
   }
 
   if (!typedInsert.ok || !typedInsert.data?.id) {
@@ -3810,6 +3875,14 @@ async function handleUploadReadUrl(request, env, url) {
         { serviceRole: true }
       );
       animalId = Array.isArray(am.data) ? am.data[0]?.animal_id : null;
+    } else if (row.kind === 'expense_receipt') {
+      const ex = await supabaseSelect(
+        env,
+        'expenses',
+        `select=animal_id&receipt_r2_object_id=eq.${row.id}&limit=1`,
+        { serviceRole: true }
+      );
+      animalId = Array.isArray(ex.data) ? ex.data[0]?.animal_id : null;
     }
     if (animalId) {
       const ok = await supabaseRpc(
@@ -4588,6 +4661,18 @@ async function handleAccessGrant(request, env) {
     notes:      notes || null,
   });
   if (!insert.ok || !insert.data) {
+    // Phase 9 — the DB trigger raises P0001 `trainer_pro_required: ...`
+    // when the grant would push the trainer over the 5-horse free cap.
+    // Propagate as a 402 so the SPA can show the trainer-pro paywall
+    // and the owner a "this trainer needs to subscribe" message.
+    const errMsg = typeof insert.data?.message === 'string' ? insert.data.message : '';
+    if (errMsg.startsWith('trainer_pro_required')) {
+      return json({
+        error: 'trainer_pro_required',
+        message: 'This trainer has reached the free plan limit of 5 horses and needs Trainer Pro to take on additional clients.',
+        trainer_id: profile.user_id,
+      }, 402);
+    }
     return json({ error: 'grant_insert_failed', status: insert.status }, 500);
   }
 
@@ -10330,7 +10415,7 @@ async function handleSubscriptionGet(request, env, ctx) {
   return json({
     subscription:      sub.data || null,
     horse_count:       horses.data,
-    horse_limit_free:  3,
+    horse_limit_free:  5,
     on_barn_mode:      ownerHasBarnMode(sub.data),
     silver_lining:     link.data || null,
     entitlement_events: events.data || [],
@@ -10447,6 +10532,148 @@ async function handleSubscriptionPortal(request, env, ctx) {
   ctx_audit(env, {
     actor_id: actorId, actor_role: 'owner',
     action: 'barn.subscription.portal_open',
+    target_table: 'subscriptions', target_id: sub.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: {},
+  }, ctx);
+
+  return json({ portal_url: portal.data?.url });
+}
+
+/* =============================================================
+ * Phase 9 — Trainer Pro subscription endpoints.
+ * GET /api/trainer/subscription            — snapshot
+ * POST /api/trainer/subscription/checkout  — Stripe Checkout session
+ * POST /api/trainer/subscription/portal    — billing portal
+ *
+ * Pricing: $25/mo, env STRIPE_PRICE_TRAINER_PRO_MONTHLY. Mirrored
+ * through the shared webhook handler — metadata.ml_source
+ * distinguishes trainer_pro_subscription from barn_mode_subscription.
+ * ============================================================= */
+async function handleTrainerSubscriptionGet(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:trainer_sub_get:${actorId}`, SUBSCRIPTION_READ_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const sub    = await getSubscriptionForTrainer(env, actorId);
+  if (!sub.ok) return json({ error: 'sub_lookup_failed', status: sub.status }, 500);
+  const horses = await countTrainerDistinctHorses(env, actorId);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'trainer',
+    action: 'trainer.subscription.read',
+    target_table: 'subscriptions', target_id: sub.data?.id ?? null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { has_sub: !!sub.data, horse_count: horses.data },
+  }, ctx);
+
+  return json({
+    subscription:      sub.data || null,
+    horse_count:       horses.data,
+    horse_limit_free:  5,
+    on_trainer_pro:    trainerHasPro(sub.data),
+    stripe_configured: isTrainerProConfigured(env),
+  });
+}
+
+async function handleTrainerSubscriptionCheckout(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId, jwt;
+  try { ({ actorId, jwt } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:trainer_sub_checkout:${actorId}`, SUBSCRIPTION_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  if (!isTrainerProConfigured(env)) {
+    return json({ error: 'stripe_not_configured', tech_debt: 'phase-9:01-01' }, 501);
+  }
+  const priceId = env.STRIPE_PRICE_TRAINER_PRO_MONTHLY;
+
+  const sub = await getSubscriptionForTrainer(env, actorId);
+  if (!sub.ok) return json({ error: 'sub_lookup_failed' }, 500);
+  const email = await fetchOwnerEmail(env, jwt);
+  const custRes = await ensurePlatformTrainerStripeCustomer(env, {
+    trainerId: actorId,
+    email,
+    existingCustomerId: sub.data?.stripe_customer_id || null,
+  });
+  if (!custRes.ok) return json({ error: 'stripe_customer_failed', status: custRes.status, message: custRes.message }, 502);
+  const customerId = custRes.data?.id;
+
+  const base = env.PUBLIC_APP_URL || 'https://maneline.co';
+  const successUrl = `${base}/trainer/subscription?stripe=success&session_id={CHECKOUT_SESSION_ID}`;
+  const cancelUrl  = `${base}/trainer/subscription?stripe=cancel`;
+
+  const sess = await createTrainerProCheckoutSession(env, {
+    trainerId: actorId,
+    customerId,
+    priceId,
+    successUrl,
+    cancelUrl,
+    idempotencyKey: `trainer_pro_checkout:${actorId}`,
+  });
+  if (!sess.ok) return json({ error: 'stripe_checkout_failed', status: sess.status, message: sess.message }, 502);
+
+  if (!sub.data) {
+    await insertSubscriptionRow(env, {
+      owner_id:   actorId,
+      role_scope: 'trainer',
+      tier:       'free',
+      status:     'active',
+      stripe_customer_id: customerId,
+    });
+  } else if (!sub.data.stripe_customer_id) {
+    await patchSubscription(env, sub.data.id, { stripe_customer_id: customerId });
+  }
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'trainer',
+    action: 'trainer.subscription.checkout_start',
+    target_table: 'subscriptions', target_id: sub.data?.id ?? null,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { session_id: sess.data?.id },
+  }, ctx);
+
+  return json({ checkout_url: sess.data?.url, session_id: sess.data?.id });
+}
+
+async function handleTrainerSubscriptionPortal(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:trainer_sub_portal:${actorId}`, SUBSCRIPTION_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  if (!env.STRIPE_SECRET_KEY) {
+    return json({ error: 'stripe_not_configured', tech_debt: 'phase-9:01-01' }, 501);
+  }
+
+  const sub = await getSubscriptionForTrainer(env, actorId);
+  if (!sub.ok) return json({ error: 'sub_lookup_failed' }, 500);
+  if (!sub.data?.stripe_customer_id) {
+    return json({ error: 'no_stripe_customer' }, 400);
+  }
+
+  const base = env.PUBLIC_APP_URL || 'https://maneline.co';
+  const portal = await createBillingPortalSession(env, {
+    customerId: sub.data.stripe_customer_id,
+    returnUrl: `${base}/trainer/subscription`,
+  });
+  if (!portal.ok) return json({ error: 'stripe_portal_failed', status: portal.status, message: portal.message }, 502);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'trainer',
+    action: 'trainer.subscription.portal_open',
     target_table: 'subscriptions', target_id: sub.data.id,
     ip: clientIp(request),
     user_agent: request.headers.get('user-agent') || null,

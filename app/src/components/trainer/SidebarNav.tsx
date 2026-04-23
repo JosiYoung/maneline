@@ -8,6 +8,7 @@ import {
   DollarSign,
   Receipt,
   FileText,
+  Sparkles,
   User,
   type LucideIcon,
 } from "lucide-react";
@@ -31,8 +32,9 @@ const NAV_ITEMS: Item[] = [
   { to: "/trainer/my-schedule", label: "My schedule", Icon: CalendarDays },
   { to: "/trainer/expenses", label: "Expenses",  Icon: Receipt },
   { to: "/trainer/invoices", label: "Invoices",  Icon: FileText },
-  { to: "/trainer/payouts",  label: "Payouts",   Icon: DollarSign },
-  { to: "/trainer/account",  label: "Account",   Icon: User },
+  { to: "/trainer/payouts",      label: "Payouts",      Icon: DollarSign },
+  { to: "/trainer/subscription", label: "Subscription", Icon: Sparkles },
+  { to: "/trainer/account",      label: "Account",      Icon: User },
 ];
 
 interface SidebarNavProps {

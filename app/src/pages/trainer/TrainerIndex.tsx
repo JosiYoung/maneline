@@ -4,6 +4,7 @@ import { WelcomeTour } from "../../components/WelcomeTour";
 import TrainerDashboard from "./TrainerDashboard";
 import BusinessDashboard from "./BusinessDashboard";
 import TrainerAccount from "./TrainerAccount";
+import TrainerSettingsSubscription from "./SettingsSubscription";
 import ClientsIndex from "./ClientsIndex";
 import AnimalReadOnly from "./AnimalReadOnly";
 import SessionsIndex from "./SessionsIndex";
@@ -40,7 +41,8 @@ export default function TrainerIndex() {
         <Route path="invoices/:id"       element={<InvoiceDetail />} />
         <Route path="my-schedule" element={<MySchedule />} />
         <Route path="payouts"     element={<PayoutsIndex />} />
-        <Route path="account"     element={<TrainerAccount />} />
+        <Route path="account"      element={<TrainerAccount />} />
+        <Route path="subscription" element={<TrainerSettingsSubscription />} />
         <Route path="*" element={<Navigate to="/trainer" replace />} />
       </Routes>
       <WelcomeTour />

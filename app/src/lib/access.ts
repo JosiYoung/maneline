@@ -102,10 +102,28 @@ export type GrantResult = {
   trainer: { user_id: string; display_name: string | null; email: string };
 };
 
+// Phase 9 — thrown when the target trainer is already at the free cap
+// (5 distinct horses) and hasn't subscribed to Trainer Pro. Owners see
+// a dialog that explains the trainer needs to upgrade first.
+export class TrainerProRequiredError extends Error {
+  readonly trainerId: string | null;
+  constructor(message: string, trainerId: string | null) {
+    super(message);
+    this.name = "TrainerProRequiredError";
+    this.trainerId = trainerId;
+  }
+}
+
 export async function grantAccess(input: GrantInput): Promise<GrantResult> {
   const res = await authedFetch("/api/access/grant", input);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
+    if (res.status === 402 && body?.error === "trainer_pro_required") {
+      throw new TrainerProRequiredError(
+        body?.message || "Trainer needs to upgrade to Trainer Pro before taking on more clients.",
+        body?.trainer_id || null,
+      );
+    }
     const err = new Error(body?.error || `Grant failed (${res.status})`);
     (err as Error & { code?: string }).code = body?.error;
     throw err;

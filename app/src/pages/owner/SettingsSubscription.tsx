@@ -147,7 +147,7 @@ export default function SettingsSubscription() {
             <p className="text-sm text-muted-foreground">
               {snap.horse_count} {snap.horse_count === 1 ? "horse" : "horses"} tracked ·
               {" "}
-              {snap.on_barn_mode ? "unlimited" : "up to 3 free"}
+              {snap.on_barn_mode ? "unlimited" : "up to 5 free"}
             </p>
           </div>
           <StatusBadge snap={snap} />

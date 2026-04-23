@@ -28,6 +28,12 @@ export function isStripePlatformConfigured(env) {
   return Boolean(env?.STRIPE_SECRET_KEY && env?.STRIPE_PRICE_BARN_MODE_MONTHLY);
 }
 
+// Phase 9 — Trainer Pro pricing is configured separately so the owner
+// Barn Mode feature stays independent of the trainer billing rollout.
+export function isTrainerProConfigured(env) {
+  return Boolean(env?.STRIPE_SECRET_KEY && env?.STRIPE_PRICE_TRAINER_PRO_MONTHLY);
+}
+
 function basicAuthHeader(secretKey) {
   return `Basic ${btoa(`${secretKey}:`)}`;
 }
@@ -88,8 +94,9 @@ async function stripePlatformFetch(env, method, path, body, idempotencyKey) {
 
 export async function getSubscriptionForOwner(env, ownerId) {
   const q = [
-    'select=id,owner_id,tier,status,stripe_customer_id,stripe_subscription_id,stripe_price_id,comp_source,comp_campaign,comp_expires_at,current_period_start,current_period_end,cancel_at_period_end,created_at,updated_at',
+    'select=id,owner_id,role_scope,tier,status,stripe_customer_id,stripe_subscription_id,stripe_price_id,comp_source,comp_campaign,comp_expires_at,current_period_start,current_period_end,cancel_at_period_end,created_at,updated_at',
     `owner_id=eq.${ownerId}`,
+    'role_scope=eq.owner',
     'archived_at=is.null',
     'limit=1',
   ].join('&');
@@ -97,6 +104,43 @@ export async function getSubscriptionForOwner(env, ownerId) {
   if (!r.ok) return { ok: false, status: r.status, data: null };
   const rows = (await r.json().catch(() => [])) || [];
   return { ok: true, status: 200, data: rows[0] || null };
+}
+
+// Phase 9 — trainer-scoped subscription row (tier=trainer_pro).
+// Absence of a row means the trainer is on the free part-time plan.
+export async function getSubscriptionForTrainer(env, trainerId) {
+  const q = [
+    'select=id,owner_id,role_scope,tier,status,stripe_customer_id,stripe_subscription_id,stripe_price_id,current_period_start,current_period_end,cancel_at_period_end,created_at,updated_at',
+    `owner_id=eq.${trainerId}`,
+    'role_scope=eq.trainer',
+    'archived_at=is.null',
+    'limit=1',
+  ].join('&');
+  const r = await fetch(`${RESTB(env)}/subscriptions?${q}`, { headers: SR(env) });
+  if (!r.ok) return { ok: false, status: r.status, data: null };
+  const rows = (await r.json().catch(() => [])) || [];
+  return { ok: true, status: 200, data: rows[0] || null };
+}
+
+// Count distinct horses this trainer has access to — used for the
+// trainer Settings page horse meter + pre-flight paywall UX. The DB
+// trigger in 00027 is the authoritative gate.
+export async function countTrainerDistinctHorses(env, trainerId) {
+  const r = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/trainer_distinct_horse_count`, {
+    method: 'POST',
+    headers: { ...SR(env), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ p_trainer_id: trainerId }),
+  });
+  if (!r.ok) return { ok: false, status: r.status, data: 0 };
+  const n = Number(await r.text().catch(() => '0'));
+  return { ok: true, status: 200, data: Number.isFinite(n) ? n : 0 };
+}
+
+export function trainerHasPro(sub) {
+  if (!sub) return false;
+  if (sub.role_scope !== 'trainer') return false;
+  if (sub.tier !== 'trainer_pro') return false;
+  return ['active', 'trialing'].includes(sub.status);
 }
 
 export async function insertSubscriptionRow(env, row) {
@@ -352,6 +396,41 @@ export async function createBarnModeCheckoutSession(env, {
   }, idempotencyKey);
 }
 
+// Phase 9 — Trainer Pro Checkout. Same pattern as Barn Mode; distinct
+// metadata.ml_source so the webhook mirror routes the payload to a
+// role_scope='trainer' + tier='trainer_pro' row.
+export async function createTrainerProCheckoutSession(env, {
+  trainerId,
+  customerId,
+  priceId,
+  successUrl,
+  cancelUrl,
+  idempotencyKey,
+}) {
+  return stripePlatformFetch(env, 'POST', '/checkout/sessions', {
+    mode: 'subscription',
+    customer: customerId,
+    line_items: [{ price: priceId, quantity: 1 }],
+    success_url: successUrl,
+    cancel_url: cancelUrl,
+    metadata: { ml_user_id: trainerId, ml_source: 'trainer_pro_subscription' },
+    subscription_data: {
+      metadata: { ml_user_id: trainerId, ml_source: 'trainer_pro_subscription' },
+    },
+    allow_promotion_codes: 'true',
+  }, idempotencyKey);
+}
+
+export async function ensurePlatformTrainerStripeCustomer(env, { trainerId, email, existingCustomerId }) {
+  if (existingCustomerId) return { ok: true, data: { id: existingCustomerId } };
+  const r = await stripePlatformFetch(env, 'POST', '/customers', {
+    email,
+    metadata: { ml_user_id: trainerId, ml_role: 'trainer' },
+  });
+  if (!r.ok) return r;
+  return { ok: true, data: r.data };
+}
+
 export async function createBillingPortalSession(env, { customerId, returnUrl }) {
   return stripePlatformFetch(env, 'POST', '/billing_portal/sessions', {
     customer: customerId,
@@ -423,17 +502,26 @@ async function getSubscriptionByStripeSubId(env, stripeSubId) {
 export async function mirrorBarnModeSubscriptionFromStripe(env, stripeSub, { eventId, forcedStatus } = {}) {
   if (!stripeSub?.id) return { ok: false, error: 'missing_subscription' };
 
-  const ownerIdMeta = stripeSub.metadata?.ml_owner_id || null;
+  // Phase 9 — the same mirror function handles owner (barn_mode) and
+  // trainer (trainer_pro) subs. Discriminator is metadata.ml_source.
+  const source = stripeSub.metadata?.ml_source || null;
+  const isTrainerPro = source === 'trainer_pro_subscription';
+  const targetTier   = isTrainerPro ? 'trainer_pro' : 'barn_mode';
+  const targetScope  = isTrainerPro ? 'trainer' : 'owner';
+
+  const ownerIdMeta = isTrainerPro
+    ? (stripeSub.metadata?.ml_user_id || null)
+    : (stripeSub.metadata?.ml_owner_id || null);
   const existing = await getSubscriptionByStripeSubId(env, stripeSub.id);
   const existingRow = existing.data;
 
-  // If neither metadata says "barn_mode_subscription" nor we already mirror it,
+  // If neither metadata identifies a ML user nor we already mirror it,
   // leave it alone — Phase 6.5 ecommerce subs must not touch this table.
   if (!existingRow && !ownerIdMeta) {
-    return { ok: true, ignored: true, reason: 'not_barn_mode_subscription' };
+    return { ok: true, ignored: true, reason: 'not_ml_subscription' };
   }
   const ownerId = existingRow?.owner_id || ownerIdMeta;
-  if (!ownerId) return { ok: true, ignored: true, reason: 'no_owner_id' };
+  if (!ownerId) return { ok: true, ignored: true, reason: 'no_user_id' };
 
   const nextStatus = forcedStatus || stripeStatusToBarnMode(stripeSub.status);
   const toIso = (t) => (Number.isFinite(t) ? new Date(t * 1000).toISOString() : null);
@@ -446,7 +534,7 @@ export async function mirrorBarnModeSubscriptionFromStripe(env, stripeSub, { eve
     : (stripeSub.customer?.id || null);
 
   const patch = {
-    tier:                   'barn_mode',
+    tier:                   targetTier,
     status:                 nextStatus,
     stripe_customer_id:     customerId,
     stripe_subscription_id: stripeSub.id,
@@ -465,7 +553,11 @@ export async function mirrorBarnModeSubscriptionFromStripe(env, stripeSub, { eve
 
   let rowId = existingRow?.id || null;
   if (!existingRow) {
-    const ins = await insertSubscriptionRow(env, { owner_id: ownerId, ...patch });
+    const ins = await insertSubscriptionRow(env, {
+      owner_id:   ownerId,
+      role_scope: targetScope,
+      ...patch,
+    });
     if (!ins.ok) return { ok: false, error: 'insert_failed' };
     rowId = ins.data?.id || null;
   } else {
@@ -473,30 +565,33 @@ export async function mirrorBarnModeSubscriptionFromStripe(env, stripeSub, { eve
     if (!up.ok) return { ok: false, error: 'patch_failed' };
   }
 
-  // Emit entitlement event only on material transitions.
-  let evtType = null;
-  if (!existingRow && (nextStatus === 'active' || nextStatus === 'trialing')) {
-    evtType = 'granted';
-  } else if (existingRow) {
-    if (prevStatus !== 'cancelled' && nextStatus === 'cancelled')       evtType = 'cancelled';
-    else if (prevStatus !== 'past_due' && nextStatus === 'past_due')    evtType = 'grace_started';
-    else if (prevStatus === 'past_due' && (nextStatus === 'active' || nextStatus === 'trialing'))
+  // Entitlement events are an owner-only concept (Barn Mode audit).
+  // Trainer Pro transitions audit via the main audit_log only.
+  if (!isTrainerPro) {
+    let evtType = null;
+    if (!existingRow && (nextStatus === 'active' || nextStatus === 'trialing')) {
       evtType = 'granted';
-    else if (prevTier !== 'barn_mode' && nextStatus === 'active')       evtType = 'granted';
-  }
-  if (evtType) {
-    await insertEntitlementEvent(env, {
-      owner_id:        ownerId,
-      event:           evtType,
-      reason:          `stripe:${eventId || 'webhook'}`,
-      source:          'stripe_webhook',
-      prev_tier:       prevTier,
-      next_tier:       'barn_mode',
-      metadata:        { stripe_subscription_id: stripeSub.id, status: nextStatus },
-    });
+    } else if (existingRow) {
+      if (prevStatus !== 'cancelled' && nextStatus === 'cancelled')       evtType = 'cancelled';
+      else if (prevStatus !== 'past_due' && nextStatus === 'past_due')    evtType = 'grace_started';
+      else if (prevStatus === 'past_due' && (nextStatus === 'active' || nextStatus === 'trialing'))
+        evtType = 'granted';
+      else if (prevTier !== 'barn_mode' && nextStatus === 'active')       evtType = 'granted';
+    }
+    if (evtType) {
+      await insertEntitlementEvent(env, {
+        owner_id:        ownerId,
+        event:           evtType,
+        reason:          `stripe:${eventId || 'webhook'}`,
+        source:          'stripe_webhook',
+        prev_tier:       prevTier,
+        next_tier:       'barn_mode',
+        metadata:        { stripe_subscription_id: stripeSub.id, status: nextStatus },
+      });
+    }
   }
 
-  return { ok: true, mirrored: true, owner_id: ownerId, status: nextStatus };
+  return { ok: true, mirrored: true, owner_id: ownerId, role_scope: targetScope, status: nextStatus };
 }
 
 /**
@@ -508,8 +603,9 @@ export async function handleBarnModeCheckoutCompleted(env, session, eventId) {
   if (session?.mode !== 'subscription') {
     return { ok: true, ignored: true, reason: 'not_subscription_mode' };
   }
-  if (session?.metadata?.ml_source !== 'barn_mode_subscription') {
-    return { ok: true, ignored: true, reason: 'not_barn_mode_source' };
+  const src = session?.metadata?.ml_source;
+  if (src !== 'barn_mode_subscription' && src !== 'trainer_pro_subscription') {
+    return { ok: true, ignored: true, reason: 'not_ml_source' };
   }
   const stripeSubId = typeof session.subscription === 'string'
     ? session.subscription
@@ -521,8 +617,14 @@ export async function handleBarnModeCheckoutCompleted(env, session, eventId) {
 
   // Carry checkout metadata forward onto the sub if Stripe didn't attach it.
   if (!sub.data.metadata) sub.data.metadata = {};
+  if (!sub.data.metadata.ml_source && session.metadata?.ml_source) {
+    sub.data.metadata.ml_source = session.metadata.ml_source;
+  }
   if (!sub.data.metadata.ml_owner_id && session.metadata?.ml_owner_id) {
     sub.data.metadata.ml_owner_id = session.metadata.ml_owner_id;
+  }
+  if (!sub.data.metadata.ml_user_id && session.metadata?.ml_user_id) {
+    sub.data.metadata.ml_user_id = session.metadata.ml_user_id;
   }
 
   return mirrorBarnModeSubscriptionFromStripe(env, sub.data, { eventId });

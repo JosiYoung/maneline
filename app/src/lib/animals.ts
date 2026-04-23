@@ -27,9 +27,10 @@ export type AnimalInput = {
 
 export const ANIMALS_QUERY_KEY = ["animals"] as const;
 
-// Phase 8 — the DB trigger `enforce_horse_limit` raises P0001 with message
-// `barn_mode_required: ...` when a free-tier owner tries to add a 4th horse.
-// The SPA hard-paywall dialog catches this specific error type.
+// Phase 8/9 — the DB trigger `enforce_horse_limit` raises P0001 with message
+// `barn_mode_required: ...` when a free-tier owner tries to add a 6th horse
+// (cap bumped 3→5 in Phase 9). The SPA hard-paywall dialog catches this
+// specific error type.
 export class BarnModeRequiredError extends Error {
   readonly currentHorseCount: number | null;
   constructor(message: string, currentHorseCount: number | null) {
@@ -101,7 +102,7 @@ export async function createAnimal(input: AnimalInput): Promise<Animal> {
     const paywall = isBarnModePaywallError(error);
     if (paywall) {
       throw new BarnModeRequiredError(
-        "Barn Mode is required to track more than 3 horses.",
+        "Barn Mode is required to track more than 5 horses.",
         paywall.horseCount,
       );
     }

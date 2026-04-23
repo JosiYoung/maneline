@@ -12,7 +12,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { notify } from "@/lib/toast";
 import { mapSupabaseError } from "@/lib/errors";
-import { ACCESS_QUERY_KEY, grantAccess } from "@/lib/access";
+import { ACCESS_QUERY_KEY, grantAccess, TrainerProRequiredError } from "@/lib/access";
 import { ANIMALS_QUERY_KEY, listAnimals } from "@/lib/animals";
 
 const schema = z
@@ -82,6 +82,10 @@ export default function TrainerInvite() {
       navigate("/app/trainers");
     },
     onError: (err) => {
+      if (err instanceof TrainerProRequiredError) {
+        notify.error(err.message);
+        return;
+      }
       const code = (err as Error & { code?: string }).code;
       if (code === "trainer_not_found") {
         notify.error("No approved trainer with that email. Ask them to sign up and get approved first.");
