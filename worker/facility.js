@@ -88,6 +88,27 @@ export async function listOwnerRanches(env, ownerId) {
 }
 
 /**
+ * Inserts a ranch row for the owner. Caller has already auth'd the actor.
+ */
+export async function insertRanch(env, ownerId, payload) {
+  const r = await fetch(`${RESTB(env)}/ranches`, {
+    method: 'POST',
+    headers: { ...SR(env), 'Content-Type': 'application/json', Prefer: 'return=representation' },
+    body: JSON.stringify([{
+      owner_id: ownerId,
+      name: payload.name,
+      address: payload.address ?? null,
+      city: payload.city ?? null,
+      state: payload.state ?? null,
+      color_hex: payload.color_hex ?? null,
+    }]),
+  });
+  if (!r.ok) return { ok: false, status: r.status, data: null };
+  const data = await r.json().catch(() => []);
+  return { ok: true, status: r.status, data: Array.isArray(data) ? data[0] : null };
+}
+
+/**
  * Reads the full facility map for a ranch — stalls + current
  * assignments + turnout_groups + active members. Single network
  * request each to keep SR simple; the SPA expects one consolidated

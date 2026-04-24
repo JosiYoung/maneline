@@ -188,6 +188,7 @@ import {
   CARE_MATRIX_COLUMNS,
   getOwnerRanch as fmGetOwnerRanch,
   listOwnerRanches as fmListOwnerRanches,
+  insertRanch as fmInsertRanch,
   readFacilityMap as fmReadFacilityMap,
   getOwnerStall as fmGetOwnerStall,
   getOwnerTurnoutGroup as fmGetOwnerTurnoutGroup,
@@ -403,6 +404,9 @@ export default {
       // --- Phase 8 Barn Mode — Module 03 (facility map + care matrix) ---
       if (url.pathname === '/api/barn/facility/ranches' && request.method === 'GET') {
         return handleFacilityRanches(request, env, ctx);
+      }
+      if (url.pathname === '/api/barn/facility/ranches' && request.method === 'POST') {
+        return handleFacilityRanchCreate(request, env, ctx);
       }
       if (url.pathname === '/api/barn/facility/map' && request.method === 'GET') {
         return handleFacilityMap(request, env, url, ctx);
@@ -9567,6 +9571,50 @@ async function handleStallCreate(request, env, ctx) {
   }, ctx);
 
   return json({ stall: ins.data }, 201);
+}
+
+async function handleFacilityRanchCreate(request, env, ctx) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireOwner(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:facility_ranch_ins:${actorId}`, FACILITY_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_request' }, 400); }
+
+  const errs = [];
+  if (typeof body?.name !== 'string' || body.name.trim().length < 1 || body.name.trim().length > 120) {
+    errs.push('name must be 1-120 chars');
+  }
+  const optStr = (v, max) => v === null || v === undefined || (typeof v === 'string' && v.length <= max);
+  if (!optStr(body?.address, 200)) errs.push('address must be <=200 chars');
+  if (!optStr(body?.city, 100)) errs.push('city must be <=100 chars');
+  if (!optStr(body?.state, 100)) errs.push('state must be <=100 chars');
+  if (!validColorHex(body?.color_hex)) errs.push('color_hex must be #RRGGBB');
+  if (errs.length) return json({ error: 'validation_failed', errors: errs }, 400);
+
+  const ins = await fmInsertRanch(env, actorId, {
+    name: body.name.trim(),
+    address: body.address?.trim() || null,
+    city: body.city?.trim() || null,
+    state: body.state?.trim() || null,
+    color_hex: body.color_hex ?? null,
+  });
+  if (!ins.ok || !ins.data) return json({ error: 'insert_failed', status: ins.status }, 500);
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'owner',
+    action: 'barn.facility.ranch_create',
+    target_table: 'ranches', target_id: ins.data.id,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { name: ins.data.name },
+  }, ctx);
+
+  return json({ ranch: ins.data }, 201);
 }
 
 async function handleStallPatch(request, env, stallId, ctx) {

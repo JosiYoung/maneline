@@ -29,6 +29,7 @@ import {
   archiveStall,
   archiveTurnoutGroup,
   assignStall,
+  createRanch,
   createStall,
   createTurnoutGroup,
   formatCareMatrixColumn,
@@ -65,6 +66,7 @@ export default function BarnFacility() {
 
   const ranches = ranchesQ.data ?? [];
   const [ranchId, setRanchId] = useState<string>("");
+  const [addRanchOpen, setAddRanchOpen] = useState(false);
 
   useEffect(() => {
     if (!ranchId && ranches.length > 0) {
@@ -119,6 +121,14 @@ export default function BarnFacility() {
               )}
             </select>
           )}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setAddRanchOpen(true)}
+          >
+            <Plus className="mr-1 h-4 w-4" />
+            New ranch
+          </Button>
         </div>
       </header>
 
@@ -130,10 +140,18 @@ export default function BarnFacility() {
         </Card>
       ) : !ranchId ? (
         <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            {ranchesQ.isLoading
-              ? "Loading ranches…"
-              : "Add a ranch in Settings → Ranches to get started."}
+          <CardContent className="space-y-3 py-10 text-center text-sm text-muted-foreground">
+            {ranchesQ.isLoading ? (
+              "Loading ranches…"
+            ) : (
+              <>
+                <p>No ranches yet.</p>
+                <Button onClick={() => setAddRanchOpen(true)}>
+                  <Plus className="mr-1 h-4 w-4" />
+                  Add your first ranch
+                </Button>
+              </>
+            )}
           </CardContent>
         </Card>
       ) : (
@@ -154,7 +172,117 @@ export default function BarnFacility() {
           </TabsContent>
         </Tabs>
       )}
+
+      <CreateRanchDialog
+        open={addRanchOpen}
+        onClose={() => setAddRanchOpen(false)}
+        onCreated={(created) => {
+          qc.invalidateQueries({ queryKey: FACILITY_RANCHES_QUERY_KEY });
+          setRanchId(created.id);
+        }}
+      />
     </div>
+  );
+}
+
+function CreateRanchDialog({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: (ranch: { id: string; name: string; color_hex: string | null }) => void;
+}) {
+  const [name, setName] = useState("");
+  const [address, setAddress] = useState("");
+  const [city, setCity] = useState("");
+  const [stateRegion, setStateRegion] = useState("");
+
+  const m = useMutation({
+    mutationFn: async () => {
+      const trimmed = name.trim();
+      if (!trimmed) throw new Error("Ranch name is required.");
+      return createRanch({
+        name: trimmed,
+        address: address.trim() || null,
+        city: city.trim() || null,
+        state: stateRegion.trim() || null,
+      });
+    },
+    onSuccess: (ranch) => {
+      notify.success("Ranch added");
+      onCreated(ranch);
+      setName("");
+      setAddress("");
+      setCity("");
+      setStateRegion("");
+      onClose();
+    },
+    onError: (err) => notify.error(mapSupabaseError(err as Error)),
+  });
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => { if (!v) onClose(); }}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Add ranch</DialogTitle>
+          <DialogDescription>
+            Create a ranch to organize stalls, turnout, and daily care.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <Label htmlFor="ranch-name">Name</Label>
+            <Input
+              id="ranch-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              maxLength={120}
+              autoFocus
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="ranch-address">Address (optional)</Label>
+            <Input
+              id="ranch-address"
+              value={address}
+              onChange={(e) => setAddress(e.target.value)}
+              maxLength={200}
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <Label htmlFor="ranch-city">City</Label>
+              <Input
+                id="ranch-city"
+                value={city}
+                onChange={(e) => setCity(e.target.value)}
+                maxLength={100}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="ranch-state">State</Label>
+              <Input
+                id="ranch-state"
+                value={stateRegion}
+                onChange={(e) => setStateRegion(e.target.value)}
+                maxLength={100}
+              />
+            </div>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose} disabled={m.isPending}>
+            Cancel
+          </Button>
+          <Button onClick={() => m.mutate()} disabled={m.isPending || !name.trim()}>
+            {m.isPending && <Loader2 className="mr-1 h-4 w-4 animate-spin" />}
+            Add
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

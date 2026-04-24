@@ -775,6 +775,25 @@ export async function getFacilityMap(ranchId: string): Promise<FacilityMapRespon
   );
 }
 
+export interface CreateRanchInput {
+  name: string;
+  address?: string | null;
+  city?: string | null;
+  state?: string | null;
+  color_hex?: string | null;
+}
+
+export async function createRanch(input: CreateRanchInput): Promise<FacilityRanch> {
+  const r = await workerFetch<{ ranch: FacilityRanch }>(
+    "/api/barn/facility/ranches",
+    {
+      method: "POST",
+      body: JSON.stringify(input),
+    },
+  );
+  return r.ranch;
+}
+
 export interface CreateStallInput {
   ranch_id: string;
   label: string;
