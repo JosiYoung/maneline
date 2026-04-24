@@ -14,7 +14,7 @@ Use the PIN shortcuts in `memory/demo_pins.md` to sign in as the three dev accou
 
 - Each section is a flow to walk through in order. Tick the box only when the UI action _and_ the DB write have both been verified (Supabase Studio row confirmation, or the audit_log row if it's a worker-fronted action).
 - **🔴 blockers** must pass before public sign-off. **🟡 highs** must be triaged (fix or accept risk). **⚪ lows** are hygiene — log to TECH-DEBT if deferred.
-- Anything prefixed `[CONFIG]` is a deploy/secret gate, not a code gate. Those roll up to `docs/phase-8/TECH-DEBT.md`.
+- Anything prefixed `[CONFIG]` is a deploy/secret gate, not a code gate. Those roll up to `docs/TECH_DEBT.md`.
 - **🟢 Fixed in `<sha>`** tags annotate items addressed after the initial sweep — the box is still unchecked because a human needs to walk the flow and confirm the fix holds in-situ.
 
 ---

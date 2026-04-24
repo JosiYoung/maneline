@@ -1,9 +1,13 @@
-# TECH_DEBT marker convention
+# Mane Line — Tech Debt Ledger
 
-## What it is
+**Last refreshed:** 2026-04-24 after commit `f7a1344` (preflight sweep + UAT refresh).
+**Scope:** consolidated across all phases; supersedes the now-deleted `docs/phase-8/TECH-DEBT.md` and the pre-sweep `docs/TECH_DEBT.md`.
 
-When we knowingly ship a shortcut, hardcode, placeholder, or deferred
-follow-up, we annotate the exact spot in source with a grep-friendly marker:
+---
+
+## 1. Marker convention
+
+When we knowingly ship a shortcut, hardcode, placeholder, or deferred follow-up, we annotate the exact spot in source with a grep-friendly marker:
 
 ```
 TECH_DEBT(<phase>): <one-line description>
@@ -24,66 +28,126 @@ Examples:
 // once we have write access to the script project.
 ```
 
-## Why this convention
+**Why this convention:**
 
-1. **Greppable.** `grep -rn "TECH_DEBT"` across the repo gives a complete,
-   sortable list of outstanding shortcuts. We can't scatter TODO / XXX / FIXME
-   without losing signal among third-party dependencies' own comments.
-2. **Phase-tagged.** Every marker carries the phase by which the debt must
-   be paid. Phase gates can fail the release if any marker tagged with a
-   prior phase is still present.
-3. **No orphan tickets.** The comment IS the ticket. Anything worth tracking
-   separately (design work, UX review) goes in the roadmap doc instead.
+1. **Greppable.** `grep -rn "TECH_DEBT"` across the repo gives a complete, sortable list of outstanding shortcuts.
+2. **Phase-tagged.** Every marker carries the phase by which the debt should be paid. Phase gates fail if any marker tagged with a prior phase is still present.
+3. **No orphan tickets.** The comment IS the ticket. Anything worth tracking separately (design work, UX review) goes in the roadmap doc instead.
 
-## Phase tags
+**Phase tags in use:** `phase-1` (owner MVP) · `phase-2` (trainer + Stripe) · `phase-3` (Shopify + checkout) · `phase-3.5` (protocols) · `phase-4` (protocol brain + RAG) · `phase-5` (admin + vet + HubSpot) · `phase-6` (onboarding + DO rate limiter) · `phase-7` (invoices + receipts) · `phase-8:NN` (Barn Mode modules) · `phase-9` (trainer paywall + messaging + ratings) · `eventually` (nice-to-have, no committed phase). Use `eventually` sparingly.
 
-- `phase-0` — must be resolved before Phase 0 is called done
-- `phase-1` — owner portal MVP
-- `phase-2` — multi-species / dog support
-- `phase-3` — vet-share bundles
-- `phase-4` — integrations hardening (Apps Script HMAC, etc.)
-- `phase-5` — admin portal + service-role migration
-- `eventually` — known nice-to-have, no committed phase yet
+**Don't tag:** in-progress feature-branch work (use TODO, clean up before merge), style nitpicks (just fix), or "could be faster" without a measured bottleneck.
 
-Use `eventually` sparingly — it's a last resort for real deferral. If you're
-tempted to use it for something that will affect compliance or safety, pick
-a concrete phase instead.
+When you add a marker, add a row below. When you resolve one, delete the row in the same commit that removes the marker.
 
-## What NOT to tag
+---
 
-- In-progress work in a feature branch — use a regular TODO and clean it up
-  before merge.
-- Style nitpicks — just fix them.
-- "Could be faster" optimizations with no current pain — don't tag unless
-  a real bottleneck has been measured.
+## 2. Active tech debt (blocks gate)
 
-## Current outstanding markers
+Status legend: 🔴 blocked on external input · 🟡 work written but not shipped · ⚪ work not yet written · 🟢 resolved in `<sha>` (deletion pending).
 
-As of Phase 3 sign-off (2026-04-17):
+### 2.1 Deploy + secret gates
 
-| Tag | Location | Summary |
-|---|---|---|
-| phase-1 | `app/src/lib/database.types.ts` | Replace hand-rolled types with `supabase gen types` output |
-| phase-2 | `worker/stripe.js`, `worker.js` (`handleStripeConnect*`) | `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` are placeholders; Cedric is verifying the company's payment processor before we mint live keys. All `/api/stripe/*` endpoints return `501 stripe_not_configured` until secrets are added via `npx wrangler secret put`; the SPA renders a "waiting on keys" state in that case. Resolve by setting the secrets in production + preview environments. |
-| phase-4 | `supabase-edge/apps-script/*` (future) | Add HMAC signing to Google Apps Script payloads |
-| phase-5 | `supabase/migrations/00002_phase0_multirole_foundation.sql` | Admin RLS policies were dropped in 00004; this file's REVISIT block is superseded |
-| phase-2 | `docs/phase-2-plan.md` §4 (Prompt 2.10) | 18-step Phase 2 verification drill deferred to the post-P0 end-to-end UAT pass. Steps 2–6, 8–16, 18 are blocked on live Stripe keys + deployed Worker + deployed `sweep-stripe-events` Edge Function + `pg_cron` schedule wired in SQL Editor. Static grep steps (1, 7, 17) ran clean on 2026-04-17 with the noted exceptions: `app/src/components/trainer/VetRecordsList.tsx:93` (vet-record warning badge — pre-existing Phase 1 hex) and `app/src/components/shared/PaymentForm.tsx` (Stripe Elements `colorPrimary` — required by Stripe SDK, not brand drift). Resolve by running the full drill once client delivers `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` + `VITE_STRIPE_PUBLIC_KEY`. |
-| phase-3 | `docs/phase-3-plan.md` §4 (Prompt 3.10) — Shopify sync steps | Phase 3.2 drill steps 2–5 deferred to the post-P0 end-to-end UAT pass. Steps 2 (live sync populates `products`), 3 (placeholder-safe skip — re-runs cleanly without the token), and 4 (KV catalog read path + `shop:v1:list` warm cache) are blocked on `SHOPIFY_STORE_DOMAIN` + `SHOPIFY_STOREFRONT_TOKEN` + `MANELINE_WORKER_URL` delivery and the hourly `pg_cron` schedule being wired in SQL Editor per `supabase/functions/shopify-catalog-sync/README.md`. Edge Function deployed v1 on 2026-04-17 and is placeholder-safe (returns `{ skipped: 'shopify_not_configured' }` when tokens absent). `app/src/integrations/shopify.ts` Phase 0 mock was removed in Prompt 3.3 (SPA now reads `/api/shop/products` via `app/src/lib/shop.ts`). Resolve by running drill steps 2–4 end-to-end once the Silver Lining Storefront token is provisioned. |
-| phase-3 | `worker/stripe-checkout.js`, `worker.js` (`handleShopCheckout`) | Phase 3.4 end-to-end checkout redirect blocked on `SLH_CONNECT_ACCOUNT_ID` Worker secret (Silver Lining's Stripe Connect account id). Until present, `POST /api/shop/checkout` takes the fallback path: inserts `orders.status='awaiting_merchant_setup'` and returns `{ status: 'awaiting_merchant_setup' }` without a Stripe session (SPA clears cart + shows info toast). With the secret set, handler mints a Checkout Session with `payment_intent_data.transfer_data.destination = <acct>` + `application_fee_amount = 0` + `Idempotency-Key: shop_checkout:${order_id}`. Also depends on Phase 2 `STRIPE_SECRET_KEY` (already TECH_DEBT-tagged above). Resolve by running the 3.10 drill's Stripe redirect steps once `SLH_CONNECT_ACCOUNT_ID` lands via `npx wrangler secret put`. |
-| phase-3 | `worker.js` (`handleCheckoutSessionCompleted` + `handleCheckoutSessionAsyncPaymentFailed`), `worker/shopify-admin.js` (`adjustInventory`) | Phase 3.5 webhook + success/cancel UI is built but the live path is blocked on the same Stripe secrets as Phase 2 (`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` already TECH_DEBT-tagged) plus `SLH_CONNECT_ACCOUNT_ID` (3.4 row). Server-side inventory decrement is further gated on the optional `SHOPIFY_ADMIN_API_TOKEN`; without it, `adjustInventory` is a no-op that logs once per process and the hourly Storefront sync reconciles inventory within ~1h. Resolve by running the 3.10 drill's Stripe Checkout + webhook steps once the Stripe keys + Connect account id (+ optional Admin token) land. |
-| phase-3 | `docs/phase-3-plan.md` §4 (Prompt 3.10) | 20-step Phase 3 verification drill partially deferred to the post-P0 end-to-end UAT pass. Steps 1, 5, 6, 14, 15, 16, 17, 19, 20 ran 🟢 on 2026-04-17 (migration SQL, static greps across shop/orders/expenses scope, orders RLS verified via `pg_policies`, expense form flows preview-verified in 3.7/3.8, `nightly-backup` v4 invoked with 98 files written to `JosiYoung/Databackup` incl. all 6 Phase 3 tables and zero card data). Steps 2, 3, 4 (Shopify sync + catalog read + placeholder path) blocked on `SHOPIFY_STORE_DOMAIN` + `SHOPIFY_STOREFRONT_TOKEN`. Steps 7, 8 (out-of-stock tile + cart state) blocked on live product rows (no SKUs until sync runs). Steps 9–13 (checkout redirect, normal pay, webhook idempotency, payment fail, inventory decrement) blocked on `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` + `SLH_CONNECT_ACCOUNT_ID` (+ optional `SHOPIFY_ADMIN_API_TOKEN` for step 13). Step 18 (in-expense Buy-now end-to-end) blocked on the same Stripe + Shopify keys. Static grep exceptions: `@heroui/react` matches in `components/owner/AnimalCard.tsx`, `pages/app/TodayView.tsx`, `components/owner/OwnerLayout.tsx` are pre-existing Phase 0/1 imports outside the Phase 3 shop/orders/expenses scope — not drift from this phase. Resolve by running drill steps 2–4, 7–13, 18 end-to-end once the client lands the Shopify + Stripe secrets. |
-| phase-3.5 | `supabase/migrations/00011_phase3_5_protocols.sql`, `app/src/components/owner/ProtocolsSection.tsx`, `app/src/pages/app/TodayView.tsx` | Phase 3.5 supplement protocol tracker (P0 catch-up before Phase 4) landed in code but the migration has NOT yet been applied to the remote Supabase. Until `supabase db push` runs, `/app/animals/:id` + `/trainer/animals/:id` render the Protocols empty state and background queries return 404 (graceful — no crash). `protocols` seed still carries 5 placeholder rows flagged in `supabase/seeds/protocols.sql`; real SLH content replaces these BEFORE Phase 4 public launch so Vectorize RAGs against production copy. Resolve by (1) `supabase db push` on remote, (2) running verification drill in `docs/phase-3.5-plan.md` §C, (3) replacing seed content with SLH's real protocol playbooks. |
-| phase-5 | `app/src/pages/admin/AdminIndex.tsx` | **Trainer vetting admin queue** — `trainer_profiles` + `trainer_applications` exist (Phase 0) but `/admin/trainer-applications` is a "coming soon" stub. P0 per feature map §3.3. Until this ships, trainers who sign up land on `/trainer/pending-review` indefinitely; only a service-role SQL update flips `application_status='approved'`. Resolve by building the admin review UI with approve/reject + reason, writing `trainer_profiles.reviewed_by/reviewed_at/review_notes`, and clearing the pending-review gate. |
-| phase-5 | `app/src/pages/VetView.tsx`, `supabase/migrations/*` (future) | **Vet View scoped magic link** — route exists at `/vet/:token` but token issuance + scoped-read are not wired. P0 per feature map §3.1 ("Share 12-month record with vet"). Requires: `vet_share_tokens` table (owner_id, animal_id, token, expires_at, scope jsonb, viewed_at), owner UI to generate/copy link from `/app/animals/:id/records`, Worker endpoint that validates token + serves scoped records without auth, and `audit_log` entries on view. |
-| phase-5 | `app/src/integrations/hubspot.ts`, `worker.js` (future `/webhooks/hubspot-sync`) | **HubSpot CRM sync** — client-side integration stub exists; no Worker-side webhook or retry queue. P0 per feature map §3.3 + §4.6.2. Requires: Worker endpoint that upserts contacts/deals on `profiles.insert` / `trainer_applications.insert` / `orders.insert` (via Stripe webhook), `hubspot_sync_log` table for audit, `pending_hubspot_syncs` queue + 15-min retry cron. Blocked on `HUBSPOT_PRIVATE_APP_TOKEN` secret. |
-| phase-5 | `app/src/pages/admin/AdminIndex.tsx` | **Admin KPI dashboard + user directory** — only `/admin/settings/fees` tab is live. P0 per feature map §3.3. Requires WAU/MAU/GMV/attach-rate tiles (service-role aggregation endpoint) and `/admin/users` searchable directory across `profiles` + `trainer_profiles` + `animals`. Every query logged to `audit_log` per §4.3. |
-| phase-5 | `supabase/migrations/*` (future), `app/src/pages/admin/*` | **Support inbox** — no `support_tickets` table, no in-app help widget, no admin reader. P0 per feature map §3.3. Requires: `support_tickets` table (owner_id, category, body, status, resolved_at, assignee_id), widget that writes tickets from any portal, `/admin/support` inbox, Sheets L1 mirror (OAG Law 2). |
-| phase-5 | `worker/stripe.js` (future refund handler), `app/src/pages/admin/*` | **Refunds + subscription management** — no admin refund UI and no subscription panel. P0 per feature map §3.3. Stripe dashboard is the fallback until this lands. Requires: `order_refunds` table, admin action on `/admin/orders/:id` that calls Stripe `refunds.create` via Connect + writes the refund row, and a `/admin/subscriptions` panel once auto-ship ships (currently open item in §3.4). |
-| phase-4 | `public.products` row `JOINT-001`, `public.protocols` (Protocol #10) | **Dev-stub Joint Formula product + SKU link** — Phase 4.6 in-chat add-to-cart verification required a real `products` row and a `protocols.linked_sku_codes` entry. Products table was empty (no Shopify sync yet) and every seeded protocol had `linked_sku_codes = '{}'`. As a dev smoke, a stub product (`sku='JOINT-001'`, `title='Joint Formula (dev stub)'`, `shopify_variant_id='dev-stub-var-1'`, `price_cents=3499`, `available=true`) was inserted and linked to Protocol #10 (Joint Support). Resolve by: (1) wiring Shopify catalog sync with real tokens (blocks on `SHOPIFY_STORE_DOMAIN` + `SHOPIFY_STOREFRONT_TOKEN`), (2) deleting the stub row (`delete from products where sku='JOINT-001';` — `orders` never referenced it since the smoke stopped at cart), (3) populating `linked_sku_codes` on every published protocol from the SLH-provided CSV before the Phase 4.10 drill runs against production. |
-| phase-4 | `app/src/components/landing/ScrollHero.tsx`, `app/public/Landing/` | **Landing hero video + poster frame** — current scrub source (`15439204_3840_2160_60fps.mp4`, 24 MiB) and companion B-roll (`8624835-hd_1920_1080_30fps.mp4`, 8 MiB) are stock Pexels clips. A larger 49 MiB portrait clip (`12016358_2160_3840_60fps.mp4`) was removed during Phase 4.4 deploy because it exceeded the Workers Assets 25 MiB per-file cap and was unreferenced. Poster is a temporary gradient SVG (`hero-poster.svg`). Resolve by: (1) commissioning real brand-shot horse footage from the SLH ranch, (2) re-encoding with every-frame keyframes (`-g 1 -keyint_min 1`) for smooth scrubbing, (3) extracting a proper first-frame poster (`ffmpeg -ss 0 -frames:v 1 -q:v 2 hero-poster.jpg`), and (4) if the final MP4 exceeds 25 MiB, hosting on R2 + fronting with a custom domain rather than bundling into the Worker asset package. |
+These are `[CONFIG]`-level — the code is written; a `wrangler secret put` or dashboard toggle flips them live.
 
-| phase-5 | `worker.js` (`rateLimitKv`) | **KV-based rate limiter is best-effort under burst** — Workers KV has two caps that collide with rate-limiting: per-key writes max out at ~1/sec (a 65-parallel burst throws `KV PUT failed: 429 Too Many Requests`) and reads are edge-cached with a 60s minimum TTL (so counter reads stay stale for up to a minute after the write lands). Net effect on `/api/vet/:token`: during a true burst from one POP, reads see stale `state.count ≤ 60` → all requests pass 200 even past the 60/min cap. KV writes _are_ being throttled by the 1-write/sec cap, which indirectly limits sustained throughput to ~60/min per token, but the 429 response the 5.9 drill expects on "61st request" isn't reliably observed. `adminOrderRefund` and the support-ticket + upload-sign limiters share the same helper and have the same caveat. Resolve by migrating `rateLimitKv` to a Durable Object with atomic `state.blockConcurrencyWhile` — either a single `RateLimiter` DO class keyed by bucket or one DO instance per hot key. Unblocks tight 429s under burst and makes the 5.9 step 14 check deterministic. |
-| phase-5 | `docs/phase-5-plan.md` §5.9 | **Admin drill partially deferred** — 5.9 ran 🟢 on 2026-04-20 across: step 1 (all Phase 5 migrations applied), step 2 (RLS enabled on all 6 new tables; service-role-only for `hubspot_sync_log` + `pending_hubspot_syncs`), step 3 (non-admin JWT returns 403 from `/api/admin/kpis`, verified with owner PIN), step 4 (`GET /api/admin/kpis` returns non-null mau/wau/gmv/attach_rate), step 5 (`GET /api/admin/users?q=cedric` returns 3 rows), step 6 (`GET /api/admin/users.csv` streams 200 + `content-type: text/csv`), step 7 (trainer approve hits `admin_decide_trainer` RPC and enqueues `maneline_trainer_decision` into `pending_hubspot_syncs`), step 9 (support ticket owner-create → admin-list → admin-claim → admin-resolve round-trip), steps 12–13 (vet share create → anon GET 200 → revoke → anon GET 410), step 17 (audit_log has 15 distinct `admin.*` actions with sane counts — proves the pipeline writes), step 18 (manual `nightly-backup` invocation v7 wrote 142 files including all 6 new tables; manifest `version: "5.0"`), step 19 (`/api/_integrations-health` returns the new `admin.audit_writes_24h` + `vet_view.scoped_reads_24h` blocks), step 20 (static grep: zero `@heroui/react`, zero hex literals, zero `console.log` under `app/src/pages/admin/**`). **Phase 6 code-progress (2026-04-20 / Prompt 6.8):** (a) Step 14 strict-429 — **code-closed** in 6.3 by the new `RateLimiter` Durable Object at `worker.js:rateLimitDO` + `worker/rate-limiter-do.js`; `state.blockConcurrencyWhile` serialises reads+writes so a 65-parallel burst splits deterministically. Live-traffic confirmation happens in 6.9 drill step 15; until then the 5.9 step-14 box stays amber. (b) Step 8 trainer-reject email — **still deferred**. `worker/resend.js:sendEmail` exists (6.2) and is called on invitation creation, but the reject branch in `worker.js:708` (`admin.trainer.reject`) does NOT yet call it; header comment on `worker/resend.js` explicitly lists trainer-reject as v1.1 scope. Resolve by wiring `sendEmail({subject: "Your Mane Line trainer application", ...})` into the `decision === 'rejected'` branch once SLH confirms reject-email copy. (c) Steps 10–11 (refund $1 + idempotency) — **still secrets-blocked** on `STRIPE_SECRET_KEY`. (d) Steps 15–16 (HubSpot drain + dead-letter) — **still secrets-blocked** on `HUBSPOT_PRIVATE_APP_TOKEN`. Row stays until live-secret drill pass lands steps 8/10/11/15/16 🟢; step 14 is provisionally green pending 6.9. |
+| # | Slug | Where | Unblock |
+|---|---|---|---|
+| `phase-2` | Stripe platform keys | `worker/stripe.js`, `worker.js` (`handleStripeConnect*`) | `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` via `wrangler secret put`. All `/api/stripe/*` endpoints return `501 stripe_not_configured` until set. 🔴 |
+| `phase-2` | Phase 2 verification drill | `docs/phase-2-plan.md` §4 (now deleted; recoverable from git history) | 18-step drill deferred until live Stripe keys + deployed Worker + `sweep-stripe-events` Edge Function + `pg_cron` schedule are wired. Static greps (steps 1, 7, 17) ran clean on 2026-04-17. 🔴 |
+| `phase-3` | Shopify sync keys | `supabase-edge/shopify-catalog-sync`, `worker/stripe-checkout.js` | `SHOPIFY_STORE_DOMAIN` + `SHOPIFY_STOREFRONT_TOKEN` + `MANELINE_WORKER_URL`; Edge Function deployed v1 on 2026-04-17 (placeholder-safe, returns `{ skipped: 'shopify_not_configured' }` without token). Hourly `pg_cron` schedule must also be wired in SQL Editor. 🔴 |
+| `phase-3` | SLH Stripe Connect account id | `worker.js` (`handleShopCheckout`), `worker/stripe-checkout.js` | `SLH_CONNECT_ACCOUNT_ID` — without it, `POST /api/shop/checkout` inserts `orders.status='awaiting_merchant_setup'` and returns `{ status: 'awaiting_merchant_setup' }` without a Stripe session. 🔴 |
+| `phase-3` | Stripe + Shopify webhook/inventory | `worker.js` (`handleCheckoutSessionCompleted`, `handleCheckoutSessionAsyncPaymentFailed`), `worker/shopify-admin.js` (`adjustInventory`) | Same Stripe secrets as above + optional `SHOPIFY_ADMIN_API_TOKEN` for inline inventory decrement (hourly storefront sync reconciles within ~1h if the Admin token is absent). 🔴 |
+| `phase-4` | Landing hero video + poster | `app/src/components/landing/ScrollHero.tsx`, `app/public/Landing/` | Stock Pexels clips in place. Resolve by (1) commissioning real brand-shot horse footage from the SLH ranch, (2) re-encoding with every-frame keyframes, (3) extracting a proper first-frame poster. If final MP4 > 25 MiB, host on R2 + front with custom domain. 🟡 |
+| `phase-5` | HubSpot private-app token | `app/src/integrations/hubspot.ts`, `worker.js` (`/webhooks/hubspot-sync`) | `HUBSPOT_PRIVATE_APP_TOKEN` blocks the sync drain + retry queue. 🔴 |
+| `phase-5` | Phase 5 drill residuals | see deleted `docs/phase-5-plan.md` §5.9 | Steps 8 (trainer-reject email — Resend sender wired but `decision==='rejected'` branch at `worker.js:708` not yet calling `sendEmail`), 10–11 (Stripe refund + idempotency), 15–16 (HubSpot drain + dead-letter) still secrets-blocked. Step 14 (strict-429 under burst) code-closed in 6.3 via `RateLimiter` Durable Object; live-traffic verification deferred. 🔴 |
+| `phase-8:01-01` | Worker deploy of Barn routes | `worker.js` | `/api/barn/*` + `/api/public/events/:token` code exists; §F.4–§F.14 verify suite cannot run. 🟡 |
+| `phase-8:01-02` | `pg_cron` barn-reminders-tick | SQL Editor | `*/15 * * * *` calling `/api/_internal/barn-reminders-tick` with `X-Internal-Secret`. Scans T-48h / T-24h / T-2h windows. ⚪ |
+| `phase-8:01-03` | `pg_cron` barn-materialize-recurrences | SQL Editor | Nightly `17 3 * * *` extends recurrence horizon. ⚪ |
+| `phase-8:01-04` | `pg_cron` pro-claim-email | SQL Editor | Daily `23 14 * * *` fires soft-signup "claim your pro account" email after 3 successful responses from the same `pro_contact_id`. ⚪ |
+| `phase-8:01-05` | `WORKER_INTERNAL_SECRET` | Worker env | All three internal cron endpoints reject with 401 until provisioned. `wrangler secret put WORKER_INTERNAL_SECRET` (32+ random bytes, base64url). 🔴 |
+| `phase-8:01-06` | `PUBLIC_APP_URL` | Worker env | External-attendee emails embed a broken link without this. `wrangler secret put PUBLIC_APP_URL` (e.g. `https://maneline.co`). 🔴 |
+| `phase-8:01-07` | Per-instance attendees on RRULE | Migration extension | When a recurrence materializes extra instances, only the base event has `barn_event_attendees` rows. Counter-propose on instance 7 of a weekly series currently targets the base attendee set. ⚪ |
+| `phase-8:01-09` | Twilio SMS opt-in for external attendees | Worker Barn paths | Gated behind Barn Mode entitlement; falls through to email-only until Module 05 ships. 🟡 |
+| `phase-8:01-10` | `.ics` attachment live smoke | Worker + Resend | External-invite `.ics` parse not verified against Apple/Google Calendar inboxes yet. 🟡 |
+| `phase-8:02-01` | Herd Health PDF R2 pipeline | `worker/pdf/templates/herd-health.css`, Browser Rendering | `POST /api/barn/herd-health/report.pdf` implemented but live render not verified. 🟡 |
+| `phase-8:02-02` | Barn Mode gate stub | `worker/barn-mode-gate.js` | PDF export returns `402 barn_mode_required` when caller is not on Barn Mode; gate is a stub returning `true` for every owner until Module 05 entitlement checks ship end-to-end. ⚪ |
+| `phase-8:03-01` | Facility PDF export | `worker.js` | `POST /api/barn/facility/print.pdf` stubs to 501. Reuses Module 02 Browser Rendering pipeline once live. 🟡 |
+| `phase-8:03-02` | Stall drag-drop | SPA Barn Facility | Stall assignment uses a pick-list dialog. Full `@dnd-kit` wiring + visual grid with `position_row/col` deferred — core CRUD + RLS verified. ⚪ |
+| `phase-8:03-03` | Care matrix fallback scope | SPA Barn Facility | Owners with no stall assignments see "No horses are currently assigned to stalls" — intentional (matrix is barn-staff tool). Drill-step check. ⚪ |
+| `phase-8:04-01` | Spending PDF export | `worker.js` | `POST /api/barn/spending/export.pdf` stubs to 501. Same pipeline as 02-01. 🟡 |
+| `phase-8:04-02` | Multi-line-item invoice mirror | Trigger `mirror_invoice_to_expense` | Current trigger inserts one `expenses` row per paid invoice, attributed to the first active `animal_access_grants` row between trainer + owner. Multi-horse / multi-line-item mapping deferred. ⚪ |
+| `phase-8:04-04` | Receipt upload (Worker redeploy) | Dev SPA | **DB CHECK 🟢 Resolved in migration `00031_r2_kind_expand.sql`** — `r2_objects.kind` now accepts `expense_receipt` + `trainer_logo`. SPA + Worker code was already wired; the deployed Worker was returning `400 bad_kind` + the DB was returning `23514` on commit. Worker redeploy + dev smoke still required to tick this as done. 🟡 |
+| `phase-8:05-01` | Stripe Barn-Mode price ids | Stripe dashboard | `STRIPE_PRICE_BARN_MODE_MONTHLY` ($25/mo) mandatory; `STRIPE_PRICE_BARN_MODE_ANNUAL` ($250/yr) optional per decision. 🔴 |
+| `phase-8:05-02` | Stripe webhook live verify | `worker/subscription.js` | Code wired (`mirrorBarnModeSubscriptionFromStripe` + `handleCheckoutSessionCompleted` short-circuit) but not verified against live Stripe events. 🟡 |
+| `phase-8:05-03` | SLH Shopify token | Worker env | `SILVER_LINING_SHOPIFY_ADMIN_TOKEN` + `SILVER_LINING_SHOPIFY_STORE_DOMAIN` not delivered by SLH ops. 🔴 |
+| `phase-8:05-04` | SL verification cron body | `worker.js` (`handleSilverLiningVerifyTick`) | Handler returns 501 with `tech_debt: phase-8:05-04` — Shopify Admin API shape (native `subscription_contracts` vs ReCharge vs Bold) unconfirmed; also requires `pg_cron` schedule once unblocked. ⚪ |
+| `phase-8:05-05` | Worker `/api/animals` paywall layer | `worker.js` | DB trigger `enforce_horse_limit` enforces horse-#4 paywall (raises P0001); if a Worker `POST /api/animals` route is ever added it must wrap the same check. Defensive-only. ⚪ |
+| `phase-8:05-06` | SL link flow | `worker.js` (`/api/barn/silver-lining/link*`) | Handlers return 501; Stripe SetupIntent side is wired. Blocked on SLH token + 05-04 cron body. ⚪ |
+| `phase-8:05-08` | Subscription health counters | `/api/_integrations-health` | Counters listed in 06-01 not yet extended — Module 06 sweep. 🟡 |
+| `phase-8:06-01` | Health endpoint extension | `/api/_integrations-health` | Extended with `barn.*`, `health.*`, `facility.*`, `spending.*`, `subscriptions.*`, `silver_lining.*`, `promo_codes.*` counters. Values null/zero until traffic lands. 🟡 |
+| `phase-8:06-02` | Nightly backup table list | `nightly-backup/index.ts` | Extended with Phase 7 + 8 tables (manifest `version: "8.0"`). Shipped; next scheduled run picks up the new list. 🟡 |
+| `phase-8:06-03` | Health endpoint live verify | Worker curl | Counters verified against `information_schema` at build time; not yet verified against deployed Worker. 🟡 |
+| `phase-8:07-01` | Barn Mode 25-step drill | End-to-end | Cannot run without all deploy keys. 🔴 |
+| `phase-8:07-02` | Hard paywall live smoke | Dev preview | Free-tier 4th-horse create must surface `BarnModePaywallDialog` (client-side catch of trigger P0001). Code wired; live smoke deferred. 🟡 |
 
-When you add a new marker, also add the row here. When you resolve one,
-delete the row in the same commit that removes the marker.
+### 2.2 Preflight-sweep residuals (2026-04-24)
+
+From the audit swarm + deep DB-verification agent at commit `cd65205`:
+
+| # | Slug | Where | Unblock |
+|---|---|---|---|
+| `phase-8:presign-ttl` | R2 presigned PUT TTL too long | `worker.js:3584-3592` | Current 300s; narrow to ≤120s. 🟡 |
+| `phase-8:stripe-webhook-501` | `STRIPE_WEBHOOK_SECRET` absence returns 501 | `worker.js:6613-6616` | Should return 401 (fail-closed, no reconnaissance signal). 🟡 |
+| `phase-5` | `btree_gist` extension in `public` schema | Advisor lint | Move to `extensions` schema. Requires superuser migration. 🟡 |
+| `phase-8:kpi-audit` | `admin_kpi_snapshot` skips audit_log | `worker.js:905` | Every other admin endpoint writes to `audit_log`; add a row here for parity. 🟡 |
+| `phase-8:admin-pin-nav` | `/admin/settings/pin` missing nav entry | `AdminIndex.tsx` TABS array | Route exists but no NavLink. 🟡 |
+| `phase-8:today-error-card` | `TodayView` stuck on skeleton on error | `app/src/pages/app/TodayView.tsx:47-49` | Currently calls `notify.error()` but never renders an error Card. 🟡 |
+| `phase-8:owner-pay-protect` | `/app/sessions/:id/pay` missing `<ProtectedRoute>` | `app/src/pages/owner/OwnerIndex.tsx:49` | RLS + role check cover; add route wrapper for defence-in-depth. 🟡 |
+| `phase-8:a11y-iconbuttons` | Icon-only buttons missing `aria-label` | `BarnCalendar.tsx:270`, `SessionsIndex`, admin inline-edits | A11y. 🟡 |
+| `phase-8:back-links` | Missing top-of-page back links | `BarnSpendingAnimal`, `InvoiceDetail` (normal state), `SubscriptionDetail`, `/trainer/invoices/recurring` | Dead-ends if sub-nav fails. 🟡 |
+| `phase-8:error-boundary` | No top-level `<ErrorBoundary>` | `OwnerLayout`, `TrainerLayout`, `AdminLayout` | Child crash nukes whole portal. 🟡 |
+| `phase-8:invoice-detail-errors` | Raw `(err as Error).message` in `InvoiceDetail` | `app/src/pages/trainer/InvoiceDetail.tsx` | Wrap with `mapSupabaseError()` for friendly copy. 🟡 |
+| `phase-8:sessions-loading` | `SessionsIndex` bare loading text | `app/src/pages/trainer/SessionsIndex.tsx` | Replace with skeleton. 🟡 |
+| `phase-8:form-html-validation` | zod-only form validation | Various owner/admin forms | Add HTML `required` + `maxLength` so browser UX catches before submit. 🟡 |
+| `phase-8:home-dangerouslysethtml` | `dangerouslySetInnerHTML` on hardcoded strings | `Home.tsx:1400`, `Home.tsx:2107` | Safe today (hardcoded `&mdash;` / `&rsquo;`); comment or replace with helper before any CMS sourcing. ⚪ |
+| `phase-9` | Animals archive DB trigger (defence-in-depth) | `animals` table | Worker `/api/animals/archive|unarchive` writes `animal_archive_events` atomically; `animals_owner_all` RLS grants `for all`, so a direct `supabase-js` UPDATE could bypass the audit. Add a BEFORE UPDATE trigger that inserts into `animal_archive_events` when `archived_at IS DISTINCT FROM OLD.archived_at`, coordinated with the Worker to avoid double-audit. No current code path bypasses the Worker. ⚪ |
+| `phase-9` | Unused-index re-audit | `pg_stat_user_indexes` | 91 of 92 `unused_index` advisor hits retained because `idx_scan=0` reflects zero production traffic, not genuine waste. Re-audit ~2 weeks post-launch. ⚪ |
+
+### 2.3 Long-standing stragglers
+
+| # | Slug | Where | Unblock |
+|---|---|---|---|
+| `phase-1` | Hand-rolled DB types | `app/src/lib/database.types.ts` | Replace with `supabase gen types` output. 🟡 |
+| `phase-2` | Gmail relay hook | `worker.js:4716` | Wire Gmail relay; placeholder until then. ⚪ |
+| `phase-2.5` | Owner one-tap confirm email | `worker.js:7524` | Email owner a one-tap confirm link before auto-actions. ⚪ |
+| `phase-4` | Google Apps Script HMAC | `supabase-edge/apps-script/*` (future) | Sign payloads once we have write access to the script project. ⚪ |
+| `phase-4` | Dev-stub Joint Formula product | `products` row `JOINT-001`, `protocols` Protocol #10 | Delete stub + populate real `linked_sku_codes` from SLH CSV after Shopify sync lands. ⚪ |
+| `phase-5` | Ranch-scope in grants RLS | `supabase/migrations/00004:123`, `00027:105` | Deferred until `animals.ranch_id` ships. Ranch-scope grants type-check but do not affect per-animal RLS; owner + animal + owner_all scopes are fully enforced. ⚪ |
+| `phase-5` | Admin RLS policy superseded | `supabase/migrations/00002_phase0_multirole_foundation.sql` | REVISIT block superseded by drop in 00004. Cleanup-only. ⚪ |
+| `phase-5` | KV rate-limiter fallback | `worker.js` (`rateLimitKv`) | Best-effort under burst (KV per-key write cap + 60s read cache). Migrated hot paths to the `RateLimiter` Durable Object in Phase 6.3; legacy KV path still exists for non-hot callers. ⚪ |
+
+---
+
+## 3. Resolved in `cd65205` (preflight sweep, 2026-04-24)
+
+Kept here for one cycle so auditors can see what just landed; drop in the next sweep.
+
+| Was | Resolution |
+|---|---|
+| 🔴 `r2_objects.kind` CHECK rejected `expense_receipt` + `trainer_logo` — every `/api/uploads/commit` for those kinds 500'd with SQLSTATE `23514` (found by deep DB-verification agent `a61de6a5c3b825b20`). | Migration `00031_r2_kind_expand.sql`. |
+| 🔴 `worker/facility.js` `getOwnerRanch` + `listOwnerRanches` referenced nonexistent `ranches.archived_at` + `ranches.address_line1` — every Barn Facility endpoint 500'd. | Column is `address`; `archived_at` filter removed. |
+| 🔴 `professional_contacts.role` CHECK rejected 4 of 8 SPA categories (nutritionist, bodyworker, boarding, hauler). | Migration `00035_pro_contacts_roles_expand.sql` + Worker `BARN_CONTACT_ROLES` expanded 5→9. |
+| 🔴 Barn Calendar RSVP payload schema mismatch between SPA and Worker — every decline + counter 400'd (`response`→`status`, `countered_*`→`counter_start_at`/`response_note`, etc.). | `app/src/lib/barn.ts` realigned to DB shape; 4 pages updated (BarnContacts, BarnCalendar, PublicEventAccept, MySchedule). |
+| 🔴 Owner "Mark confirmed/declined on attendee" silently no-op'd — handler ignored `body.attendee_id` and looked up the caller's own row. | `worker.js handleBarnEventRespond` now honours `attendee_id` with ownership verification; audit tags `on_behalf=true`. |
+| 🟡 `promo_codes` had RLS enabled with zero policies (advisor `rls_enabled_no_policy`). | Migration `00030_audit_hardening.sql` §3 adds explicit silver-lining-admin SELECT policy. |
+| 🟡 138 `multiple_permissive_policies` (expenses: 18, supplement_doses: 12). | Migration `00033_rls_permissive_consolidation.sql`. |
+| 🟡 113 `auth_rls_initplan` warnings. | Migration `00032_rls_initplan_optimize.sql` — `auth.uid()` wrapped in `(select …)`. |
+| 🟡 30+ unindexed FKs (horse_messages, invoice_line_items, animal_media, health_thresholds, etc.). | Migration `00030_audit_hardening.sql` §2 (hot paths) + `00034_fk_indexes_sweep.sql` (full sweep, 31 partial indexes). |
+| 🟡 10 functions with mutable `search_path`. | Migration `00030_audit_hardening.sql` §1 — `set search_path = public, pg_temp` via `ALTER FUNCTION`. |
+| 🟡 Admin promo-code archive/restore missing. | New `archiveAdminPromoCode` / `unarchiveAdminPromoCode` endpoints + UI toggle in `PromoCodesIndex`. |
+| 🟡 `@supabase/supabase-js` stale. | Bumped 2.103.3 → 2.104.1. 0 prod vulns. |
+| 🟡 `horse_messages_animal_idx` strictly redundant (strict prefix of composite). | Migration `00036_drop_redundant_horse_messages_index.sql`. |
+
+---
+
+**Gate rule:** every 🔴 / 🟡 row in §2 must be either resolved or explicitly re-homed to v1.1 before calling the build "launch-ready." ⚪ rows can ship to closed beta if the owner of the row accepts the risk; they cannot ship to public launch.
