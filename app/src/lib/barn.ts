@@ -22,10 +22,15 @@ export type ProContactRole =
 export interface ProContact {
   id: string;
   owner_id: string;
-  display_name: string;
+  // DB column is `name`; matches the Worker validator at `worker.js`
+  // normalizeContactBody. The UI labels this "Display name" — that is
+  // presentation-layer only.
+  name: string;
   role: ProContactRole;
   email: string | null;
   phone_e164: string | null;
+  company: string | null;
+  sms_opt_in: boolean;
   linked_user_id: string | null;
   response_count_confirmed: number;
   claim_email_sent_at: string | null;
@@ -35,33 +40,51 @@ export interface ProContact {
   updated_at: string;
 }
 
-export type BarnEventStatus = "scheduled" | "cancelled" | "completed";
+// Matches DB CHECK barn_events_status_check.
+export type BarnEventStatus =
+  | "scheduled"
+  | "in_progress"
+  | "completed"
+  | "cancelled";
 
+// Matches DB CHECK barn_event_attendees_current_status_check.
 export type AttendeeStatus =
   | "pending"
   | "confirmed"
   | "declined"
   | "countered"
-  | "no_response";
+  | "cancelled";
+
+// Matches DB CHECK barn_event_responses_status_check.
+export type BarnEventResponseStatus =
+  | "confirmed"
+  | "declined"
+  | "countered"
+  | "cancelled";
+
+export type ResponderChannel = "in_app" | "public_token";
 
 export type DeliveryChannel = "in_app" | "email" | "email_sms";
+
+export type BarnEventPrefillSource =
+  | "herd_health_dashboard"
+  | "manual"
+  | "recurrence_materialize";
 
 export interface BarnEvent {
   id: string;
   owner_id: string;
   ranch_id: string | null;
   title: string;
-  description: string | null;
   start_at: string;
   duration_minutes: number;
   location_text: string | null;
   animal_ids: string[];
   notes: string | null;
+  created_by: string;
   status: BarnEventStatus;
   recurrence_rule_id: string | null;
-  parent_event_id: string | null;
-  cancelled_at: string | null;
-  cancelled_reason: string | null;
+  prefill_source: BarnEventPrefillSource | null;
   archived_at: string | null;
   created_at: string;
   updated_at: string;
@@ -78,21 +101,21 @@ export interface BarnEventAttendee {
   public_token: string | null;
   token_expires_at: string | null;
   current_status: AttendeeStatus;
-  countered_start_at: string | null;
-  countered_note: string | null;
+  last_notified_at: string | null;
   created_at: string;
-  updated_at: string;
+  archived_at: string | null;
 }
 
 export interface BarnEventResponse {
   id: string;
   event_id: string;
   attendee_id: string;
-  actor_user_id: string | null;
-  response: "confirmed" | "declined" | "countered";
-  countered_start_at: string | null;
-  countered_note: string | null;
-  ip_hash: string | null;
+  responder_channel: ResponderChannel;
+  responder_user_id: string | null;
+  status: BarnEventResponseStatus;
+  counter_start_at: string | null;
+  response_note: string | null;
+  ip: string | null;
   user_agent: string | null;
   created_at: string;
 }
@@ -125,7 +148,6 @@ export interface AttendeeInput {
 
 export interface CreateEventInput {
   title: string;
-  description?: string | null;
   start_at: string;
   duration_minutes: number;
   location_text?: string | null;
@@ -220,10 +242,12 @@ export async function listProContacts(params: {
 }
 
 export interface CreateProContactInput {
-  display_name: string;
+  name: string;
   role: ProContactRole;
   email?: string | null;
   phone_e164?: string | null;
+  company?: string | null;
+  sms_opt_in?: boolean;
   notes?: string | null;
 }
 
@@ -292,7 +316,6 @@ export async function updateEvent(
   patch: Partial<Pick<
     CreateEventInput,
     | "title"
-    | "description"
     | "start_at"
     | "duration_minutes"
     | "location_text"
@@ -325,10 +348,15 @@ export async function archiveEvent(id: string): Promise<{ event: BarnEvent }> {
 }
 
 export interface RespondInput {
-  attendee_id: string;
-  response: "confirmed" | "declined" | "countered";
-  countered_start_at?: string | null;
-  countered_note?: string | null;
+  /**
+   * attendee_id is retained for backwards compatibility with callers —
+   * the Worker handler resolves the attendee from the caller's
+   * linked_user_id instead and ignores this field.
+   */
+  attendee_id?: string;
+  status: "confirmed" | "declined" | "countered";
+  counter_start_at?: string | null;
+  response_note?: string | null;
 }
 
 export async function respondToEvent(
@@ -380,11 +408,11 @@ export async function publicGetEvent(token: string): Promise<PublicEventView> {
 export async function publicRespond(
   token: string,
   input: {
-    response: "confirmed" | "declined" | "countered";
-    countered_start_at?: string | null;
-    countered_note?: string | null;
+    status: "confirmed" | "declined" | "countered";
+    counter_start_at?: string | null;
+    response_note?: string | null;
   }
-): Promise<{ ok: true; current_status: AttendeeStatus }> {
+): Promise<{ response: BarnEventResponse; current_status: AttendeeStatus }> {
   const res = await fetch(
     `/api/public/events/${encodeURIComponent(token)}/respond`,
     {
@@ -400,7 +428,7 @@ export async function publicRespond(
     const err = (data as { error?: string; message?: string } | null) ?? {};
     throw new Error(err.message || err.error || `Request failed (${res.status})`);
   }
-  return data as { ok: true; current_status: AttendeeStatus };
+  return data as { response: BarnEventResponse; current_status: AttendeeStatus };
 }
 
 // ---------- Display helpers ----------
@@ -438,7 +466,7 @@ export function formatAttendeeStatus(s: AttendeeStatus): string {
     case "confirmed":    return "Confirmed";
     case "declined":     return "Declined";
     case "countered":    return "Counter-proposed";
-    case "no_response":  return "No response";
+    case "cancelled":    return "Cancelled";
   }
 }
 
@@ -450,7 +478,7 @@ export function attendeeStatusTone(
     case "pending":      return "secondary";
     case "countered":    return "outline";
     case "declined":     return "destructive";
-    case "no_response":  return "outline";
+    case "cancelled":    return "outline";
   }
 }
 
@@ -738,7 +766,9 @@ export interface CareMatrixEntry {
 
 export interface FacilityMapResponse {
   ranch: FacilityRanch & {
-    address_line1: string | null;
+    // DB column is `ranches.address` (single free-text line), not
+    // the split address_line1/2 the earlier SPA draft assumed.
+    address: string | null;
     city: string | null;
     state: string | null;
   };
@@ -1197,20 +1227,41 @@ export interface AdminPromoCode {
   single_use: boolean;
   expires_at: string | null;
   redeemed_at: string | null;
-  redeemed_by: string | null;
+  redeemed_by_owner_id: string | null;
   notes: string | null;
   created_at: string;
   created_by: string | null;
+  archived_at: string | null;
 }
 
 export async function listAdminPromoCodes(
-  campaign?: string
+  campaign?: string,
+  opts: { includeArchived?: boolean } = {}
 ): Promise<AdminPromoCode[]> {
-  const qp = campaign ? `?campaign=${encodeURIComponent(campaign)}` : "";
+  const params = new URLSearchParams();
+  if (campaign) params.set("campaign", campaign);
+  if (opts.includeArchived) params.set("include_archived", "1");
+  const qp = params.toString() ? `?${params.toString()}` : "";
   const r = await workerFetch<{ codes: AdminPromoCode[] }>(
     `/api/admin/promo-codes${qp}`
   );
   return r.codes;
+}
+
+export async function archiveAdminPromoCode(id: string): Promise<AdminPromoCode> {
+  const r = await workerFetch<{ code: AdminPromoCode }>(
+    `/api/admin/promo-codes/${id}/archive`,
+    { method: "POST" }
+  );
+  return r.code;
+}
+
+export async function unarchiveAdminPromoCode(id: string): Promise<AdminPromoCode> {
+  const r = await workerFetch<{ code: AdminPromoCode }>(
+    `/api/admin/promo-codes/${id}/unarchive`,
+    { method: "POST" }
+  );
+  return r.code;
 }
 
 export interface CreateAdminPromoCodesInput {

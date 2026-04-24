@@ -232,6 +232,8 @@ import {
   markPromoRedeemed,
   listPromoCodes,
   insertPromoCodesBulk,
+  archivePromoCode,
+  unarchivePromoCode,
   generatePromoCode,
   ensurePlatformStripeCustomer,
   createBarnModeCheckoutSession,
@@ -524,6 +526,13 @@ export default {
       }
       if (url.pathname === '/api/admin/promo-codes' && request.method === 'POST') {
         return handleAdminPromoCodesCreate(request, env, ctx);
+      }
+      if (url.pathname.startsWith('/api/admin/promo-codes/') && request.method === 'POST') {
+        const rest = url.pathname.slice('/api/admin/promo-codes/'.length);
+        const m = rest.match(/^([0-9a-f-]{36})\/(archive|unarchive)$/i);
+        if (m) {
+          return handleAdminPromoCodeArchiveToggle(request, env, ctx, m[1], m[2] === 'archive');
+        }
       }
       if (url.pathname === '/api/stripe/connect/onboard') {
         return handleStripeConnectOnboard(request, env, url);
@@ -3588,7 +3597,14 @@ async function handleUploadSign(request, env) {
       accountId: env.R2_ACCOUNT_ID,
       accessKeyId: env.R2_ACCESS_KEY_ID,
       secretKey: env.R2_SECRET_ACCESS_KEY,
-      expiresSec: 300,
+      // 120s covers a normal presign→PUT round trip with slack for
+      // mobile uploads. Narrower than the previous 300s to reduce
+      // the window where a leaked URL (DevTools, MITM, log scrape)
+      // can be replayed by an attacker to upload arbitrary content
+      // under the actor's prefix. GET presign at line 3913 stays at
+      // 300s because embedded signed <img> URLs need to survive
+      // between page load and render.
+      expiresSec: 120,
     });
   } catch (err) {
     return json({ error: 'presign_failed', detail: err?.message ?? 'unknown' }, 500);
@@ -6611,8 +6627,13 @@ async function handleStripeWebhook(request, env) {
     return json({ error: 'not_configured' }, 500);
   }
   if (!env.STRIPE_WEBHOOK_SECRET) {
-    // Placeholder until the payment processor is verified.
-    return json({ error: 'webhook_not_configured' }, 501);
+    // Fail closed. 401 (not 501) so an attacker scanning for
+    // misconfigured instances can't differentiate "endpoint exists
+    // but no secret" from "endpoint rejects my signature" by status
+    // code — both look like auth failures from the outside. Keep a
+    // loud log line so ops notices the secret is missing.
+    console.warn('[stripe_webhook] STRIPE_WEBHOOK_SECRET not set — rejecting');
+    return json({ error: 'invalid_signature' }, 401);
   }
 
   // Per-IP ceiling — Stripe's own throughput is well below this.
@@ -8062,7 +8083,20 @@ async function handleChat(request, env, ctx) {
    ============================================================= */
 
 const BARN_CONTACT_RATE = { limit: 30, windowSec: 60 };
-const BARN_CONTACT_ROLES = new Set(['trainer', 'vet', 'farrier', 'staff', 'other']);
+// Aligned with SPA `ProContactRole` in app/src/lib/barn.ts + DB CHECK
+// professional_contacts_role_check (migration 00035). `staff` is kept
+// for backward compatibility with rows that predate the SPA role set.
+const BARN_CONTACT_ROLES = new Set([
+  'farrier',
+  'vet',
+  'nutritionist',
+  'bodyworker',
+  'trainer',
+  'boarding',
+  'hauler',
+  'staff',
+  'other',
+]);
 
 function normalizeContactBody(body, { requireAll = true } = {}) {
   const out = {};
@@ -8077,7 +8111,7 @@ function normalizeContactBody(body, { requireAll = true } = {}) {
   }
   if (body.role !== undefined || requireAll) {
     if (!BARN_CONTACT_ROLES.has(body.role)) {
-      errs.push('role must be one of trainer|vet|farrier|staff|other');
+      errs.push('role must be one of farrier|vet|nutritionist|bodyworker|trainer|boarding|hauler|staff|other');
     } else {
       out.role = body.role;
     }
@@ -8740,12 +8774,42 @@ async function handleBarnEventRespond(request, env, id, ctx) {
     if (!counterStart) return json({ error: 'counter_start_at_required' }, 400);
   }
 
-  // Find the caller's attendee row on this event.
-  const attQ = `select=id,linked_user_id,event_id&event_id=eq.${id}&linked_user_id=eq.${actorId}&archived_at=is.null&limit=1`;
-  const ar = await barnSrSelect(env, 'barn_event_attendees', attQ);
-  if (!ar.ok) return json({ error: 'attendee_lookup_failed' }, 500);
-  const attendee = Array.isArray(ar.data) ? ar.data[0] : null;
-  if (!attendee) return json({ error: 'not_an_attendee' }, 403);
+  // Resolve the target attendee row.
+  //
+  // Two valid paths:
+  //   1. The owner of the event passes an explicit attendee_id in the
+  //      body to mark any invitee as confirmed/declined/countered on
+  //      their behalf (e.g. phoned in an RSVP). We verify the attendee
+  //      actually belongs to this event before trusting it.
+  //   2. No attendee_id — caller is answering for themselves. We look
+  //      up their own attendee row by linked_user_id.
+  //
+  // The legacy handler ignored body.attendee_id entirely, so owner
+  // self-RSVP-on-behalf-of was silently a no-op against their own row.
+  const rawAttendeeId = typeof body.attendee_id === 'string' ? body.attendee_id.trim() : '';
+  let attendee = null;
+  if (rawAttendeeId) {
+    // Owner-assist path — verify both the attendee and the event owner.
+    if (!isUuid(rawAttendeeId)) return json({ error: 'bad_attendee_id' }, 400);
+    const evQ = `select=id,owner_id&id=eq.${id}&limit=1`;
+    const er = await barnSrSelect(env, 'barn_events', evQ);
+    if (!er.ok) return json({ error: 'event_lookup_failed' }, 500);
+    const ev = Array.isArray(er.data) ? er.data[0] : null;
+    if (!ev) return json({ error: 'event_not_found' }, 404);
+    if (ev.owner_id !== actorId) return json({ error: 'forbidden' }, 403);
+    const attQ = `select=id,linked_user_id,event_id&event_id=eq.${id}&id=eq.${rawAttendeeId}&archived_at=is.null&limit=1`;
+    const ar = await barnSrSelect(env, 'barn_event_attendees', attQ);
+    if (!ar.ok) return json({ error: 'attendee_lookup_failed' }, 500);
+    attendee = Array.isArray(ar.data) ? ar.data[0] : null;
+    if (!attendee) return json({ error: 'attendee_not_found' }, 404);
+  } else {
+    // Self path — the caller's own attendee row on this event.
+    const attQ = `select=id,linked_user_id,event_id&event_id=eq.${id}&linked_user_id=eq.${actorId}&archived_at=is.null&limit=1`;
+    const ar = await barnSrSelect(env, 'barn_event_attendees', attQ);
+    if (!ar.ok) return json({ error: 'attendee_lookup_failed' }, 500);
+    attendee = Array.isArray(ar.data) ? ar.data[0] : null;
+    if (!attendee) return json({ error: 'not_an_attendee' }, 403);
+  }
 
   const respIns = await barnSrInsertReturning(env, 'barn_event_responses', {
     event_id: id,
@@ -8760,15 +8824,17 @@ async function handleBarnEventRespond(request, env, id, ctx) {
   });
   if (!respIns.ok || !respIns.data) return json({ error: 'response_insert_failed' }, 500);
 
+  const onBehalf = rawAttendeeId && attendee.linked_user_id !== actorId;
+
   ctx_audit(env, {
     actor_id: actorId,
-    actor_role: 'attendee',
+    actor_role: onBehalf ? 'owner' : 'attendee',
     action: 'barn.event.respond',
     target_table: 'barn_event_responses',
     target_id: respIns.data.id,
     ip: clientIp(request),
     user_agent: request.headers.get('user-agent') || null,
-    metadata: { event_id: id, status },
+    metadata: { event_id: id, attendee_id: attendee.id, status, on_behalf: Boolean(onBehalf) },
   }, ctx);
 
   return json({ response: respIns.data, current_status: status });
@@ -10964,7 +11030,8 @@ async function handleAdminPromoCodesList(request, env, url, ctx) {
   catch (resp) { if (resp instanceof Response) return resp; throw resp; }
 
   const campaign = url.searchParams.get('campaign') || null;
-  const rows = await listPromoCodes(env, campaign);
+  const includeArchived = url.searchParams.get('include_archived') === '1';
+  const rows = await listPromoCodes(env, campaign, { includeArchived });
   if (!rows.ok) return json({ error: 'promo_list_failed' }, 500);
 
   ctx_audit(env, {
@@ -10973,10 +11040,40 @@ async function handleAdminPromoCodesList(request, env, url, ctx) {
     target_table: 'promo_codes', target_id: null,
     ip: clientIp(request),
     user_agent: request.headers.get('user-agent') || null,
-    metadata: { campaign, row_count: rows.data.length },
+    metadata: { campaign, include_archived: includeArchived, row_count: rows.data.length },
   }, ctx);
 
   return json({ codes: rows.data });
+}
+
+async function handleAdminPromoCodeArchiveToggle(request, env, ctx, promoId, archive) {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json({ error: 'not_configured' }, 500);
+  let actorId;
+  try { ({ actorId } = await requireSilverLiningAdmin(request, env)); }
+  catch (resp) { if (resp instanceof Response) return resp; throw resp; }
+
+  const rl = await rateLimit(env, `ratelimit:admin_promo_write:${actorId}`, ADMIN_PROMO_WRITE_RATE);
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
+
+  const res = archive
+    ? await archivePromoCode(env, promoId)
+    : await unarchivePromoCode(env, promoId);
+  if (!res.ok) return json({ error: 'promo_update_failed', status: res.status }, 500);
+  if (!res.data) {
+    // Row didn't exist, was already in target state, or (for archive) already redeemed.
+    return json({ error: 'promo_not_eligible' }, 409);
+  }
+
+  ctx_audit(env, {
+    actor_id: actorId, actor_role: 'silver_lining',
+    action: archive ? 'admin.promo_codes.archive' : 'admin.promo_codes.unarchive',
+    target_table: 'promo_codes', target_id: promoId,
+    ip: clientIp(request),
+    user_agent: request.headers.get('user-agent') || null,
+    metadata: { campaign: res.data.campaign || null },
+  }, ctx);
+
+  return json({ code: res.data });
 }
 
 async function handleAdminPromoCodesCreate(request, env, ctx) {

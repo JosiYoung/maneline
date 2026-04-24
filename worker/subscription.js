@@ -312,18 +312,47 @@ export async function markPromoRedeemed(env, promoId, ownerId) {
   return { ok: true, status: r.status, data: Array.isArray(data) ? data[0] : null };
 }
 
-export async function listPromoCodes(env, campaign) {
+export async function listPromoCodes(env, campaign, { includeArchived = false } = {}) {
   const params = [
     'select=id,code,campaign,grants_barn_mode_months,single_use,expires_at,redeemed_at,redeemed_by_owner_id,created_at,archived_at,notes',
-    'archived_at=is.null',
     'order=created_at.desc',
     'limit=500',
   ];
+  if (!includeArchived) params.push('archived_at=is.null');
   if (campaign) params.push(`campaign=eq.${encodeURIComponent(campaign)}`);
   const r = await fetch(`${RESTB(env)}/promo_codes?${params.join('&')}`, { headers: SR(env) });
   if (!r.ok) return { ok: false, status: r.status, data: null };
   const rows = (await r.json().catch(() => [])) || [];
   return { ok: true, status: 200, data: rows };
+}
+
+export async function archivePromoCode(env, promoId) {
+  // Only flip archived_at if still NULL and the code has not been redeemed.
+  const r = await fetch(
+    `${RESTB(env)}/promo_codes?id=eq.${promoId}&archived_at=is.null&redeemed_at=is.null`,
+    {
+      method: 'PATCH',
+      headers: { ...SR(env), 'Content-Type': 'application/json', Prefer: 'return=representation' },
+      body: JSON.stringify({ archived_at: new Date().toISOString() }),
+    }
+  );
+  if (!r.ok) return { ok: false, status: r.status, data: null };
+  const data = (await r.json().catch(() => [])) || [];
+  return { ok: true, status: r.status, data: Array.isArray(data) ? data[0] || null : null };
+}
+
+export async function unarchivePromoCode(env, promoId) {
+  const r = await fetch(
+    `${RESTB(env)}/promo_codes?id=eq.${promoId}&archived_at=not.is.null`,
+    {
+      method: 'PATCH',
+      headers: { ...SR(env), 'Content-Type': 'application/json', Prefer: 'return=representation' },
+      body: JSON.stringify({ archived_at: null }),
+    }
+  );
+  if (!r.ok) return { ok: false, status: r.status, data: null };
+  const data = (await r.json().catch(() => [])) || [];
+  return { ok: true, status: r.status, data: Array.isArray(data) ? data[0] || null : null };
 }
 
 export async function insertPromoCodesBulk(env, rows) {

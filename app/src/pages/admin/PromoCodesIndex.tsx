@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Copy, Plus } from "lucide-react";
+import { Archive, ArchiveRestore, Copy, Plus } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -29,8 +29,10 @@ import {
 import { notify } from "@/lib/toast";
 import { mapSupabaseError } from "@/lib/errors";
 import {
+  archiveAdminPromoCode,
   createAdminPromoCodes,
   listAdminPromoCodes,
+  unarchiveAdminPromoCode,
   type AdminPromoCode,
 } from "@/lib/barn";
 
@@ -45,11 +47,17 @@ const PROMO_CODES_QUERY_KEY = ["admin", "promo_codes"] as const;
 
 export default function PromoCodesIndex() {
   const [campaignFilter, setCampaignFilter] = useState<string>("");
+  const [includeArchived, setIncludeArchived] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
 
   const q = useQuery({
-    queryKey: [...PROMO_CODES_QUERY_KEY, campaignFilter || null] as const,
-    queryFn: () => listAdminPromoCodes(campaignFilter.trim() || undefined),
+    queryKey: [
+      ...PROMO_CODES_QUERY_KEY,
+      campaignFilter || null,
+      includeArchived,
+    ] as const,
+    queryFn: () =>
+      listAdminPromoCodes(campaignFilter.trim() || undefined, { includeArchived }),
   });
 
   const rows = q.data ?? [];
@@ -107,6 +115,14 @@ export default function PromoCodesIndex() {
               Clear
             </Button>
           )}
+          <label className="ml-auto flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={includeArchived}
+              onChange={(e) => setIncludeArchived(e.target.checked)}
+            />
+            Include archived
+          </label>
         </CardContent>
       </Card>
 
@@ -136,6 +152,7 @@ export default function PromoCodesIndex() {
                   <TableHead>Status</TableHead>
                   <TableHead>Expires</TableHead>
                   <TableHead>Created</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -157,18 +174,23 @@ export default function PromoCodesIndex() {
 }
 
 function CodeRow({ row }: { row: AdminPromoCode }) {
+  const qc = useQueryClient();
   const redeemed = row.redeemed_at != null;
+  const archived = row.archived_at != null;
   const expired =
     !redeemed &&
+    !archived &&
     row.expires_at != null &&
     new Date(row.expires_at).getTime() < Date.now();
 
   const status: { label: string; tone: "secondary" | "default" | "outline" } =
-    redeemed
-      ? { label: "Redeemed", tone: "secondary" }
-      : expired
-        ? { label: "Expired", tone: "outline" }
-        : { label: "Available", tone: "default" };
+    archived
+      ? { label: "Archived", tone: "outline" }
+      : redeemed
+        ? { label: "Redeemed", tone: "secondary" }
+        : expired
+          ? { label: "Expired", tone: "outline" }
+          : { label: "Available", tone: "default" };
 
   async function copy() {
     try {
@@ -179,8 +201,21 @@ function CodeRow({ row }: { row: AdminPromoCode }) {
     }
   }
 
+  const toggle = useMutation({
+    mutationFn: () =>
+      archived ? unarchiveAdminPromoCode(row.id) : archiveAdminPromoCode(row.id),
+    onSuccess: () => {
+      notify.success(archived ? "Code restored." : "Code archived.");
+      qc.invalidateQueries({ queryKey: PROMO_CODES_QUERY_KEY });
+    },
+    onError: (err) => notify.error(mapSupabaseError(err as Error)),
+  });
+
+  // Redeemed rows are immutable — the grant already flowed through.
+  const canToggle = !redeemed;
+
   return (
-    <TableRow>
+    <TableRow className={archived ? "opacity-60" : undefined}>
       <TableCell>
         <button
           type="button"
@@ -204,6 +239,28 @@ function CodeRow({ row }: { row: AdminPromoCode }) {
       </TableCell>
       <TableCell className="text-sm text-muted-foreground">
         {formatDate(row.created_at)}
+      </TableCell>
+      <TableCell className="text-right">
+        {canToggle ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => toggle.mutate()}
+            disabled={toggle.isPending}
+            title={archived ? "Restore code" : "Archive code"}
+          >
+            {archived ? (
+              <ArchiveRestore className="h-4 w-4" aria-hidden="true" />
+            ) : (
+              <Archive className="h-4 w-4" aria-hidden="true" />
+            )}
+            <span className="sr-only">
+              {archived ? "Restore code" : "Archive code"}
+            </span>
+          </Button>
+        ) : (
+          <span className="text-xs text-muted-foreground">—</span>
+        )}
       </TableCell>
     </TableRow>
   );

@@ -524,7 +524,7 @@ function CreateEventDialog({
                           : "border-border bg-card hover:bg-muted"
                       }`}
                     >
-                      {c.display_name}
+                      {c.name}
                     </button>
                   );
                 })}
@@ -634,7 +634,7 @@ function EventDetailDialog({
       eventId
         ? respondToEvent(eventId, {
             attendee_id: input.attendeeId,
-            response: input.response,
+            status: input.response,
           })
         : Promise.reject(),
     onSuccess: () => {

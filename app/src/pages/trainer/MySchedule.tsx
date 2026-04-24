@@ -244,12 +244,12 @@ function TrainerRespondDialog({
       if (!eventId || !myAttendee) throw new Error("Not an invitee.");
       return respondToEvent(eventId, {
         attendee_id: myAttendee.id,
-        response,
-        countered_start_at:
+        status: response,
+        counter_start_at:
           response === "countered" && counterStart
             ? new Date(counterStart).toISOString()
             : null,
-        countered_note:
+        response_note:
           response === "countered" && counterNote.trim()
             ? counterNote.trim()
             : null,

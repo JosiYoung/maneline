@@ -19,7 +19,6 @@ import {
   SUPPLEMENT_DOSES_QUERY_KEY,
   countDosesDueToday,
 } from "@/lib/protocols";
-import { notify } from "@/lib/toast";
 import { mapSupabaseError } from "@/lib/errors";
 
 // TodayView — /app. The first screen an owner sees each morning.
@@ -43,10 +42,6 @@ export default function TodayView() {
     queryKey: ATTENTION_QUERY_KEY,
     queryFn: () => attentionAnimalIds(30),
   });
-
-  if (animalsQuery.isError) {
-    notify.error(mapSupabaseError(animalsQuery.error as Error));
-  }
 
   const today = new Date().toLocaleDateString(undefined, {
     weekday: "long",
@@ -92,6 +87,11 @@ export default function TodayView() {
         <div className="flex justify-center py-12">
           <Spinner color="primary" label="Loading your barn…" />
         </div>
+      ) : animalsQuery.isError ? (
+        <ErrorState
+          message={mapSupabaseError(animalsQuery.error as Error)}
+          onRetry={() => animalsQuery.refetch()}
+        />
       ) : animals.length === 0 ? (
         <EmptyState />
       ) : (
@@ -131,6 +131,28 @@ export default function TodayView() {
         </motion.ul>
       )}
     </div>
+  );
+}
+
+function ErrorState({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry: () => void;
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>We couldn't load your barn.</CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col items-start gap-3">
+        <p className="text-sm text-muted-foreground">{message}</p>
+        <Button size="sm" variant="outline" onClick={onRetry}>
+          Try again
+        </Button>
+      </CardContent>
+    </Card>
   );
 }
 

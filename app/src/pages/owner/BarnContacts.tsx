@@ -58,7 +58,7 @@ const ROLES: ProContactRole[] = [
 
 interface FormState {
   id: string | null;
-  display_name: string;
+  name: string;
   role: ProContactRole;
   email: string;
   phone_e164: string;
@@ -67,7 +67,7 @@ interface FormState {
 
 const EMPTY_FORM: FormState = {
   id: null,
-  display_name: "",
+  name: "",
   role: "farrier",
   email: "",
   phone_e164: "",
@@ -163,7 +163,7 @@ export default function BarnContacts() {
                   >
                     <TableCell className="font-medium">
                       <div className="flex items-center gap-2">
-                        {c.display_name}
+                        {c.name}
                         {c.linked_user_id && (
                           <Badge variant="outline" className="text-[10px]">
                             In-app
@@ -188,7 +188,7 @@ export default function BarnContacts() {
                           onClick={() =>
                             setEditing({
                               id: c.id,
-                              display_name: c.display_name,
+                              name: c.name,
                               role: c.role,
                               email: c.email ?? "",
                               phone_e164: c.phone_e164 ?? "",
@@ -204,7 +204,7 @@ export default function BarnContacts() {
                             size="icon"
                             variant="ghost"
                             onClick={() => {
-                              if (confirm(`Archive ${c.display_name}?`)) {
+                              if (confirm(`Archive ${c.name}?`)) {
                                 archive.mutate(c.id);
                               }
                             }}
@@ -255,7 +255,7 @@ function ContactFormDialog({
   const save = useMutation({
     mutationFn: async () => {
       const patch = {
-        display_name: local.display_name.trim(),
+        name: local.name.trim(),
         role: local.role,
         email: local.email.trim() || null,
         phone_e164: local.phone_e164.trim() || null,
@@ -263,7 +263,7 @@ function ContactFormDialog({
       };
       if (local.id) return updateProContact(local.id, patch);
       return createProContact({
-        display_name: patch.display_name,
+        name: patch.name,
         role: patch.role,
         email: patch.email,
         phone_e164: patch.phone_e164,
@@ -280,7 +280,7 @@ function ContactFormDialog({
 
   function onSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!local.display_name.trim()) {
+    if (!local.name.trim()) {
       notify.error("Name is required.");
       return;
     }
@@ -313,9 +313,9 @@ function ContactFormDialog({
             <Label htmlFor="pc-name">Name</Label>
             <Input
               id="pc-name"
-              value={local.display_name}
+              value={local.name}
               onChange={(e) =>
-                setLocal((p) => ({ ...p, display_name: e.target.value }))
+                setLocal((p) => ({ ...p, name: e.target.value }))
               }
               required
               maxLength={200}

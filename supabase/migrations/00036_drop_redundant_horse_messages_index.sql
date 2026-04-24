@@ -1,0 +1,37 @@
+-- =============================================================
+-- Migration 00036 — drop redundant horse_messages_animal_idx (2026-04-24)
+--
+-- Context
+-- -------
+-- The Supabase `unused_index` advisor currently flags 114 indexes,
+-- but virtually all of them are `idx_scan = 0` only because the
+-- project has near-zero production traffic — not because they're
+-- wasteful. The FK indexes from migration 00034 are the clearest
+-- example: they exist precisely so PostgREST joins through those
+-- FKs don't seq-scan once traffic arrives, and dropping them would
+-- immediately re-trigger the `unindexed_foreign_keys` advisor.
+--
+-- This migration drops the ONE index that is structurally redundant
+-- on its own merits, independent of traffic:
+--
+--   `horse_messages_animal_idx`  (animal_id)
+--
+-- is a strict prefix of
+--
+--   `horse_messages_animal_created_idx`  (animal_id, created_at DESC)
+--     WHERE archived_at IS NULL
+--
+-- Any predicate `WHERE animal_id = $1` (with or without an ORDER BY)
+-- can be served by the composite index; Postgres scans it left-to-right.
+-- The only scans the narrower index serves that the composite does not
+-- are those over archived rows — and the only reader of `horse_messages`
+-- in the codebase (app/src/lib/horseMessages.ts + worker.js chat paths)
+-- always filters `archived_at IS NULL` anyway. So the narrow index
+-- is dead weight.
+--
+-- Note on the remaining 113 indexes: those are kept by design pre-launch
+-- and should be re-audited after ~2 weeks of production traffic, when
+-- `idx_scan` counts will reflect real query patterns.
+-- =============================================================
+
+drop index if exists public.horse_messages_animal_idx;

@@ -106,7 +106,14 @@ export default function SubscriptionDetail() {
   });
 
   if (q.isLoading) {
-    return <div className="text-sm text-muted-foreground">Loading subscription…</div>;
+    return (
+      <div className="flex flex-col gap-4">
+        <Link className="text-sm text-primary hover:underline" to="/admin/subscriptions">
+          ← Subscriptions
+        </Link>
+        <div className="text-sm text-muted-foreground">Loading subscription…</div>
+      </div>
+    );
   }
   if (q.isError || !q.data) {
     return (

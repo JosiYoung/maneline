@@ -39,11 +39,14 @@ export default function SessionsIndex() {
       </header>
 
       {q.isLoading && (
-        <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            Loading sessions…
-          </CardContent>
-        </Card>
+        <ul className="space-y-3">
+          {[0, 1, 2].map((i) => (
+            <li
+              key={i}
+              className="h-24 animate-pulse rounded-lg border border-border bg-muted/40"
+            />
+          ))}
+        </ul>
       )}
 
       {q.isError && (

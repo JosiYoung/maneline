@@ -65,7 +65,7 @@ export default function InvoiceDetail() {
       notify.success("Invoice finalized");
       setConfirmOpen(null);
     },
-    onError: (err) => notify.error((err as Error).message),
+    onError: (err) => notify.error(mapSupabaseError(err as Error)),
   });
 
   const sendM = useMutation({
@@ -76,7 +76,7 @@ export default function InvoiceDetail() {
       notify.success("Invoice sent");
       setConfirmOpen(null);
     },
-    onError: (err) => notify.error((err as Error).message),
+    onError: (err) => notify.error(mapSupabaseError(err as Error)),
   });
 
   const voidM = useMutation({
@@ -87,32 +87,50 @@ export default function InvoiceDetail() {
       notify.success("Invoice voided");
       setConfirmOpen(null);
     },
-    onError: (err) => notify.error((err as Error).message),
+    onError: (err) => notify.error(mapSupabaseError(err as Error)),
   });
 
   if (q.isLoading) {
     return (
-      <Card>
-        <CardContent className="py-10 text-center text-sm text-muted-foreground">
-          Loading invoice…
-        </CardContent>
-      </Card>
+      <div className="space-y-6">
+        <Link
+          to="/trainer/invoices"
+          className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Invoices
+        </Link>
+        <Card>
+          <CardContent className="py-10 text-center text-sm text-muted-foreground">
+            Loading invoice…
+          </CardContent>
+        </Card>
+      </div>
     );
   }
   if (q.isError || !q.data) {
     return (
-      <Card>
-        <CardContent className="py-10 text-center text-sm text-destructive">
-          Couldn't load this invoice.{" "}
-          <button
-            type="button"
-            onClick={() => navigate("/trainer/invoices")}
-            className="underline hover:text-foreground"
-          >
-            Back to invoices
-          </button>
-        </CardContent>
-      </Card>
+      <div className="space-y-6">
+        <Link
+          to="/trainer/invoices"
+          className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Invoices
+        </Link>
+        <Card>
+          <CardContent className="py-10 text-center text-sm text-destructive">
+            Couldn't load this invoice.{" "}
+            <button
+              type="button"
+              onClick={() => navigate("/trainer/invoices")}
+              className="underline hover:text-foreground"
+            >
+              Back to invoices
+            </button>
+          </CardContent>
+        </Card>
+      </div>
     );
   }
 

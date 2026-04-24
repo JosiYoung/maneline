@@ -25,11 +25,12 @@ export const CARE_MATRIX_COLUMNS = [
  * Confirms the ranch belongs to the owner. Returns the ranch row or null.
  */
 export async function getOwnerRanch(env, ownerId, ranchId) {
+  // NB: `ranches` has no `archived_at` column — soft-delete is a future
+  // migration. Filter by owner_id only.
   const q = [
-    'select=id,name,color_hex,address_line1,city,state',
+    'select=id,name,color_hex,address,city,state',
     `id=eq.${ranchId}`,
     `owner_id=eq.${ownerId}`,
-    'archived_at=is.null',
     'limit=1',
   ].join('&');
   const r = await fetch(`${RESTB(env)}/ranches?${q}`, { headers: SR(env) });
@@ -75,10 +76,10 @@ export async function getOwnerTurnoutGroup(env, ownerId, groupId) {
  * Lists the owner's non-archived ranches with stall counts.
  */
 export async function listOwnerRanches(env, ownerId) {
+  // NB: `ranches` has no `archived_at` column (see getOwnerRanch).
   const q = [
     'select=id,name,color_hex',
     `owner_id=eq.${ownerId}`,
-    'archived_at=is.null',
     'order=name.asc',
   ].join('&');
   const r = await fetch(`${RESTB(env)}/ranches?${q}`, { headers: SR(env) });
