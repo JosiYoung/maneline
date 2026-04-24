@@ -2,6 +2,7 @@ import { useNavigate } from 'react-router-dom';
 import { LogOut } from 'lucide-react';
 import { useAuthStore } from '../lib/authStore';
 import type { UserRole } from '../lib/types';
+import { CartButton } from './shop/CartButton';
 
 interface PortalHeaderProps {
   portal: 'owner' | 'trainer' | 'admin';
@@ -47,25 +48,31 @@ export function PortalHeader({ portal }: PortalHeaderProps) {
           </span>
         </span>
       </div>
-      <button
-        type="button"
-        onClick={handleSignOut}
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 6,
-          padding: '8px 14px',
-          border: '1px solid var(--color-line)',
-          background: 'var(--color-surface)',
-          color: 'var(--color-ink)',
-          borderRadius: 8,
-          cursor: 'pointer',
-          fontSize: 14,
-        }}
-      >
-        <LogOut size={16} />
-        Sign out
-      </button>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        {/* Cart is owner-only: only owners shop Silver Lining. Always
+            visible (with a 0-state icon) so the "added to cart" signal
+            is discoverable from any owner page, not just /shop. */}
+        {portal === 'owner' && <CartButton />}
+        <button
+          type="button"
+          onClick={handleSignOut}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '8px 14px',
+            border: '1px solid var(--color-line)',
+            background: 'var(--color-surface)',
+            color: 'var(--color-ink)',
+            borderRadius: 8,
+            cursor: 'pointer',
+            fontSize: 14,
+          }}
+        >
+          <LogOut size={16} />
+          Sign out
+        </button>
+      </div>
     </header>
   );
 }

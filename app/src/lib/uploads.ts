@@ -86,9 +86,55 @@ async function postWorker<T>(path: string, body: unknown): Promise<T> {
       (err as Error & { code?: string }).code = "rate_limited";
       throw err;
     }
-    throw new Error(msg?.error || `Request failed (${res.status})`);
+    // Preserve the Worker's error code + detail on the thrown Error so
+    // callers can map it to a specific toast instead of the blanket
+    // "Something went wrong" fallback in mapSupabaseError.
+    const code = typeof msg?.error === "string" ? msg.error : undefined;
+    const detail = typeof msg?.detail === "string" ? msg.detail : undefined;
+    const err = new Error(code || detail || `Request failed (${res.status})`);
+    (err as Error & { code?: string; detail?: string; status?: number }).code = code;
+    (err as Error & { code?: string; detail?: string; status?: number }).detail = detail;
+    (err as Error & { code?: string; detail?: string; status?: number }).status = res.status;
+    throw err;
   }
   return (await res.json()) as T;
+}
+
+// Human-readable mapping for Worker upload error codes. Prefer this over
+// mapSupabaseError for upload flows — most Worker codes don't match any
+// Supabase pattern and would otherwise fall through to GENERIC.
+export function mapUploadError(err: unknown): string {
+  const e = err as Error & { code?: string; detail?: string; status?: number };
+  const code = e?.code;
+  const status = e?.status;
+  switch (code) {
+    case "rate_limited":
+      return "Too many uploads right now; try again in a minute.";
+    case "unauthorized":
+    case "forbidden":
+      return "You don't have permission to upload here.";
+    case "bad_kind":
+    case "bad_content_type":
+      return "That file type isn't supported for this upload.";
+    case "too_large":
+      return "File is too large.";
+    case "bad_record_type":
+      return "Pick a valid record type (Coggins, vaccine, dental, farrier, or other).";
+    case "missing_animal":
+    case "animal_not_found":
+      return "That horse is no longer available. Refresh and try again.";
+    case "r2_not_found":
+      return "Upload didn't finish reaching storage. Please try again.";
+    case "db_write_failed":
+      return `Couldn't save the record${e.detail ? ` (${e.detail})` : ""}. Please try again.`;
+    case "not_configured":
+      return "Uploads are temporarily unavailable. We've been notified.";
+    default:
+      if (status === 413) return "File is too large.";
+      if (status === 401) return "Your session expired. Please sign in again.";
+      if (typeof e?.message === "string" && e.message) return e.message;
+      return "Upload failed. Please try again.";
+  }
 }
 
 export async function requestPresign(input: {

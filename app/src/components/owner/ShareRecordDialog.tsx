@@ -28,6 +28,24 @@ import {
   type VetShareTokenRow,
 } from "@/lib/vetShare";
 
+// Map the revoke-specific Worker error codes to something the owner can
+// act on. The `err.code` field is populated by vetShare.ts's parseError.
+function mapRevokeError(err: unknown): string {
+  const code = (err as Error & { code?: string })?.code;
+  switch (code) {
+    case "not_found":
+      return "That link was already removed. Refresh to see the current list.";
+    case "forbidden":
+      return "You don't have permission to revoke that link.";
+    case "revoke_failed":
+      return "Couldn't revoke just now — please try again in a moment.";
+    case "unauthorized":
+      return "Your session expired. Please sign in again.";
+    default:
+      return mapSupabaseError(err as Error);
+  }
+}
+
 // ShareRecordDialog — Phase 5.7
 //
 // Owner clicks "Share with vet" from AnimalDetail. The dialog opens in
@@ -65,11 +83,15 @@ export function ShareRecordDialog({ animalId }: { animalId: string }) {
 
   const revoke = useMutation({
     mutationFn: (id: string) => revokeVetShareToken(id),
-    onSuccess: () => {
-      notify.success("Share revoked.");
+    onSuccess: (data) => {
+      if (data?.revoked_at || (data as { already_revoked?: boolean })?.already_revoked) {
+        notify.success("Share revoked.");
+      } else {
+        notify.success("Share revoked.");
+      }
       queryClient.invalidateQueries({ queryKey: VET_SHARE_TOKENS_QUERY_KEY });
     },
-    onError: (err) => notify.error(mapSupabaseError(err as Error)),
+    onError: (err) => notify.error(mapRevokeError(err)),
   });
 
   const handleOpenChange = (next: boolean) => {

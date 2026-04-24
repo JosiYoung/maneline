@@ -1913,6 +1913,9 @@ async function handleVetShareList(request, env, url) {
 }
 
 async function handleVetShareRevoke(request, env, tokenId, ctx) {
+  if (request.method !== 'POST') {
+    return new Response('method not allowed', { status: 405 });
+  }
   let actorId, jwt;
   try {
     ({ actorId, jwt } = await requireOwner(request, env));
@@ -1920,13 +1923,15 @@ async function handleVetShareRevoke(request, env, tokenId, ctx) {
     return errResp;
   }
 
-  // Ownership check via owner JWT + RLS. If no row comes back, the
-  // caller either doesn't own it or it doesn't exist.
+  // Ownership check — use service_role so a just-created token is
+  // visible even if the owner's JWT cache hasn't caught up with RLS
+  // propagation. We still verify owner_id === actorId ourselves below,
+  // so there's no authz regression.
   const own = await supabaseSelect(
     env,
     'vet_share_tokens',
     `select=id,owner_id,revoked_at&id=eq.${encodeURIComponent(tokenId)}&limit=1`,
-    { userJwt: jwt }
+    { serviceRole: true }
   );
   const row = Array.isArray(own.data) ? own.data[0] : null;
   if (!row) {
@@ -2071,7 +2076,7 @@ async function handleVetTokenGet(request, env, token, ctx) {
     const objQ = await supabaseSelect(
       env,
       'r2_objects',
-      `select=id,bucket,object_key,content_type,size_bytes&id=in.(${inList})`,
+      `select=id,bucket,object_key,content_type,byte_size&id=in.(${inList})`,
       { serviceRole: true }
     );
     if (Array.isArray(objQ.data)) {
@@ -2093,7 +2098,7 @@ async function handleVetTokenGet(request, env, token, ctx) {
         secretKey:   env.R2_SECRET_ACCESS_KEY,
         expiresSec:  VET_GET_URL_TTL_SEC,
       });
-      return { url, content_type: row.content_type, size_bytes: row.size_bytes };
+      return { url, content_type: row.content_type, size_bytes: row.byte_size };
     } catch {
       return null;
     }
@@ -3771,6 +3776,22 @@ async function handleUploadCommit(request, env) {
       await supabaseDelete(env, 'r2_objects', `id=eq.${r2ObjectId}`);
       await env.MANELINE_R2.delete(objectKey).catch(() => {});
       return json({ error: 'db_write_failed', detail: 'trainer_profiles update' }, 500);
+    }
+    // If the trainer had no trainer_profiles row yet (signup trigger
+    // skipped, or manual demo-seed path), UPDATE returns 200 with an
+    // empty array — PostgREST's idea of "no rows matched." Fall back to
+    // an INSERT so the logo pointer actually lands somewhere. user_id has
+    // a unique constraint, so this is safe against concurrent uploads.
+    if (!upd.data) {
+      const ins = await supabaseInsertReturning(env, 'trainer_profiles', {
+        user_id: actorId,
+        invoice_logo_r2_key: objectKey,
+      });
+      if (!ins.ok || !ins.data?.id) {
+        await supabaseDelete(env, 'r2_objects', `id=eq.${r2ObjectId}`);
+        await env.MANELINE_R2.delete(objectKey).catch(() => {});
+        return json({ error: 'db_write_failed', detail: 'trainer_profiles insert' }, 500);
+      }
     }
 
     if (priorKey && priorKey !== objectKey) {

@@ -54,10 +54,17 @@ export type CreateVetShareTokenInput = {
 async function parseError(res: Response): Promise<Error> {
   let payload: { error?: string; message?: string; detail?: string } | null = null;
   try { payload = await res.json(); } catch { /* ignore */ }
+  // If the Worker route didn't match and the ASSETS fallback served the
+  // SPA shell, we'll have a 2xx/404 with HTML body — surface that as a
+  // specific code so callers don't show a generic "something went wrong".
+  const code =
+    payload?.error ||
+    (res.status === 404 ? "not_found" : res.status === 401 ? "unauthorized" : undefined);
   const msg =
     payload?.message || payload?.detail || payload?.error || `Request failed (${res.status})`;
   const err = new Error(msg);
-  (err as Error & { code?: string }).code = payload?.error;
+  (err as Error & { code?: string; status?: number }).code = code;
+  (err as Error & { code?: string; status?: number }).status = res.status;
   return err;
 }
 

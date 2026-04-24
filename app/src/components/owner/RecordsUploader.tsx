@@ -8,11 +8,11 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { notify } from "@/lib/toast";
-import { mapSupabaseError } from "@/lib/errors";
 import {
   MAX_UPLOAD_BYTES,
   VET_RECORD_MIME,
   commitUpload,
+  mapUploadError,
   requestPresign,
   uploadToR2,
 } from "@/lib/uploads";
@@ -74,12 +74,7 @@ export function RecordsUploader({
     },
     onError: (err) => {
       setProgress(null);
-      const code = (err as Error & { code?: string }).code;
-      if (code === "rate_limited") {
-        notify.error("Too many uploads right now; try again in a minute.");
-        return;
-      }
-      notify.error(mapSupabaseError(err as Error));
+      notify.error(mapUploadError(err));
     },
   });
 
