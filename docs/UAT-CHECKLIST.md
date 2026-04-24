@@ -1,9 +1,10 @@
 # Mane Line — User Acceptance Testing Checklist
 
-**Target:** HEAD `af71dc9` (Phase 8 Barn Mode + Phase 9 trainer-paywall / messaging / ratings — all shipped to repo)
-**Supabase:** `vvzasinqfirzxfduenjx` (migrations 00002–00029 applied)
-**Generated:** 2026-04-24 from a 4-agent audit swarm (smoke test, security, DB schema, QA/workflow).
+**Target:** HEAD `cd65205` (Phase 8 Barn Mode + Phase 9 trainer-paywall / messaging / ratings + 2026-04-24 preflight sweep).
+**Supabase:** `vvzasinqfirzxfduenjx` (migrations 00002–00036 applied).
+**Generated:** 2026-04-24 from a 4-agent audit swarm (smoke test, security, DB schema, QA/workflow) + a deep DB-verification agent (14 real inserts + RLS + RPC round-trips).
 **Raw findings:** see [`audits/2026-04-24-preflight-swarm.md`](./audits/2026-04-24-preflight-swarm.md).
+**Last refreshed:** 2026-04-24 after commit `cd65205` (preflight sweep).
 
 Use the PIN shortcuts in `memory/demo_pins.md` to sign in as the three dev accounts (owner / trainer / silver_lining) without email round-trips.
 
@@ -14,6 +15,7 @@ Use the PIN shortcuts in `memory/demo_pins.md` to sign in as the three dev accou
 - Each section is a flow to walk through in order. Tick the box only when the UI action _and_ the DB write have both been verified (Supabase Studio row confirmation, or the audit_log row if it's a worker-fronted action).
 - **🔴 blockers** must pass before public sign-off. **🟡 highs** must be triaged (fix or accept risk). **⚪ lows** are hygiene — log to TECH-DEBT if deferred.
 - Anything prefixed `[CONFIG]` is a deploy/secret gate, not a code gate. Those roll up to `docs/phase-8/TECH-DEBT.md`.
+- **🟢 Fixed in `<sha>`** tags annotate items addressed after the initial sweep — the box is still unchecked because a human needs to walk the flow and confirm the fix holds in-situ.
 
 ---
 
@@ -23,10 +25,10 @@ Use the PIN shortcuts in `memory/demo_pins.md` to sign in as the three dev accou
 - [ ] 🔴 `npx wrangler deploy` succeeds on a clean checkout (currently the dev preview has Phase 8+9 SPA code but the Worker was not redeployed — receipts, herd-health endpoints, etc. are gated behind this).
 - [ ] 🔴 Supabase Auth → Security → "Leaked password protection (HaveIBeenPwned)" is **enabled**. Currently OFF per advisor.
 - [ ] 🟡 Move `btree_gist` out of `public` schema into a dedicated `extensions` schema.
-- [ ] 🟡 Add `SET search_path = public, pg_temp` to the 10 functions flagged by advisor (`trg_hubspot_*`, `signed_url_ttl_seconds`, `my_rating_for_session`, `touch_horse_message_reads`, `horse_messages_unread_total`, `touch_updated_at`).
+- [ ] 🟡 Add `SET search_path = public, pg_temp` to the 10 functions flagged by advisor (`trg_hubspot_*`, `signed_url_ttl_seconds`, `my_rating_for_session`, `touch_horse_message_reads`, `horse_messages_unread_total`, `touch_updated_at`). 🟢 **Fixed in `cd65205`** via migration `00030_audit_hardening.sql` §1 — re-run `get_advisors` to confirm these 10 no longer surface before ticking.
 - [ ] 🟡 Confirm `STRIPE_WEBHOOK_SECRET` absence returns 401 not 501 (currently `worker.js:6613-6616` returns 501 — reconnaissance leak).
-- [ ] ⚪ Typecheck: `cd app && pnpm tsc --noEmit` → clean.
-- [ ] ⚪ Build: `cd app && pnpm build` → no warnings beyond known Tailwind v4 noise.
+- [x] ⚪ Typecheck: `cd app && npm run typecheck` → clean. (verified 2026-04-24 @ `cd65205`)
+- [x] ⚪ Build: `cd app && npm run build` → succeeds (only pre-existing `>500kB chunk` warning). (verified 2026-04-24 @ `cd65205`)
 
 ---
 
@@ -61,13 +63,14 @@ Sign in as `cedric@obsidianaxisgroup.com` (owner demo PIN).
 
 ### 1.5 Barn Mode (paywall-gated)
 - [ ] 🔴 Create a subscription at `/app/settings/barn-mode` using Stripe test card. DB: `subscriptions.status='active'` with `stripe_price_id = STRIPE_PRICE_BARN_MODE_MONTHLY`. `[CONFIG]`-gated.
-- [ ] `BarnCalendar` (`/app/barn/calendar`): create a one-off event, invite an attendee, mark declined. DB: `barn_events` + `barn_event_attendees` + `barn_event_responses` rows.
+- [ ] `BarnCalendar` (`/app/barn/calendar`): create a one-off event, invite an attendee, mark declined. DB: `barn_events` + `barn_event_attendees` + `barn_event_responses` rows. 🟢 **Fixed in `cd65205`** — the SPA↔Worker payload schema was misaligned (`response`→`status`, `countered_*`→`counter_start_at`/`response_note`); every decline was 400ing before the sweep. **Also fixed:** owner "Mark confirmed/declined" on another attendee's behalf — Worker `handleBarnEventRespond` now honours `body.attendee_id` (was silently no-op'ing against the owner's own row).
 - [ ] 🟡 A11y: the event-list button at `BarnCalendar.tsx:270` is icon-only with no `aria-label`. Add one.
 - [ ] Create a recurring event; run the `/api/_internal/barn/materialize-recurrences` cron; verify concrete rows materialized.
 - [ ] Herd Health dashboard (`/app/barn/health`): set a threshold, trigger it, acknowledge. DB: `health_thresholds` + `health_dashboard_acknowledgements` rows. **Note:** there is no `herd_health_records` table — shipped schema is thresholds + acknowledgements, despite some internal specs using the older name.
-- [ ] Facility Map (`/app/barn/facility`): create a ranch via "New ranch" dialog, add stalls, assign an animal, create a turnout group. DB: `ranches`/`stalls`/`stall_assignments`/`turnout_groups` rows, all owner-scoped.
+- [ ] Facility Map (`/app/barn/facility`): create a ranch via "New ranch" dialog, add stalls, assign an animal, create a turnout group. DB: `ranches`/`stalls`/`stall_assignments`/`turnout_groups` rows, all owner-scoped. 🟢 **Fixed in `cd65205`** — `worker/facility.js` `getOwnerRanch` + `listOwnerRanches` were referencing nonexistent columns (`ranches.archived_at`, `ranches.address_line1`), which 500'd every Barn Facility endpoint. Column is `address`; `archived_at` filter removed. Re-walk the full flow before ticking.
 - [ ] Barn Spending (`/app/barn/spending`): year-to-date aggregates match raw `expenses` sum for the owner.
 - [ ] 🟡 `/app/barn/spending/animals/:id` has no top-of-page back link — only breadcrumb via `BarnSubNav`. Adds a dead-end if `BarnSubNav` fails.
+- [ ] Barn Contacts (`/app/barn/contacts`): create contacts for each of the 8 role categories (farrier, vet, nutritionist, bodyworker, trainer, boarding, hauler, other). DB: `professional_contacts` rows with correct role. 🟢 **Fixed in `cd65205`** — the DB CHECK constraint previously rejected 4 of the 8 SPA roles (migration `00035` expanded it); the Worker `BARN_CONTACT_ROLES` set was also expanded 5→9. SPA→DB field rename: `display_name`→`name`, plus new `company` + `sms_opt_in` columns are now wired end-to-end.
 
 ### 1.6 Messaging (Phase 9)
 - [ ] Text-only message thread on an animal: owner sends, trainer receives, unread count increments. DB: `horse_messages` + `horse_message_reads` rows; `horse_messages_unread_total` helper returns expected value.
@@ -127,7 +130,9 @@ Sign in as `cedric@silverliningherbs.com` (silver_lining demo PIN).
 - [ ] Apply as a trainer from public route; verify HubSpot sync row lands in `pending_hubspot_syncs` then clears after `hubspot-sync-log` tick.
 
 ### 3.5 Promo codes
-- [ ] 🟡 `promo_codes` has RLS enabled with **zero policies** — SPA under user JWT returns empty. Confirm design intent: is this admin-via-service-role-only, or should it have an admin RLS policy?
+- [ ] 🟡 `promo_codes` has RLS enabled with **zero policies** — SPA under user JWT returns empty. 🟢 **Resolved in `cd65205`** — migration `00030` §3 added an explicit admin-only SELECT policy on `promo_codes` matching the design intent (admin-via-service-role-only for writes; silver_lining SELECT via user JWT). Re-run `get_advisors` to confirm the `rls_enabled_no_policy` warning clears for this table.
+- [ ] Mint a 5-code batch at `/admin/promo-codes` via the New-batch dialog; copy-all; redeem one from an owner account at `/app/settings/subscription`. DB: 5 rows in `promo_codes`, 1 row flips `redeemed_at`/`redeemed_by_owner_id`, owner `subscriptions.barn_mode_comp_until` extended by `grants_barn_mode_months`.
+- [ ] 🟢 **New in `cd65205`** — archive an un-redeemed code via the trash button. DB: `promo_codes.archived_at` set. Redeemed codes should show "—" (immutable). Tick Include-archived → archived row reappears greyed-out with a Restore button; click it; DB: `archived_at=null`.
 
 ---
 
@@ -135,7 +140,7 @@ Sign in as `cedric@silverliningherbs.com` (silver_lining demo PIN).
 
 - [ ] Owner A cannot read Owner B's animals, expenses, invoices, or messages (cross-tenant leak test).
 - [ ] Trainer without a grant for a given animal cannot read its records.
-- [ ] Presigned PUT URLs for R2 expire in ≤ 120s. 🟡 Currently 300s at `worker.js:3584-3592` — narrow this.
+- [ ] Presigned PUT URLs for R2 expire in ≤ 120s. 🟡 Currently 300s at `worker.js:3584-3592` — narrow this. *(Not addressed in `cd65205`; still a code change needed.)*
 - [ ] All R2 object keys start with `${actor_id}/${kind}/` — enforced at commit time (worker.js:3653).
 - [ ] `session_ratings` unique constraint blocks a second rating by the same rater (SQL: `insert … on conflict do nothing` returns 0 rows).
 - [ ] `expenses.session_id` round-trip: insert via trainer, fetch via `listExpensesForSession`, confirm owner sees it in `/app/sessions/:id/pay`. (Verified in smoke test 2026-04-24.)
@@ -146,10 +151,10 @@ Sign in as `cedric@silverliningherbs.com` (silver_lining demo PIN).
 
 These are **not** blockers for closed-beta UAT, but must be on the roadmap before public launch.
 
-- [ ] 🟡 Consolidate **138 multiple_permissive_policies** (`expenses` has 18, `supplement_doses` 12).
-- [ ] 🟡 Resolve **113 auth_rls_initplan** warnings — replace `auth.uid()` with `(select auth.uid())` inside policy bodies.
-- [ ] 🟡 Add indexes for the **30+ unindexed FKs** advisor flagged — in particular `horse_messages.sender_id/recipient_id`, `invoice_line_items.product_id`, `animal_media.r2_object_id`, `health_thresholds.owner_id`. Messaging + invoicing are hot paths.
-- [ ] ⚪ Evaluate the **92 unused_index** advisor hits; drop any that never served a query path.
+- [ ] 🟡 Consolidate **138 multiple_permissive_policies** (`expenses` has 18, `supplement_doses` 12). 🟢 **Fixed in `cd65205`** via migration `00033_rls_permissive_consolidation.sql`. Re-run `get_advisors performance` to confirm the count dropped (expected: near-zero).
+- [ ] 🟡 Resolve **113 auth_rls_initplan** warnings — replace `auth.uid()` with `(select auth.uid())` inside policy bodies. 🟢 **Fixed in `cd65205`** via migration `00032_rls_initplan_optimize.sql`. Re-run advisor to confirm.
+- [ ] 🟡 Add indexes for the **30+ unindexed FKs** advisor flagged — in particular `horse_messages.sender_id/recipient_id`, `invoice_line_items.product_id`, `animal_media.r2_object_id`, `health_thresholds.owner_id`. 🟢 **Fixed in `cd65205`** — hot-path indexes shipped in migration `00030` §2 and the remaining FK sweep (31 partial indexes) in `00034_fk_indexes_sweep.sql`. Re-run advisor to confirm `unindexed_foreign_keys` clears.
+- [ ] ⚪ Evaluate the **92 unused_index** advisor hits; drop any that never served a query path. 🟢 **Deliberately deferred in `cd65205`** — only one strictly-redundant index dropped (`horse_messages_animal_idx`, covered by a composite index; migration `00036`). The remaining hits are `idx_scan=0` because the project has zero production traffic, not because the indexes are wasteful — dropping the FK indexes from `00034` would immediately re-trigger the `unindexed_foreign_keys` advisor. Re-audit ~2 weeks post-launch when `idx_scan` counts reflect real query patterns.
 
 ---
 
@@ -158,9 +163,11 @@ These are **not** blockers for closed-beta UAT, but must be on the roadmap befor
 Captured here so they don't get re-discovered as "new" findings on the next audit:
 
 - **`scope='ranch'` in grants RLS** is deferred until `animals.ranch_id` exists (migrations `00004:123`, `00027:105`). Current behaviour: ranch-scope grants type-check but have no effect on per-animal RLS. Owner + animal + owner_all scopes are fully enforced.
-- **Receipt-upload worker deploy** — SPA is wired; `expense_receipt` kind will 400 until `worker.js` is redeployed (TECH-DEBT 04-04). The DB-side CHECK constraint on `r2_objects.kind` was expanded in migration `00031` (2026-04-24) so commits will no longer fail with 23514 once the Worker redeploys.
+- **Receipt-upload worker deploy** — SPA is wired; DB-side CHECK on `r2_objects.kind` was expanded to accept `expense_receipt` + `trainer_logo` in migration `00031` (applied 2026-04-24). The Worker-side validator already accepts both values, so commits will round-trip once the Worker is redeployed (TECH-DEBT 04-04 tracks the deploy).
 - **`animals` archive audit is Worker-enforced, not DB-enforced.** The Worker `/api/animals/archive|unarchive` endpoints atomically UPDATE `animals.archived_at` + INSERT `animal_archive_events`, but `animals_owner_all` RLS grants `for all` so an owner could bypass via direct `supabase-js` UPDATE. No current code path does this; a defence-in-depth BEFORE UPDATE trigger is tracked in `docs/audits/2026-04-24-preflight-swarm.md` §9.
+- **91 of 92 `unused_index` advisor hits retained.** See §5 — zero-traffic environment makes `idx_scan=0` the expected state. Re-audit ~2 weeks post-launch.
 - **Migration number `00021` is skipped** — appears intentional (renumbered during Phase 8 planning). Document or backfill a no-op file if CI ever requires a contiguous sequence.
+- **`@supabase/supabase-js` upgrade** — bumped from `2.103.3` → `2.104.1` in `cd65205`. No other `@supabase/*` packages are pinned at the root workspace. `npm audit` reports 0 production vulnerabilities.
 
 ---
 
