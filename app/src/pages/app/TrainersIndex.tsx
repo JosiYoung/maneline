@@ -28,6 +28,7 @@ import {
   type AccessGrantWithTrainer,
   type GrantStatus,
 } from "@/lib/access";
+import { ProfessionalContactsSection } from "@/components/owner/ProfessionalContactsSection";
 
 // TrainersIndex — /app/trainers.
 //
@@ -80,6 +81,8 @@ export default function TrainersIndex() {
           ))}
         </ul>
       )}
+
+      <ProfessionalContactsSection />
     </div>
   );
 }
