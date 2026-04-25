@@ -35,6 +35,7 @@ import {
   listExpensesForAnimal,
 } from "@/lib/expenses";
 import { ProtocolsSection } from "@/components/owner/ProtocolsSection";
+import { HorseMessageThread } from "@/components/messaging/HorseMessageThread";
 
 // AnimalDetail — /app/animals/:id
 //
@@ -94,6 +95,21 @@ export default function AnimalDetail() {
               <ProtocolsSection animalId={query.data.id} role="owner" />
               <SessionsSection animalId={query.data.id} />
               <ExpensesSection animalId={query.data.id} />
+              <section className="space-y-2" aria-labelledby="messages-heading">
+                <h2
+                  id="messages-heading"
+                  className="font-display text-lg text-primary"
+                >
+                  Messages
+                </h2>
+                <p className="text-xs text-muted-foreground">
+                  Async chat with anyone who has access to {query.data.barn_name}. Text only.
+                </p>
+                <HorseMessageThread
+                  animalId={query.data.id}
+                  animalName={query.data.barn_name}
+                />
+              </section>
             </>
           ) : null}
         </>
