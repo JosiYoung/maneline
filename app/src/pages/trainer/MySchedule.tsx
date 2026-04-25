@@ -1,12 +1,17 @@
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { CalendarDays, Loader2 } from "lucide-react";
+import { CalendarDays, ChevronLeft, Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import {
+  WeekCalendar,
+  addDays,
+  isSameDay,
+  startOfWeekSunday,
+} from "@/components/barn/WeekCalendar";
 import {
   Dialog,
   DialogContent,
@@ -66,28 +71,27 @@ export default function MySchedule() {
   const events = (eventsQuery.data ?? []).filter(
     (e): e is EventListItem => Boolean(e?.event?.start_at),
   );
-  const now = Date.now();
-  const upcoming = useMemo(
+
+  const [weekStart, setWeekStart] = useState<Date>(() =>
+    startOfWeekSunday(new Date()),
+  );
+  const [view, setView] = useState<"week" | "day">("week");
+  const [dayDate, setDayDate] = useState<Date>(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  });
+
+  const dayItems = useMemo(
     () =>
       events
-        .filter((e) => new Date(e.event.start_at).getTime() >= now)
+        .filter((e) => isSameDay(new Date(e.event.start_at), dayDate))
         .sort(
           (a, b) =>
             new Date(a.event.start_at).getTime() -
-            new Date(b.event.start_at).getTime()
+            new Date(b.event.start_at).getTime(),
         ),
-    [events, now]
-  );
-  const past = useMemo(
-    () =>
-      events
-        .filter((e) => new Date(e.event.start_at).getTime() < now)
-        .sort(
-          (a, b) =>
-            new Date(b.event.start_at).getTime() -
-            new Date(a.event.start_at).getTime()
-        ),
-    [events, now]
+    [events, dayDate],
   );
 
   return (
@@ -100,40 +104,121 @@ export default function MySchedule() {
         </p>
       </header>
 
-      <Tabs defaultValue="upcoming">
-        <TabsList>
-          <TabsTrigger value="upcoming">
-            Upcoming
-            {upcoming.length > 0 && (
-              <Badge variant="secondary" className="ml-2">
-                {upcoming.length}
-              </Badge>
-            )}
-          </TabsTrigger>
-          <TabsTrigger value="past">Past</TabsTrigger>
-        </TabsList>
-        <TabsContent value="upcoming" className="mt-4">
-          <ScheduleList
-            loading={eventsQuery.isLoading}
-            items={upcoming}
-            empty="No upcoming events on your schedule."
-            onOpen={setOpenId}
-          />
-        </TabsContent>
-        <TabsContent value="past" className="mt-4">
-          <ScheduleList
-            loading={eventsQuery.isLoading}
-            items={past}
-            empty="No past events."
-            onOpen={setOpenId}
-          />
-        </TabsContent>
-      </Tabs>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="inline-flex rounded-md border border-border bg-background p-0.5">
+          <Button
+            size="sm"
+            variant={view === "week" ? "default" : "ghost"}
+            className="h-7 px-3"
+            onClick={() => setView("week")}
+          >
+            Week
+          </Button>
+          <Button
+            size="sm"
+            variant={view === "day" ? "default" : "ghost"}
+            className="h-7 px-3"
+            onClick={() => setView("day")}
+          >
+            Day
+          </Button>
+        </div>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => {
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            setDayDate(today);
+            setWeekStart(startOfWeekSunday(today));
+            setView("day");
+          }}
+        >
+          My day
+        </Button>
+      </div>
+
+      {view === "week" ? (
+        <WeekCalendar
+          weekStart={weekStart}
+          events={events}
+          selectedDate={dayDate}
+          loading={eventsQuery.isLoading}
+          onWeekStartChange={setWeekStart}
+          onSelectDay={(date) => {
+            setDayDate(date);
+            setView("day");
+          }}
+          onOpenEvent={setOpenId}
+        />
+      ) : (
+        <DayView
+          date={dayDate}
+          loading={eventsQuery.isLoading}
+          items={dayItems}
+          onPrevDay={() => setDayDate(addDays(dayDate, -1))}
+          onNextDay={() => setDayDate(addDays(dayDate, 1))}
+          onBack={() => setView("week")}
+          onOpenEvent={setOpenId}
+          empty="Nothing on your schedule this day."
+        />
+      )}
 
       <TrainerRespondDialog
         userId={userId}
         eventId={openId}
         onClose={() => setOpenId(null)}
+      />
+    </div>
+  );
+}
+
+function DayView({
+  date,
+  loading,
+  items,
+  onPrevDay,
+  onNextDay,
+  onBack,
+  onOpenEvent,
+  empty,
+}: {
+  date: Date;
+  loading: boolean;
+  items: EventListItem[];
+  onPrevDay: () => void;
+  onNextDay: () => void;
+  onBack: () => void;
+  onOpenEvent: (id: string) => void;
+  empty: string;
+}) {
+  const headline = date.toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+  });
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <Button size="sm" variant="ghost" onClick={onBack}>
+          <ChevronLeft className="mr-1 h-4 w-4" /> Week
+        </Button>
+        <div className="text-sm font-medium">{headline}</div>
+        <div className="flex items-center gap-1">
+          <Button size="sm" variant="outline" onClick={onPrevDay} aria-label="Previous day">
+            <ChevronLeft className="h-4 w-4" />
+          </Button>
+          <Button size="sm" variant="outline" onClick={onNextDay} aria-label="Next day">
+            <ChevronLeft className="h-4 w-4 rotate-180" />
+          </Button>
+        </div>
+      </div>
+      <ScheduleList
+        loading={loading}
+        items={items}
+        empty={empty}
+        onOpen={onOpenEvent}
       />
     </div>
   );
