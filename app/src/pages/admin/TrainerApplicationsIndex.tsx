@@ -25,6 +25,7 @@ import {
   TRAINER_APPLICATIONS_QUERY_KEY,
   decideTrainerApplication,
   listTrainerApplications,
+  revokeOrBanTrainer,
   type TrainerApplicationRow,
   type TrainerApplicationStatus,
 } from "@/lib/trainerApplications";
@@ -32,6 +33,11 @@ import { mapSupabaseError } from "@/lib/errors";
 import { notify } from "@/lib/toast";
 
 type StatusFilter = TrainerApplicationStatus | "";
+type PendingAction =
+  | { kind: "approve" | "reject"; row: TrainerApplicationRow }
+  | { kind: "revoke" | "ban"; row: TrainerApplicationRow };
+
+const REVOKE_BAN_NOTES_MIN = 10;
 
 // TrainerApplicationsIndex — /admin/trainer-applications
 //
@@ -44,15 +50,14 @@ const STATUS_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
   { value: "submitted", label: "Queue" },
   { value: "approved", label: "Approved" },
   { value: "rejected", label: "Rejected" },
+  { value: "revoked", label: "Revoked" },
+  { value: "banned", label: "Banned" },
   { value: "", label: "All" },
 ];
 
 export default function TrainerApplicationsIndex() {
   const [status, setStatus] = useState<StatusFilter>("submitted");
-  const [pending, setPending] = useState<
-    | { row: TrainerApplicationRow; decision: "approve" | "reject" }
-    | null
-  >(null);
+  const [pending, setPending] = useState<PendingAction | null>(null);
   const [notes, setNotes] = useState("");
 
   const qc = useQueryClient();
@@ -82,7 +87,35 @@ export default function TrainerApplicationsIndex() {
     onError: (e: Error) => notify.error(mapSupabaseError(e)),
   });
 
+  const revokeBanM = useMutation({
+    mutationFn: ({
+      id,
+      action,
+      reviewNotes,
+    }: {
+      id: string;
+      action: "revoke" | "ban";
+      reviewNotes: string;
+    }) => revokeOrBanTrainer(id, action, reviewNotes),
+    onSuccess: (result) => {
+      const label = result.decision === "banned" ? "Banned" : "Revoked";
+      notify.success(`${label} ${result.display_name || result.email || "trainer"}`);
+      setPending(null);
+      setNotes("");
+      qc.invalidateQueries({ queryKey: TRAINER_APPLICATIONS_QUERY_KEY });
+      qc.invalidateQueries({ queryKey: ["admin", "users"] });
+    },
+    onError: (e: Error & { code?: string }) => {
+      if (e.code === "bad_notes") {
+        notify.error("Notes are required to revoke or ban a trainer.");
+      } else {
+        notify.error(mapSupabaseError(e));
+      }
+    },
+  });
+
   const rows = listQ.data ?? [];
+  const isMutating = decideM.isPending || revokeBanM.isPending;
 
   return (
     <div className="space-y-6">
@@ -146,11 +179,19 @@ export default function TrainerApplicationsIndex() {
                       key={row.id}
                       row={row}
                       onApprove={() => {
-                        setPending({ row, decision: "approve" });
+                        setPending({ kind: "approve", row });
                         setNotes("");
                       }}
                       onReject={() => {
-                        setPending({ row, decision: "reject" });
+                        setPending({ kind: "reject", row });
+                        setNotes("");
+                      }}
+                      onRevoke={() => {
+                        setPending({ kind: "revoke", row });
+                        setNotes("");
+                      }}
+                      onBan={() => {
+                        setPending({ kind: "ban", row });
                         setNotes("");
                       }}
                     />
@@ -176,30 +217,33 @@ export default function TrainerApplicationsIndex() {
             <>
               <DialogHeader>
                 <DialogTitle>
-                  {pending.decision === "approve" ? "Approve" : "Reject"}{" "}
+                  {dialogTitleFor(pending.kind)}{" "}
                   {pending.row.display_name || pending.row.email || "trainer"}
                 </DialogTitle>
                 <DialogDescription>
-                  {pending.decision === "approve"
-                    ? "User will be flipped to active immediately."
-                    : "User will be suspended. They'll see the rejection on next login."}
+                  {dialogDescriptionFor(pending.kind)}
                 </DialogDescription>
               </DialogHeader>
               <div className="space-y-2">
                 <label className="text-xs text-muted-foreground" htmlFor="review-notes">
-                  Reviewer notes (optional, shared with trainer)
+                  {pending.kind === "revoke" || pending.kind === "ban"
+                    ? `Reason (required, at least ${REVOKE_BAN_NOTES_MIN} characters)`
+                    : "Reviewer notes (optional, shared with trainer)"}
                 </label>
                 <Textarea
                   id="review-notes"
                   rows={4}
                   value={notes}
                   onChange={(e) => setNotes(e.target.value)}
-                  placeholder={
-                    pending.decision === "reject"
-                      ? "Why the application is being declined…"
-                      : "Any onboarding notes for the trainer…"
-                  }
+                  placeholder={placeholderFor(pending.kind)}
                 />
+                {(pending.kind === "revoke" || pending.kind === "ban") &&
+                  notes.trim().length > 0 &&
+                  notes.trim().length < REVOKE_BAN_NOTES_MIN ? (
+                    <p className="text-xs text-destructive">
+                      Notes must be at least {REVOKE_BAN_NOTES_MIN} characters.
+                    </p>
+                  ) : null}
               </div>
               <DialogFooter>
                 <Button
@@ -208,26 +252,34 @@ export default function TrainerApplicationsIndex() {
                     setPending(null);
                     setNotes("");
                   }}
-                  disabled={decideM.isPending}
+                  disabled={isMutating}
                 >
                   Cancel
                 </Button>
                 <Button
-                  variant={pending.decision === "approve" ? "default" : "destructive"}
-                  onClick={() =>
-                    decideM.mutate({
-                      id: pending.row.id,
-                      decision: pending.decision,
-                      reviewNotes: notes.trim() || undefined,
-                    })
+                  variant={pending.kind === "approve" ? "default" : "destructive"}
+                  onClick={() => {
+                    if (pending.kind === "approve" || pending.kind === "reject") {
+                      decideM.mutate({
+                        id: pending.row.id,
+                        decision: pending.kind,
+                        reviewNotes: notes.trim() || undefined,
+                      });
+                    } else {
+                      revokeBanM.mutate({
+                        id: pending.row.id,
+                        action: pending.kind,
+                        reviewNotes: notes.trim(),
+                      });
+                    }
+                  }}
+                  disabled={
+                    isMutating ||
+                    ((pending.kind === "revoke" || pending.kind === "ban") &&
+                      notes.trim().length < REVOKE_BAN_NOTES_MIN)
                   }
-                  disabled={decideM.isPending}
                 >
-                  {decideM.isPending
-                    ? "Saving…"
-                    : pending.decision === "approve"
-                    ? "Approve"
-                    : "Reject"}
+                  {isMutating ? "Saving…" : submitLabelFor(pending.kind)}
                 </Button>
               </DialogFooter>
             </>
@@ -242,16 +294,21 @@ function AppRow({
   row,
   onApprove,
   onReject,
+  onRevoke,
+  onBan,
 }: {
   row: TrainerApplicationRow;
   onApprove: () => void;
   onReject: () => void;
+  onRevoke: () => void;
+  onBan: () => void;
 }) {
   const submitted = useMemo(
     () => new Date(row.submitted_at).toLocaleString(),
     [row.submitted_at],
   );
-  const isPending = row.status === "submitted";
+  const isSubmitted = row.status === "submitted";
+  const isApproved = row.status === "approved";
   return (
     <TableRow>
       <TableCell>
@@ -265,16 +322,25 @@ function AppRow({
         <StatusBadge status={row.status} />
       </TableCell>
       <TableCell className="max-w-[280px] text-xs text-muted-foreground">
-        {row.review_notes || (isPending ? "—" : "(none)")}
+        {row.review_notes || (isSubmitted ? "—" : "(none)")}
       </TableCell>
       <TableCell className="text-right">
-        {isPending ? (
+        {isSubmitted ? (
           <div className="flex justify-end gap-2">
             <Button variant="outline" size="sm" onClick={onReject}>
               Reject
             </Button>
             <Button size="sm" onClick={onApprove}>
               Approve
+            </Button>
+          </div>
+        ) : isApproved ? (
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={onRevoke}>
+              Revoke
+            </Button>
+            <Button variant="destructive" size="sm" onClick={onBan}>
+              Ban
             </Button>
           </div>
         ) : (
@@ -289,7 +355,7 @@ function StatusBadge({ status }: { status: TrainerApplicationStatus }) {
   const variant =
     status === "approved"
       ? "default"
-      : status === "rejected"
+      : status === "rejected" || status === "banned"
       ? "destructive"
       : status === "submitted"
       ? "secondary"
@@ -299,6 +365,46 @@ function StatusBadge({ status }: { status: TrainerApplicationStatus }) {
       {status}
     </Badge>
   );
+}
+
+function dialogTitleFor(kind: PendingAction["kind"]): string {
+  switch (kind) {
+    case "approve": return "Approve";
+    case "reject":  return "Reject";
+    case "revoke":  return "Revoke access for";
+    case "ban":     return "Ban";
+  }
+}
+
+function dialogDescriptionFor(kind: PendingAction["kind"]): string {
+  switch (kind) {
+    case "approve":
+      return "User will be flipped to active immediately.";
+    case "reject":
+      return "User will be suspended. They'll see the rejection on next login.";
+    case "revoke":
+      return "Trainer's portal access will be turned off (account suspended). They can be re-approved later. Notes are required.";
+    case "ban":
+      return "Trainer will be permanently banned from the platform. This is terminal — they cannot re-apply without an admin override. Notes are required.";
+  }
+}
+
+function placeholderFor(kind: PendingAction["kind"]): string {
+  switch (kind) {
+    case "approve": return "Any onboarding notes for the trainer…";
+    case "reject":  return "Why the application is being declined…";
+    case "revoke":  return "Why access is being revoked…";
+    case "ban":     return "Why this trainer is being banned…";
+  }
+}
+
+function submitLabelFor(kind: PendingAction["kind"]): string {
+  switch (kind) {
+    case "approve": return "Approve";
+    case "reject":  return "Reject";
+    case "revoke":  return "Revoke access";
+    case "ban":     return "Ban trainer";
+  }
 }
 
 function LoadingRow() {

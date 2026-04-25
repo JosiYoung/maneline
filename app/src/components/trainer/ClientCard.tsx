@@ -31,10 +31,17 @@ export function ClientCard({ grant }: { grant: ClientGrant }) {
   const ownerLine =
     grant.owner_display_name ?? grant.owner_email ?? "Owner";
 
-  // Animal-scope grants link to the read-only animal page; the broader
-  // scopes don't have a single animal target, so the CTA is disabled
-  // until Prompt 2.3 adds a dedicated roster drill-down.
-  const animalHref = grant.animal_id ? `/trainer/animals/${grant.animal_id}` : null;
+  // Animal-scope grants jump straight to the read-only animal page.
+  // Owner_all and ranch scopes drop into /trainer/clients/:ownerId,
+  // which fans out the trainer's accessible roster for that owner
+  // (optionally narrowed to a single ranch via ?ranch=).
+  const openHref = (() => {
+    if (grant.animal_id) return `/trainer/animals/${grant.animal_id}`;
+    if (grant.scope === "ranch" && grant.ranch_id) {
+      return `/trainer/clients/${grant.owner_id}?ranch=${grant.ranch_id}`;
+    }
+    return `/trainer/clients/${grant.owner_id}`;
+  })();
 
   return (
     <Card className="transition-shadow hover:shadow-md">
@@ -53,17 +60,14 @@ export function ClientCard({ grant }: { grant: ClientGrant }) {
             {scopeLabel(grant)}
           </p>
         </div>
-        {animalHref ? (
-          <Button asChild size="sm" variant="ghost">
-            <Link to={animalHref} aria-label={`Open ${grant.animal_barn_name ?? "animal"}`}>
-              Open <ArrowRight size={14} />
-            </Link>
-          </Button>
-        ) : (
-          <Button size="sm" variant="ghost" disabled>
-            Open
-          </Button>
-        )}
+        <Button asChild size="sm" variant="ghost">
+          <Link
+            to={openHref}
+            aria-label={`Open ${grant.animal_barn_name ?? scopeLabel(grant)}`}
+          >
+            Open <ArrowRight size={14} />
+          </Link>
+        </Button>
       </CardContent>
     </Card>
   );

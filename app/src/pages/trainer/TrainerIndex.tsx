@@ -6,6 +6,7 @@ import BusinessDashboard from "./BusinessDashboard";
 import TrainerAccount from "./TrainerAccount";
 import TrainerSettingsSubscription from "./SettingsSubscription";
 import ClientsIndex from "./ClientsIndex";
+import ClientRoster from "./ClientRoster";
 import AnimalReadOnly from "./AnimalReadOnly";
 import SessionsIndex from "./SessionsIndex";
 import SessionNew from "./SessionNew";
@@ -30,8 +31,9 @@ export default function TrainerIndex() {
       <Routes>
         <Route index element={<TrainerDashboard />} />
         <Route path="business"    element={<BusinessDashboard />} />
-        <Route path="clients"     element={<ClientsIndex />} />
-        <Route path="animals/:id" element={<AnimalReadOnly />} />
+        <Route path="clients"             element={<ClientsIndex />} />
+        <Route path="clients/:ownerId"    element={<ClientRoster />} />
+        <Route path="animals/:id"         element={<AnimalReadOnly />} />
         <Route path="sessions"          element={<SessionsIndex />} />
         <Route path="sessions/new"      element={<SessionNew />} />
         <Route path="sessions/:id"      element={<SessionDetail />} />

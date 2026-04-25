@@ -100,7 +100,15 @@ export default function ClientsIndex() {
               {rows.map((g) => {
                 const status = statusFor(g);
                 const grace = status === "grace" ? daysLeftInGrace(g) : 0;
-                const animalHref = g.animal_id ? `/trainer/animals/${g.animal_id}` : null;
+                // Animal scope → AnimalReadOnly. Ranch scope → roster
+                // narrowed by ranch. Owner_all → full roster for that
+                // owner. Every grant therefore has a working Open link.
+                const openHref = g.animal_id
+                  ? `/trainer/animals/${g.animal_id}`
+                  : g.scope === "ranch" && g.ranch_id
+                    ? `/trainer/clients/${g.owner_id}?ranch=${g.ranch_id}`
+                    : `/trainer/clients/${g.owner_id}`;
+                const openLabel = g.animal_id ? "Open animal" : "Open roster";
                 return (
                   <TableRow key={g.id}>
                     <TableCell className="font-medium">
@@ -120,17 +128,11 @@ export default function ClientsIndex() {
                       )}
                     </TableCell>
                     <TableCell className="text-right">
-                      {animalHref ? (
-                        <Button asChild size="sm" variant="ghost">
-                          <Link to={animalHref}>
-                            Open animal <ArrowRight size={14} />
-                          </Link>
-                        </Button>
-                      ) : (
-                        <Button size="sm" variant="ghost" disabled>
-                          Open
-                        </Button>
-                      )}
+                      <Button asChild size="sm" variant="ghost">
+                        <Link to={openHref}>
+                          {openLabel} <ArrowRight size={14} />
+                        </Link>
+                      </Button>
                     </TableCell>
                   </TableRow>
                 );

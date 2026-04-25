@@ -1147,6 +1147,79 @@ async function handleAdmin(request, env, url) {
         has_notes: !!reviewNotes,
       };
     }
+  } else if (
+    request.method === 'POST' &&
+    (tail.endsWith('/revoke') || tail.endsWith('/ban')) &&
+    tail.startsWith('trainer-applications/')
+  ) {
+    // Companion to approve/reject above, but for already-approved
+    // trainers. Notes are required (RPC raises bad_notes otherwise);
+    // we surface that as a 400 so the SPA can keep the dialog open.
+    const match = tail.match(/^trainer-applications\/([^/]+)\/(revoke|ban)$/);
+    if (!match) {
+      return json({ error: 'not_found' }, 404);
+    }
+    const id = match[1];
+    const actionKind = match[2]; // 'revoke' | 'ban'
+    action = actionKind === 'revoke' ? 'admin.trainer.revoke' : 'admin.trainer.ban';
+    targetTable = 'trainer_applications';
+    let body = {};
+    try { body = await request.json(); } catch { body = {}; }
+    const reviewNotes = typeof body?.review_notes === 'string' && body.review_notes.trim()
+      ? body.review_notes.trim().slice(0, 2000)
+      : null;
+    if (!reviewNotes) {
+      return json({ error: 'bad_notes', message: 'Notes are required to revoke or ban a trainer.' }, 400);
+    }
+    const r = await supabaseRpc(
+      env,
+      'admin_revoke_or_ban_trainer',
+      { app_id: id, action_kind: actionKind, reviewer: actorId, p_review_notes: reviewNotes },
+      { serviceRole: true }
+    );
+    if (!r.ok) {
+      const errText = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+      if (/app_not_found/.test(errText)) {
+        response = json({ error: 'not_found' }, 404);
+      } else if (/bad_action/.test(errText)) {
+        response = json({ error: 'bad_action' }, 400);
+      } else if (/bad_notes/.test(errText)) {
+        response = json({ error: 'bad_notes' }, 400);
+      } else {
+        response = json({ error: 'decision_failed' }, 500);
+      }
+      metadata = { ok: false, action_kind: actionKind, app_id: id, status: r.status };
+    } else {
+      const decisionPayload = r.data || {};
+      // Mirror the approve/reject HubSpot enqueue so the marketing
+      // pipeline sees access removals too. Best-effort, drained by
+      // the existing 5.6 cron.
+      try {
+        await supabaseInsert(env, 'pending_hubspot_syncs', {
+          event_name: 'maneline_trainer_decision',
+          payload: {
+            application_id: id,
+            user_id: decisionPayload.user_id,
+            email: decisionPayload.email,
+            display_name: decisionPayload.display_name,
+            decision: decisionPayload.decision,
+            review_notes: decisionPayload.review_notes,
+            decided_by: actorId,
+            decided_at: new Date().toISOString(),
+          },
+        });
+      } catch (err) {
+        console.warn('[hubspot] enqueue failed:', err?.message);
+      }
+      response = json({ application: decisionPayload });
+      metadata = {
+        ok: true,
+        action_kind: actionKind,
+        app_id: id,
+        user_id: decisionPayload.user_id,
+        has_notes: true,
+      };
+    }
   } else if (tail === 'support-tickets' && request.method === 'GET') {
     action = 'admin.read.support_tickets';
     targetTable = 'support_tickets';

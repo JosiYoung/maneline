@@ -11,7 +11,9 @@ export type TrainerApplicationStatus =
   | "approved"
   | "rejected"
   | "withdrawn"
-  | "archived";
+  | "archived"
+  | "revoked"
+  | "banned";
 
 export type TrainerApplicationRow = {
   id: string;
@@ -66,7 +68,7 @@ export type DecisionResult = {
   user_id: string;
   email: string | null;
   display_name: string | null;
-  decision: "approved" | "rejected";
+  decision: "approved" | "rejected" | "revoked" | "banned";
   user_status: string;
   review_notes: string | null;
 };
@@ -78,6 +80,21 @@ export async function decideTrainerApplication(
 ): Promise<DecisionResult> {
   const res = await authed("POST", `/api/admin/trainer-applications/${id}/${decision}`, {
     review_notes: reviewNotes || null,
+  });
+  if (!res.ok) throw await parseError(res);
+  const body = (await res.json()) as { application: DecisionResult };
+  return body.application;
+}
+
+// Revoke / Ban — only valid on already-approved trainers. Notes are
+// required server-side; the UI enforces it before we get here.
+export async function revokeOrBanTrainer(
+  id: string,
+  action: "revoke" | "ban",
+  reviewNotes: string,
+): Promise<DecisionResult> {
+  const res = await authed("POST", `/api/admin/trainer-applications/${id}/${action}`, {
+    review_notes: reviewNotes,
   });
   if (!res.ok) throw await parseError(res);
   const body = (await res.json()) as { application: DecisionResult };
