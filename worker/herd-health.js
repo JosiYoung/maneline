@@ -165,11 +165,14 @@ export async function computeHerdHealth(env, ownerId) {
  * Lists the owner's non-archived animals (used to join onto grid cells).
  */
 export async function listOwnerAnimals(env, ownerId) {
+  // animals.name doesn't exist — the column is barn_name. We alias it
+  // back to `name` via PostgREST so the SPA HerdHealthAnimalRow type
+  // (`{ name, ... }`) stays unchanged.
   const q = [
-    'select=id,name,color_hex,archived_at',
+    'select=id,name:barn_name,color_hex,archived_at',
     `owner_id=eq.${ownerId}`,
     'archived_at=is.null',
-    'order=name.asc',
+    'order=barn_name.asc',
   ].join('&');
   const r = await fetch(`${RESTB(env)}/animals?${q}`, { headers: SR(env) });
   if (!r.ok) return { ok: false, status: r.status, data: null };
@@ -245,7 +248,7 @@ export async function listAnimalVetRecords(env, ownerId, animalId) {
  */
 export async function getOwnerAnimal(env, ownerId, animalId) {
   const q = [
-    'select=id,name,color_hex,archived_at,created_at',
+    'select=id,name:barn_name,color_hex,archived_at,created_at',
     `id=eq.${animalId}`,
     `owner_id=eq.${ownerId}`,
     'limit=1',
