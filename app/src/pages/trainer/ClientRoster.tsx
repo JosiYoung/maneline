@@ -32,7 +32,6 @@ type RosterAnimal = {
   sex: string | null;
   year_born: number | null;
   discipline: string | null;
-  ranch_id: string | null;
   archived_at: string | null;
 };
 
@@ -42,16 +41,31 @@ async function listAnimalsForOwner(
   ownerId: string,
   ranchId: string | null,
 ): Promise<RosterAnimal[]> {
+  // Animals don't have a direct ranch_id; ranch placement lives on
+  // stall_assignments → stalls. When the originating grant was scope=
+  // 'ranch' we narrow by current stall assignments on that ranch.
+  let allowedIds: string[] | null = null;
+  if (ranchId) {
+    const { data: stallRows, error: stallErr } = await supabase
+      .from("stall_assignments")
+      .select("animal_id, stalls!inner(ranch_id)")
+      .is("unassigned_at", null)
+      .eq("stalls.ranch_id", ranchId);
+    if (stallErr) throw stallErr;
+    allowedIds = Array.from(
+      new Set(((stallRows ?? []) as Array<{ animal_id: string }>).map((r) => r.animal_id)),
+    );
+    if (allowedIds.length === 0) return [];
+  }
+
   let q = supabase
     .from("animals")
-    .select(
-      "id,barn_name,species,breed,sex,year_born,discipline,ranch_id,archived_at",
-    )
+    .select("id,barn_name,species,breed,sex,year_born,discipline,archived_at")
     .eq("owner_id", ownerId)
     .is("archived_at", null)
     .order("barn_name", { ascending: true });
 
-  if (ranchId) q = q.eq("ranch_id", ranchId);
+  if (allowedIds) q = q.in("id", allowedIds);
 
   const { data, error } = await q;
   if (error) throw error;
