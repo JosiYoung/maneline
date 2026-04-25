@@ -8497,8 +8497,9 @@ async function handleBarnEventsList(request, env, url) {
   const rl = await rateLimit(env, `ratelimit:barn_events_list:${actorId}`, BARN_EVENT_RATE);
   if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, { 'retry-after': String(rl.resetSec) });
 
-  const from = url.searchParams.get('from');
-  const to   = url.searchParams.get('to');
+  // Accept both `start`/`end` (SPA) and `from`/`to` (legacy) param names.
+  const from = url.searchParams.get('start') || url.searchParams.get('from');
+  const to   = url.searchParams.get('end')   || url.searchParams.get('to');
   const filters = ['archived_at=is.null'];
   if (from) filters.push(`start_at=gte.${encodeURIComponent(from)}`);
   if (to)   filters.push(`start_at=lte.${encodeURIComponent(to)}`);
@@ -8507,7 +8508,32 @@ async function handleBarnEventsList(request, env, url) {
   // Use caller JWT so RLS (owner-own + trainer-via-grants) applies.
   const r = await supabaseSelect(env, 'barn_events', q, { userJwt: jwt });
   if (!r.ok) return json({ error: 'list_failed', status: r.status }, 500);
-  return json({ events: r.data || [] });
+  const events = Array.isArray(r.data) ? r.data : [];
+
+  // SPA EventListItem shape needs attendee_count + confirmed_count per
+  // event. Bulk-fetch attendees in a single round-trip and bucket by
+  // event_id. RLS on barn_event_attendees mirrors barn_events visibility,
+  // so this stays scoped to events the caller already saw.
+  const counts = new Map();
+  if (events.length > 0) {
+    const idCsv = events.map((e) => e.id).join(',');
+    const aQ = `select=event_id,current_status&event_id=in.(${idCsv})&archived_at=is.null&limit=2000`;
+    const ar = await supabaseSelect(env, 'barn_event_attendees', aQ, { userJwt: jwt });
+    if (ar.ok && Array.isArray(ar.data)) {
+      for (const row of ar.data) {
+        const c = counts.get(row.event_id) || { total: 0, confirmed: 0 };
+        c.total += 1;
+        if (row.current_status === 'confirmed') c.confirmed += 1;
+        counts.set(row.event_id, c);
+      }
+    }
+  }
+
+  const items = events.map((ev) => {
+    const c = counts.get(ev.id) || { total: 0, confirmed: 0 };
+    return { event: ev, attendee_count: c.total, confirmed_count: c.confirmed };
+  });
+  return json({ events: items });
 }
 
 async function handleBarnEventGet(request, env, id) {

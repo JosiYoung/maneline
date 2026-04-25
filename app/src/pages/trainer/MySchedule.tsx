@@ -63,7 +63,9 @@ export default function MySchedule() {
     enabled: Boolean(userId),
   });
 
-  const events = eventsQuery.data ?? [];
+  const events = (eventsQuery.data ?? []).filter(
+    (e): e is EventListItem => Boolean(e?.event?.start_at),
+  );
   const now = Date.now();
   const upcoming = useMemo(
     () =>

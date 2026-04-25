@@ -128,7 +128,9 @@ export default function BarnCalendar() {
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
 
-  const events = eventsQuery.data ?? [];
+  const events = (eventsQuery.data ?? []).filter(
+    (e): e is EventListItem => Boolean(e?.event?.start_at),
+  );
   const now = Date.now();
   const upcoming = useMemo(
     () =>
