@@ -92,8 +92,17 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   signOut: async () => {
-    await supabase.auth.signOut();
+    if (!get().session) return;
+    // Clear local state first so the UI reacts immediately. The Supabase
+    // call only revokes the refresh token server-side; making the UI wait
+    // on it makes the logout button feel unresponsive on slow networks.
     set({ session: null, profile: null });
+    try {
+      await supabase.auth.signOut();
+    } catch {
+      // Local state is already cleared — a flaky network here just means
+      // the refresh token isn't revoked server-side until it expires.
+    }
   },
 
   withAuthPause: async (fn) => {

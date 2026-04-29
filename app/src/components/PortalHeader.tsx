@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { LogOut } from 'lucide-react';
 import { useAuthStore } from '../lib/authStore';
@@ -17,8 +18,11 @@ const PORTAL_LABELS: Record<PortalHeaderProps['portal'], string> = {
 export function PortalHeader({ portal }: PortalHeaderProps) {
   const navigate = useNavigate();
   const { session, profile, signOut } = useAuthStore();
+  const [signingOut, setSigningOut] = useState(false);
 
   async function handleSignOut() {
+    if (signingOut) return;
+    setSigningOut(true);
     await signOut();
     navigate('/', { replace: true });
   }
@@ -56,6 +60,7 @@ export function PortalHeader({ portal }: PortalHeaderProps) {
         <button
           type="button"
           onClick={handleSignOut}
+          disabled={signingOut}
           style={{
             display: 'inline-flex',
             alignItems: 'center',
@@ -65,12 +70,13 @@ export function PortalHeader({ portal }: PortalHeaderProps) {
             background: 'var(--color-surface)',
             color: 'var(--color-ink)',
             borderRadius: 8,
-            cursor: 'pointer',
+            cursor: signingOut ? 'wait' : 'pointer',
             fontSize: 14,
+            opacity: signingOut ? 0.6 : 1,
           }}
         >
           <LogOut size={16} />
-          Sign out
+          {signingOut ? 'Signing out…' : 'Sign out'}
         </button>
       </div>
     </header>
