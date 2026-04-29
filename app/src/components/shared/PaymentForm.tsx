@@ -6,6 +6,7 @@ import {
   useElements,
   useStripe,
 } from "@stripe/react-stripe-js";
+import { Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { notify } from "@/lib/toast";
@@ -21,9 +22,13 @@ const STRIPE_PUBLIC_KEY = import.meta.env.VITE_STRIPE_PUBLIC_KEY as
   | string
   | undefined;
 
-// Memoize loadStripe at module scope so we don't re-download stripe.js
-// on every mount (per Stripe docs).
+// Kick off loadStripe immediately at module load — this starts
+// downloading stripe.js from Stripe's CDN as early as possible
+// instead of waiting for the PaymentForm component to mount.
 let stripePromise: Promise<Stripe | null> | null = null;
+if (STRIPE_PUBLIC_KEY) {
+  stripePromise = loadStripe(STRIPE_PUBLIC_KEY);
+}
 function getStripe(): Promise<Stripe | null> {
   if (!STRIPE_PUBLIC_KEY) return Promise.resolve(null);
   if (!stripePromise) stripePromise = loadStripe(STRIPE_PUBLIC_KEY);
@@ -47,7 +52,7 @@ export type PaymentFormProps = {
 };
 
 export function PaymentForm(props: PaymentFormProps) {
-  const stripePromise = useMemo(() => getStripe(), []);
+  const stripe = useMemo(() => getStripe(), []);
 
   if (!STRIPE_PUBLIC_KEY) {
     return (
@@ -60,7 +65,7 @@ export function PaymentForm(props: PaymentFormProps) {
 
   return (
     <Elements
-      stripe={stripePromise}
+      stripe={stripe}
       options={{
         clientSecret: props.clientSecret,
         appearance: {
@@ -81,15 +86,27 @@ function InnerForm({ returnUrl, onSuccess, onFailure, amountLabel }: PaymentForm
   const elements = useElements();
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  // PaymentElement fires onReady once it's fully mounted in the DOM.
-  // useElements() returns non-null before that, so we gate the submit
-  // button on this flag to avoid the "should have a mounted Payment
-  // Element" error from stripe.confirmPayment().
   const [elementReady, setElementReady] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     setErrorMsg(null);
   }, []);
+
+  // Timeout: if PaymentElement hasn't fired onReady after 15s, something
+  // is wrong (bad client_secret, Stripe CDN blocked, etc.).
+  useEffect(() => {
+    if (elementReady || loadError) return;
+    const t = setTimeout(() => {
+      if (!elementReady) {
+        setLoadError(
+          "The payment form is taking too long to load. " +
+          "Check your internet connection or try refreshing."
+        );
+      }
+    }, 15_000);
+    return () => clearTimeout(t);
+  }, [elementReady, loadError]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -105,8 +122,6 @@ function InnerForm({ returnUrl, onSuccess, onFailure, amountLabel }: PaymentForm
       });
 
       if (error) {
-        // Card errors, decline, 3DS cancel, validation errors — all
-        // surface here without a redirect.
         const msg = error.message || "Payment failed. Try a different card.";
         setErrorMsg(msg);
         notify.error(msg);
@@ -114,10 +129,8 @@ function InnerForm({ returnUrl, onSuccess, onFailure, amountLabel }: PaymentForm
         return;
       }
 
-      // No redirect needed (e.g. card succeeded immediately).
       onSuccess?.();
     } catch (err) {
-      // confirmPayment threw — network glitch, blocked 3DS popup, etc.
       const msg =
         (err as Error)?.message ||
         "Payment didn't go through. Refresh and try again.";
@@ -131,12 +144,49 @@ function InnerForm({ returnUrl, onSuccess, onFailure, amountLabel }: PaymentForm
 
   return (
     <form onSubmit={handleSubmit} className="space-y-4">
-      <PaymentElement onReady={() => setElementReady(true)} />
+      {/* Loading skeleton shown until Stripe's iframe is ready */}
+      {!elementReady && !loadError && (
+        <div className="flex items-center justify-center gap-2 rounded-md border border-border bg-muted/20 py-10 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Loading payment form…
+        </div>
+      )}
+
+      {loadError && (
+        <div className="space-y-2 rounded-md border border-destructive/30 bg-destructive/5 p-4">
+          <p className="text-sm text-destructive">{loadError}</p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => window.location.reload()}
+          >
+            Refresh page
+          </Button>
+        </div>
+      )}
+
+      {/* PaymentElement renders a hidden iframe immediately; it becomes
+          visible once Stripe's JS populates it. We keep it in the DOM
+          always so the iframe can load in parallel with our skeleton. */}
+      <div className={elementReady ? undefined : "sr-only"}>
+        <PaymentElement
+          onReady={() => setElementReady(true)}
+          onLoadError={(e) => {
+            const msg =
+              e.error?.message ||
+              "Could not load the payment form. Please refresh.";
+            setLoadError(msg);
+          }}
+        />
+      </div>
+
       {errorMsg && (
         <p className="text-sm text-destructive" role="alert">
           {errorMsg}
         </p>
       )}
+
       <Button
         type="submit"
         className="w-full bg-accent text-accent-foreground hover:bg-accent/90"
