@@ -98,7 +98,6 @@ export default function BusinessDashboard() {
                 <NetBreakdown
                   grossCents={summary.grossCents}
                   platformFeeCents={summary.platformFeeCents}
-                  stripeFeeCentsEst={summary.stripeFeeCentsEst}
                   netCents={summary.netCents}
                 />
               }

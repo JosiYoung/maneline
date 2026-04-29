@@ -95,6 +95,11 @@ export default function SessionApproveAndPay() {
       setPayError(null);
       setIntent(res);
       queryClient.invalidateQueries({ queryKey: SESSION_PAYMENTS_QUERY_KEY });
+      // If the Worker tells us this session is already paid, refresh the
+      // session query so the UI flips to the "paid" card immediately.
+      if (res.status === "succeeded" || res.status === "processing") {
+        queryClient.invalidateQueries({ queryKey: SESSIONS_QUERY_KEY });
+      }
     },
     onError: (err) => {
       const msg = mapSupabaseError(err as Error);
@@ -255,7 +260,9 @@ export default function SessionApproveAndPay() {
         </Card>
       )}
 
-      {session.status === "paid" ? (
+      {session.status === "paid"
+        || paymentQuery.data?.status === "succeeded"
+        || (intent && intent.status === "succeeded") ? (
         <Card>
           <CardContent className="space-y-3 py-6 text-center">
             <p className="text-sm text-muted-foreground">

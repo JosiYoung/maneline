@@ -2237,7 +2237,9 @@ export type Database = {
           currency: string
           failure_code: string | null
           failure_message: string | null
+          gross_amount_cents: number | null
           id: string
+          owner_surcharge_cents: number | null
           payee_id: string
           payer_id: string
           platform_fee_cents: number
@@ -2245,7 +2247,9 @@ export type Database = {
           status: string
           stripe_charge_id: string | null
           stripe_event_last_seen: string | null
+          stripe_fee_estimate_cents: number | null
           stripe_payment_intent_id: string | null
+          trainer_cut_cents: number | null
           updated_at: string
         }
         Insert: {
@@ -2254,7 +2258,9 @@ export type Database = {
           currency?: string
           failure_code?: string | null
           failure_message?: string | null
+          gross_amount_cents?: number | null
           id?: string
+          owner_surcharge_cents?: number | null
           payee_id: string
           payer_id: string
           platform_fee_cents: number
@@ -2262,7 +2268,9 @@ export type Database = {
           status?: string
           stripe_charge_id?: string | null
           stripe_event_last_seen?: string | null
+          stripe_fee_estimate_cents?: number | null
           stripe_payment_intent_id?: string | null
+          trainer_cut_cents?: number | null
           updated_at?: string
         }
         Update: {
@@ -2271,7 +2279,9 @@ export type Database = {
           currency?: string
           failure_code?: string | null
           failure_message?: string | null
+          gross_amount_cents?: number | null
           id?: string
+          owner_surcharge_cents?: number | null
           payee_id?: string
           payer_id?: string
           platform_fee_cents?: number
@@ -2279,7 +2289,9 @@ export type Database = {
           status?: string
           stripe_charge_id?: string | null
           stripe_event_last_seen?: string | null
+          stripe_fee_estimate_cents?: number | null
           stripe_payment_intent_id?: string | null
+          trainer_cut_cents?: number | null
           updated_at?: string
         }
         Relationships: [

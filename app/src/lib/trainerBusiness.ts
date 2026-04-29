@@ -33,18 +33,11 @@ type Grant = Database["public"]["Tables"]["animal_access_grants"]["Row"];
 
 export type BusinessPeriod = "last_30d" | "last_90d" | "ytd";
 
-// Stripe US card processing rate. We don't read Stripe's fee back into
-// our DB, so we approximate here and label it clearly on the tooltip.
-// Source: https://stripe.com/pricing (US, card present/not present).
-const STRIPE_FEE_BPS = 290;       // 2.9 %
-const STRIPE_FEE_FIXED = 30;      // $0.30 per charge
-
 export interface BusinessSummary {
   periodStart: Date;
   periodEnd: Date;
   grossCents: number;
   platformFeeCents: number;
-  stripeFeeCentsEst: number;
   netCents: number;
   expensesCents: number;
   netOfExpensesCents: number;
@@ -241,12 +234,11 @@ export function computeSummary(
   const { start, end } = periodRange(period);
 
   const grossCents = raw.payments.reduce((s, p) => s + p.amount_cents, 0);
-  const platformFeeCents = raw.payments.reduce((s, p) => s + p.platform_fee_cents, 0);
-  const stripeFeeCentsEst = raw.payments.reduce(
-    (s, p) => s + Math.round((p.amount_cents * STRIPE_FEE_BPS) / 10000) + STRIPE_FEE_FIXED,
-    0
-  );
-  const netCents = grossCents - platformFeeCents - stripeFeeCentsEst;
+  // trainer_cut_cents is the platform fee deducted from the trainer's earnings.
+  // platform_fee_cents is the full Stripe application_fee_amount (includes the
+  // owner-side surcharge that covers Stripe processing) — do NOT use it here.
+  const platformFeeCents = raw.payments.reduce((s, p) => s + (p.trainer_cut_cents ?? 0), 0);
+  const netCents = grossCents - platformFeeCents;
 
   const expensesCents = raw.expenses.reduce((s, e) => s + e.amount_cents, 0);
   const netOfExpensesCents = netCents - expensesCents;
@@ -265,7 +257,6 @@ export function computeSummary(
     periodEnd: end,
     grossCents,
     platformFeeCents,
-    stripeFeeCentsEst,
     netCents,
     expensesCents,
     netOfExpensesCents,
@@ -289,8 +280,7 @@ export function computeMonthly(raw: RawBusinessData): MonthlyPoint[] {
 
   for (const p of raw.payments) {
     const k = monthKey(new Date(p.created_at));
-    const net = p.amount_cents - p.platform_fee_cents -
-      (Math.round((p.amount_cents * STRIPE_FEE_BPS) / 10000) + STRIPE_FEE_FIXED);
+    const net = p.amount_cents - (p.trainer_cut_cents ?? 0);
     rev.set(k, (rev.get(k) ?? 0) + net);
   }
   for (const e of raw.expenses) {
@@ -318,8 +308,7 @@ export function computeByHorse(raw: RawBusinessData, limit = 10): EntityProfit[]
   for (const p of raw.payments) {
     const s = sessionById.get(p.session_id);
     if (!s) continue;
-    const net = p.amount_cents - p.platform_fee_cents -
-      (Math.round((p.amount_cents * STRIPE_FEE_BPS) / 10000) + STRIPE_FEE_FIXED);
+    const net = p.amount_cents - (p.trainer_cut_cents ?? 0);
     revByAnimal.set(s.animal_id, (revByAnimal.get(s.animal_id) ?? 0) + net);
   }
 
@@ -361,8 +350,7 @@ export function computeByBarn(raw: RawBusinessData): EntityProfit[] {
     const s = sessionById.get(p.session_id);
     if (!s) continue;
     const barn = raw.barnByAnimalId.get(s.animal_id)?.name ?? "Unassigned";
-    const net = p.amount_cents - p.platform_fee_cents -
-      (Math.round((p.amount_cents * STRIPE_FEE_BPS) / 10000) + STRIPE_FEE_FIXED);
+    const net = p.amount_cents - (p.trainer_cut_cents ?? 0);
     rev.set(barn, (rev.get(barn) ?? 0) + net);
   }
 
@@ -390,8 +378,7 @@ export function computeByClient(raw: RawBusinessData, limit = 10): EntityProfit[
   for (const p of raw.payments) {
     const s = sessionById.get(p.session_id);
     if (!s) continue;
-    const net = p.amount_cents - p.platform_fee_cents -
-      (Math.round((p.amount_cents * STRIPE_FEE_BPS) / 10000) + STRIPE_FEE_FIXED);
+    const net = p.amount_cents - (p.trainer_cut_cents ?? 0);
     rev.set(s.owner_id, (rev.get(s.owner_id) ?? 0) + net);
   }
 

@@ -5591,6 +5591,31 @@ async function handleSessionPay(request, env) {
   if (!row) return json({ error: 'not_found' }, 404);
   if (row.owner_id !== actorId) return json({ error: 'forbidden' }, 403);
   if (row.archived_at) return json({ error: 'archived' }, 409);
+
+  // If the session is already paid, return the succeeded payment row
+  // instead of a 409 — the webhook may have flipped status between
+  // page-load and the startPayment() call.
+  if (row.status === 'paid') {
+    const paidQ = await supabaseSelect(
+      env,
+      'session_payments',
+      `select=id,status,stripe_payment_intent_id,amount_cents,platform_fee_cents,gross_amount_cents,owner_surcharge_cents,trainer_cut_cents&session_id=eq.${encodeURIComponent(sessionId)}&status=eq.succeeded`,
+      { serviceRole: true }
+    );
+    const paidRow = Array.isArray(paidQ.data) ? paidQ.data[0] : null;
+    if (paidRow) {
+      return json({
+        status: 'succeeded',
+        payment_intent_id: paidRow.stripe_payment_intent_id,
+        amount_cents:          paidRow.amount_cents,
+        platform_fee_cents:    paidRow.platform_fee_cents,
+        gross_amount_cents:    paidRow.gross_amount_cents,
+        owner_surcharge_cents: paidRow.owner_surcharge_cents,
+        trainer_cut_cents:     paidRow.trainer_cut_cents,
+      });
+    }
+  }
+
   if (row.status !== 'approved') {
     return json({ error: 'not_payable', status: row.status }, 409);
   }
