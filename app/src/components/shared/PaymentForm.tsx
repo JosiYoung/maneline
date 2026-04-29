@@ -81,6 +81,11 @@ function InnerForm({ returnUrl, onSuccess, onFailure, amountLabel }: PaymentForm
   const elements = useElements();
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // PaymentElement fires onReady once it's fully mounted in the DOM.
+  // useElements() returns non-null before that, so we gate the submit
+  // button on this flag to avoid the "should have a mounted Payment
+  // Element" error from stripe.confirmPayment().
+  const [elementReady, setElementReady] = useState(false);
 
   useEffect(() => {
     setErrorMsg(null);
@@ -88,7 +93,7 @@ function InnerForm({ returnUrl, onSuccess, onFailure, amountLabel }: PaymentForm
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!stripe || !elements) return;
+    if (!stripe || !elements || !elementReady) return;
     setSubmitting(true);
     setErrorMsg(null);
 
@@ -113,8 +118,6 @@ function InnerForm({ returnUrl, onSuccess, onFailure, amountLabel }: PaymentForm
       onSuccess?.();
     } catch (err) {
       // confirmPayment threw — network glitch, blocked 3DS popup, etc.
-      // Without this catch the button stayed in "Processing…" forever
-      // and the user thought the page was hung.
       const msg =
         (err as Error)?.message ||
         "Payment didn't go through. Refresh and try again.";
@@ -122,16 +125,13 @@ function InnerForm({ returnUrl, onSuccess, onFailure, amountLabel }: PaymentForm
       notify.error(msg);
       onFailure?.(msg);
     } finally {
-      // Always clear the spinner so the user can retry. The previous
-      // implementation only cleared it in the no-error branch and on
-      // explicit decline — anything else left the button frozen.
       setSubmitting(false);
     }
   }
 
   return (
     <form onSubmit={handleSubmit} className="space-y-4">
-      <PaymentElement />
+      <PaymentElement onReady={() => setElementReady(true)} />
       {errorMsg && (
         <p className="text-sm text-destructive" role="alert">
           {errorMsg}
@@ -140,7 +140,7 @@ function InnerForm({ returnUrl, onSuccess, onFailure, amountLabel }: PaymentForm
       <Button
         type="submit"
         className="w-full bg-accent text-accent-foreground hover:bg-accent/90"
-        disabled={!stripe || !elements || submitting}
+        disabled={!stripe || !elements || !elementReady || submitting}
       >
         {submitting ? "Processing…" : amountLabel ? `Pay ${amountLabel}` : "Pay"}
       </Button>
