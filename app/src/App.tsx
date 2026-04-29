@@ -8,6 +8,7 @@ import SignupPage from './pages/SignupPage';
 import SignupCompleteProfile from './pages/SignupCompleteProfile';
 import CheckEmail from './pages/CheckEmail';
 import AuthCallback from './pages/AuthCallback';
+import SetupPin from './pages/SetupPin';
 import VetView from './pages/VetView';
 import Welcome from './pages/Welcome';
 import PublicEventAccept from './pages/PublicEventAccept';
@@ -29,6 +30,7 @@ export default function App() {
         <Route path="/signup/complete-profile" element={<SignupCompleteProfile />} />
         <Route path="/check-email" element={<CheckEmail />} />
         <Route path="/auth/callback" element={<AuthCallback />} />
+        <Route path="/setup-pin" element={<SetupPin />} />
 
         {/* Vet view — scoped magic link, no session required */}
         <Route path="/vet/:token" element={<VetView />} />

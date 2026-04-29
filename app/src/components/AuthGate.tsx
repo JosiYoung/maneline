@@ -1,6 +1,7 @@
 import { useEffect, type ReactNode } from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '../lib/authStore';
+import { pinSetupWasSkipped } from '../pages/SetupPin';
 
 interface AuthGateProps {
   children: ReactNode;
@@ -71,6 +72,19 @@ export function AuthGate({ children }: AuthGateProps) {
   const isCompleteProfile = location.pathname === '/signup/complete-profile';
   if (!profile && !isCompleteProfile) {
     return <Navigate to="/signup/complete-profile" replace />;
+  }
+
+  // EVERY new user is offered PIN setup once on first sign-in. They can skip
+  // (we remember per-user via localStorage) but the page is the default
+  // destination after auth so the option is never hidden.
+  if (
+    profile &&
+    !profile.has_pin &&
+    location.pathname !== '/setup-pin' &&
+    !isCompleteProfile &&
+    !pinSetupWasSkipped(session.user.id)
+  ) {
+    return <Navigate to="/setup-pin" replace />;
   }
 
   return <>{children}</>;

@@ -36,6 +36,13 @@ export type PaymentFormProps = {
   returnUrl: string;
   /** Fires after confirmPayment resolves without an immediate error. */
   onSuccess?: () => void;
+  /**
+   * Fires when confirmPayment returns an error or throws. Parents should
+   * use this to refresh the PaymentIntent — once Stripe puts a PI into
+   * `requires_payment_method` with a `last_payment_error`, that PI
+   * is poisoned and Elements won't render a fresh card form against it.
+   */
+  onFailure?: (message: string) => void;
   amountLabel?: string;
 };
 
@@ -69,7 +76,7 @@ export function PaymentForm(props: PaymentFormProps) {
   );
 }
 
-function InnerForm({ returnUrl, onSuccess, amountLabel }: PaymentFormProps) {
+function InnerForm({ returnUrl, onSuccess, onFailure, amountLabel }: PaymentFormProps) {
   const stripe = useStripe();
   const elements = useElements();
   const [submitting, setSubmitting] = useState(false);
@@ -85,24 +92,41 @@ function InnerForm({ returnUrl, onSuccess, amountLabel }: PaymentFormProps) {
     setSubmitting(true);
     setErrorMsg(null);
 
-    const { error } = await stripe.confirmPayment({
-      elements,
-      confirmParams: { return_url: returnUrl },
-      redirect: "if_required",
-    });
+    try {
+      const { error } = await stripe.confirmPayment({
+        elements,
+        confirmParams: { return_url: returnUrl },
+        redirect: "if_required",
+      });
 
-    if (error) {
-      // Card errors + validation errors surface here without a redirect.
-      const msg = error.message || "Payment failed. Try a different card.";
+      if (error) {
+        // Card errors, decline, 3DS cancel, validation errors — all
+        // surface here without a redirect.
+        const msg = error.message || "Payment failed. Try a different card.";
+        setErrorMsg(msg);
+        notify.error(msg);
+        onFailure?.(msg);
+        return;
+      }
+
+      // No redirect needed (e.g. card succeeded immediately).
+      onSuccess?.();
+    } catch (err) {
+      // confirmPayment threw — network glitch, blocked 3DS popup, etc.
+      // Without this catch the button stayed in "Processing…" forever
+      // and the user thought the page was hung.
+      const msg =
+        (err as Error)?.message ||
+        "Payment didn't go through. Refresh and try again.";
       setErrorMsg(msg);
       notify.error(msg);
+      onFailure?.(msg);
+    } finally {
+      // Always clear the spinner so the user can retry. The previous
+      // implementation only cleared it in the no-error branch and on
+      // explicit decline — anything else left the button frozen.
       setSubmitting(false);
-      return;
     }
-
-    // No redirect needed (eg. card succeeded immediately).
-    onSuccess?.();
-    setSubmitting(false);
   }
 
   return (

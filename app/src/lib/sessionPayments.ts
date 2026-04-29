@@ -50,15 +50,26 @@ export type StartPaymentResult =
       payment_intent_id: string;
       amount_cents?: number;
       platform_fee_cents?: number;
+      gross_amount_cents?: number;
+      owner_surcharge_cents?: number;
+      trainer_cut_cents?: number;
     }
   | {
       status: "processing" | "succeeded";
       payment_intent_id: string | null;
+      amount_cents?: number;
+      platform_fee_cents?: number;
+      gross_amount_cents?: number;
+      owner_surcharge_cents?: number;
+      trainer_cut_cents?: number;
     }
   | {
       status: "awaiting_trainer_setup";
       amount_cents: number;
       platform_fee_cents: number;
+      gross_amount_cents?: number;
+      owner_surcharge_cents?: number;
+      trainer_cut_cents?: number;
     };
 
 export async function startPayment(sessionId: string): Promise<StartPaymentResult> {

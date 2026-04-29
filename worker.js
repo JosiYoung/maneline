@@ -327,6 +327,9 @@ export default {
       if (url.pathname === '/api/access/revoke') {
         return handleAccessRevoke(request, env);
       }
+      if (url.pathname === '/api/trainers/directory') {
+        return handleTrainersDirectory(request, env);
+      }
       // --- Phase 8 Barn Mode — Module 01 (calendar + contacts) ---
       if (url.pathname === '/api/barn/pro-contacts') {
         if (request.method === 'GET')  return handleProContactsList(request, env, url);
@@ -4822,6 +4825,75 @@ async function handleAccessGrant(request, env) {
   });
 }
 
+/* =============================================================
+   GET /api/trainers/directory
+   -------------------------------------------------------------
+   Owner-facing list of approved active trainers. Used by the
+   "Invite a trainer" picker so owners select from the system
+   instead of typing emails. Service-role read because user_profiles
+   RLS only exposes own + granted relationships — owners haven't
+   yet established a relationship with these trainers.
+
+   Returns: [{ user_id, display_name, email, bio_short }, ...]
+   ============================================================= */
+const TRAINER_DIRECTORY_RATE = { limit: 60, windowSec: 60 };
+
+async function handleTrainersDirectory(request, env) {
+  if (request.method !== 'GET') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ error: 'not_configured' }, 500);
+  }
+
+  let actorId;
+  try {
+    ({ actorId } = await requireOwner(request, env));
+  } catch (resp) {
+    if (resp instanceof Response) return resp;
+    throw resp;
+  }
+
+  const rl = await rateLimit(env, `ratelimit:trainers_directory:${actorId}`, TRAINER_DIRECTORY_RATE);
+  if (!rl.ok) {
+    return json({ error: 'rate_limited', retry_after: rl.resetSec }, 429, {
+      'retry-after': String(rl.resetSec),
+    });
+  }
+
+  // Approved active trainers only. Two-step join because the embedded
+  // syntax `trainer_profiles!inner(application_status)` is fragile
+  // through PostgREST + service-role; explicit IN is bulletproof.
+  const tpRes = await supabaseSelect(
+    env,
+    'trainer_profiles',
+    'select=user_id&application_status=eq.approved',
+    { serviceRole: true }
+  );
+  if (!tpRes.ok) return json({ error: 'directory_lookup_failed' }, 500);
+  const approvedIds = (Array.isArray(tpRes.data) ? tpRes.data : []).map((r) => r.user_id).filter(Boolean);
+  if (approvedIds.length === 0) {
+    return json({ trainers: [] });
+  }
+
+  const idsParam = approvedIds.map((id) => encodeURIComponent(id)).join(',');
+  const upRes = await supabaseSelect(
+    env,
+    'user_profiles',
+    `select=user_id,email,display_name&role=eq.trainer&status=eq.active&user_id=in.(${idsParam})&order=display_name.asc.nullslast`,
+    { serviceRole: true }
+  );
+  if (!upRes.ok) return json({ error: 'directory_lookup_failed' }, 500);
+
+  const trainers = (Array.isArray(upRes.data) ? upRes.data : []).map((p) => ({
+    user_id:      p.user_id,
+    email:        p.email,
+    display_name: p.display_name,
+  }));
+
+  return json({ trainers });
+}
+
 async function handleAccessRevoke(request, env) {
   if (request.method !== 'POST') {
     return new Response('method not allowed', { status: 405 });
@@ -5389,13 +5461,92 @@ async function handleSessionApprove(request, env) {
      • trainer not ready → insert session_payments with
        status='awaiting_trainer_setup', return that status so
        the SPA can render the "waiting on trainer" helper.
-   Fee math uses public.effective_fee_bps (single source of
-   truth across admin default + per-trainer overrides).
-   Idempotent on an existing session_payments row: if a
-   'pending' intent already exists, retrieve it and return
-   its client_secret rather than creating a second intent.
+
+   Fee model (post-00038): the trainer's listed price is what
+   the trainer nets. The owner pays a service fee on top that
+   covers Stripe processing + the platform's margin. Math is
+   gross-up:
+
+     total*(1 - stripePct) = trainerPrice*(1 + platformPct)
+                             + platformFlat + stripeFlat
+
+   solved for `total`. application_fee_amount = total - trainerPrice.
+   With controller.fees.payer = application_express, Stripe
+   processing fees come out of the application fee, leaving the
+   platform with exactly platformPct*trainerPrice + platformFlat.
+
+   feeBps comes from public.effective_fee_bps (admin default or
+   per-trainer override); platformFlatCents from platform_settings.
    ============================================================= */
 const SESSION_PAY_RATE = { limit: 10, windowSec: 60 };
+
+// Stripe Standard US pricing — bumped here if Stripe ever changes.
+// Verified 2026-04-28 against actual charge: 2.9% × $200 + $0.30 = $6.10. ✓
+const STRIPE_PCT_BPS = 290;
+const STRIPE_FLAT_CENTS = 30;
+
+/**
+ * Compute the dual-side fee split for a session payment.
+ *
+ *   Owner pays:    T + ownerSurchargeCents
+ *   Trainer nets:  T − trainerCutCents
+ *   Platform nets: ownerSurchargeCents + trainerCutCents − stripeFee
+ *                = (ownerBps×T/10000 + ownerFlat) + (trainerBps×T/10000 + trainerFlat)
+ *
+ * Owner side is grossed up so the platform actually nets exactly
+ * (ownerBps × T / 10000 + ownerFlat) — Stripe's 2.9% + $0.30 is
+ * absorbed by the gross-up, not the platform.
+ *
+ * Trainer side is a flat deduction at face value — no gross-up,
+ * since it doesn't touch Stripe processing.
+ *
+ * Math:
+ *   total = (T + ownerTarget + stripeFlat) / (1 − stripePct)
+ *   ownerSurcharge = total − T
+ *   trainerCut     = trainerBps × T / 10000 + trainerFlat
+ *   applicationFee = ownerSurcharge + trainerCut
+ */
+function computeFeeSplit({
+  trainerPriceCents,
+  ownerBps,
+  ownerFlatCents,
+  trainerBps,
+  trainerFlatCents,
+}) {
+  const t = Math.max(0, Math.floor(Number(trainerPriceCents) || 0));
+  const oBps = Math.max(0, Math.floor(Number(ownerBps) || 0));
+  const oFlat = Math.max(0, Math.floor(Number(ownerFlatCents) || 0));
+  const trBps = Math.max(0, Math.floor(Number(trainerBps) || 0));
+  const trFlat = Math.max(0, Math.floor(Number(trainerFlatCents) || 0));
+
+  const ownerTargetCents = Math.ceil((t * oBps) / 10000) + oFlat;
+
+  // total = (T + ownerTarget + stripeFlat) / (1 − stripePct)
+  const numeratorCents = t + ownerTargetCents + STRIPE_FLAT_CENTS;
+  const totalCents = Math.ceil(
+    (numeratorCents * 10000) / (10000 - STRIPE_PCT_BPS),
+  );
+
+  const ownerSurchargeCents = totalCents - t;
+  const trainerCutCents = Math.min(
+    t,
+    Math.ceil((t * trBps) / 10000) + trFlat,
+  );
+  const applicationFeeCents = ownerSurchargeCents + trainerCutCents;
+  const trainerNetCents = t - trainerCutCents;
+
+  const stripeFeeEstimateCents =
+    Math.ceil((totalCents * STRIPE_PCT_BPS) / 10000) + STRIPE_FLAT_CENTS;
+
+  return {
+    totalCents,
+    ownerSurchargeCents,
+    trainerCutCents,
+    trainerNetCents,
+    applicationFeeCents,
+    stripeFeeEstimateCents,
+  };
+}
 
 async function handleSessionPay(request, env) {
   if (request.method !== 'POST') {
@@ -5455,7 +5606,13 @@ async function handleSessionPay(request, env) {
     { serviceRole: true }
   );
   if (!feeRpc.ok) {
-    return json({ error: 'fee_lookup_failed' }, 500);
+    console.error('[handleSessionPay] effective_fee_bps RPC failed', {
+      sessionId,
+      trainerId: row.trainer_id,
+      rpcStatus: feeRpc.status,
+      rpcError: feeRpc.data,
+    });
+    return json({ error: 'fee_lookup_failed', message: 'Could not compute platform fee.' }, 500);
   }
   const feeBps = typeof feeRpc.data === 'number'
     ? feeRpc.data
@@ -5463,14 +5620,46 @@ async function handleSessionPay(request, env) {
   if (!Number.isFinite(feeBps) || feeBps < 0 || feeBps > 10000) {
     return json({ error: 'fee_invalid' }, 500);
   }
-  const amountCents = row.trainer_price_cents;
-  const platformFeeCents = Math.ceil((amountCents * feeBps) / 10000);
+
+  // Read all four fee components from platform_settings. feeBps from
+  // the RPC already accounts for any per-trainer override on the
+  // owner side; trainer-side has no per-trainer override yet.
+  const settingsQ = await supabaseSelect(
+    env,
+    'platform_settings',
+    'select=default_fee_flat_cents,default_trainer_fee_bps,default_trainer_fee_flat_cents&id=eq.1',
+    { serviceRole: true }
+  );
+  const settingsRow = Array.isArray(settingsQ.data) ? settingsQ.data[0] : null;
+  const ownerFlatCents = Number.isFinite(settingsRow?.default_fee_flat_cents)
+    ? Number(settingsRow.default_fee_flat_cents) : 10;
+  const trainerFeeBps = Number.isFinite(settingsRow?.default_trainer_fee_bps)
+    ? Number(settingsRow.default_trainer_fee_bps) : 200;
+  const trainerFeeFlatCents = Number.isFinite(settingsRow?.default_trainer_fee_flat_cents)
+    ? Number(settingsRow.default_trainer_fee_flat_cents) : 0;
+
+  // Dual-side split: owner pays grossed-up surcharge, trainer absorbs
+  // a small flat platform fee. application_fee = surcharge + cut.
+  const trainerPriceCents = row.trainer_price_cents;
+  const split = computeFeeSplit({
+    trainerPriceCents,
+    ownerBps: feeBps,
+    ownerFlatCents,
+    trainerBps: trainerFeeBps,
+    trainerFlatCents: trainerFeeFlatCents,
+  });
+  const amountCents = trainerPriceCents;                  // T (trainer's listed price)
+  const platformFeeCents = split.applicationFeeCents;     // Stripe API application_fee
+  const grossAmountCents = split.totalCents;              // total owner pays
+  const ownerSurchargeCents = split.ownerSurchargeCents;  // owner-side fee
+  const trainerCutCents = split.trainerCutCents;          // trainer-side deduction
+  const stripeFeeEstimateCents = split.stripeFeeEstimateCents;
 
   // Existing payment row? (Idempotency on repeated clicks.)
   const existingQ = await supabaseSelect(
     env,
     'session_payments',
-    `select=id,status,stripe_payment_intent_id,amount_cents,platform_fee_cents&session_id=eq.${encodeURIComponent(sessionId)}`,
+    `select=id,status,stripe_payment_intent_id,amount_cents,platform_fee_cents,gross_amount_cents,owner_surcharge_cents,trainer_cut_cents&session_id=eq.${encodeURIComponent(sessionId)}`,
     { serviceRole: true }
   );
   const existing = Array.isArray(existingQ.data) ? existingQ.data[0] : null;
@@ -5480,6 +5669,11 @@ async function handleSessionPay(request, env) {
     return json({
       status: existing.status,
       payment_intent_id: existing.stripe_payment_intent_id,
+      amount_cents:          existing.amount_cents,
+      platform_fee_cents:    existing.platform_fee_cents,
+      gross_amount_cents:    existing.gross_amount_cents,
+      owner_surcharge_cents: existing.owner_surcharge_cents,
+      trainer_cut_cents:     existing.trainer_cut_cents,
     });
   }
 
@@ -5493,25 +5687,38 @@ async function handleSessionPay(request, env) {
     if (existing && existing.status === 'awaiting_trainer_setup') {
       return json({
         status: 'awaiting_trainer_setup',
-        amount_cents: existing.amount_cents,
-        platform_fee_cents: existing.platform_fee_cents,
+        amount_cents:          existing.amount_cents,
+        platform_fee_cents:    existing.platform_fee_cents,
+        gross_amount_cents:    existing.gross_amount_cents,
+        owner_surcharge_cents: existing.owner_surcharge_cents,
+        trainer_cut_cents:     existing.trainer_cut_cents,
       });
     }
     // Insert fresh (or upgrade a stale 'failed' row by deleting + reinserting
     // is risky; instead we only insert when no row exists and otherwise
     // return the current state).
     if (!existing) {
-      const ins = await supabaseInsertReturning(env, 'session_payments', {
-        session_id:         sessionId,
-        payer_id:           actorId,
-        payee_id:           row.trainer_id,
-        amount_cents:       amountCents,
-        platform_fee_cents: platformFeeCents,
-        currency:           'usd',
-        status:             'awaiting_trainer_setup',
-      });
+      const fullPayload = {
+        session_id:                sessionId,
+        payer_id:                  actorId,
+        payee_id:                  row.trainer_id,
+        amount_cents:              amountCents,
+        platform_fee_cents:        platformFeeCents,
+        gross_amount_cents:        grossAmountCents,
+        owner_surcharge_cents:     ownerSurchargeCents,
+        trainer_cut_cents:         trainerCutCents,
+        stripe_fee_estimate_cents: stripeFeeEstimateCents,
+        currency:                  'usd',
+        status:                    'awaiting_trainer_setup',
+      };
+      let ins = await supabaseInsertReturning(env, 'session_payments', fullPayload);
+      if (!ins.ok && ins.status === 400) {
+        const { gross_amount_cents: _a, owner_surcharge_cents: _b, trainer_cut_cents: _c, stripe_fee_estimate_cents: _d, ...corePayload } = fullPayload;
+        ins = await supabaseInsertReturning(env, 'session_payments', corePayload);
+      }
       if (!ins.ok) {
-        return json({ error: 'payment_insert_failed', status: ins.status }, 500);
+        console.error('[handleSessionPay] awaiting_trainer_setup insert failed', ins);
+        return json({ error: 'payment_insert_failed', message: 'Could not save payment record.', status: ins.status }, 500);
       }
     }
     ctx_audit(env, {
@@ -5520,12 +5727,21 @@ async function handleSessionPay(request, env) {
       action:       'session_payment.awaiting_trainer_setup',
       target_table: 'session_payments',
       target_id:    sessionId,
-      metadata:     { amount_cents: amountCents, platform_fee_cents: platformFeeCents },
+      metadata: {
+        amount_cents:          amountCents,
+        platform_fee_cents:    platformFeeCents,
+        gross_amount_cents:    grossAmountCents,
+        owner_surcharge_cents: ownerSurchargeCents,
+        trainer_cut_cents:     trainerCutCents,
+      },
     });
     return json({
       status: 'awaiting_trainer_setup',
-      amount_cents: amountCents,
-      platform_fee_cents: platformFeeCents,
+      amount_cents:          amountCents,
+      platform_fee_cents:    platformFeeCents,
+      gross_amount_cents:    grossAmountCents,
+      owner_surcharge_cents: ownerSurchargeCents,
+      trainer_cut_cents:     trainerCutCents,
     });
   }
 
@@ -5534,72 +5750,147 @@ async function handleSessionPay(request, env) {
     return json({ error: 'stripe_not_configured' }, 501);
   }
 
-  // If we already have a pending intent for this session, just re-retrieve
-  // its client_secret so the SPA can resume.
+  // If we already have a pending intent for this session, retrieve it from
+  // Stripe and decide whether to reuse or replace.
+  //
+  // Reuse path:  PI is in `requires_payment_method` with NO last_payment_error
+  //              (clean intent, never charged) — return its client_secret.
+  // Replace path: PI is in `requires_payment_method` WITH last_payment_error
+  //              (a previous attempt failed) — Stripe Elements won't render
+  //              a fresh card form against a poisoned PI, so we mint a new
+  //              one with a salted idempotency key.
+  // Other states (`processing`, `succeeded`, etc.) are handled earlier.
+  let priorPiAttemptFailed = false;
   if (existing && existing.status === 'pending' && existing.stripe_payment_intent_id) {
     const pi = await retrievePaymentIntent(env, existing.stripe_payment_intent_id);
-    if (pi.ok && pi.data?.client_secret) {
-      return json({
-        status: 'pending',
-        client_secret: pi.data.client_secret,
-        payment_intent_id: pi.data.id,
-      });
+    if (pi.ok && pi.data) {
+      const piStatus = pi.data.status;
+      const hasLastError = !!pi.data.last_payment_error;
+      const stillUsable =
+        piStatus === 'requires_payment_method' && !hasLastError;
+
+      if (stillUsable && pi.data.client_secret) {
+        return json({
+          status: 'pending',
+          client_secret: pi.data.client_secret,
+          payment_intent_id: pi.data.id,
+          amount_cents:          amountCents,
+          platform_fee_cents:    platformFeeCents,
+          gross_amount_cents:    grossAmountCents,
+          owner_surcharge_cents: ownerSurchargeCents,
+          trainer_cut_cents:     trainerCutCents,
+        });
+      }
+      priorPiAttemptFailed = piStatus === 'requires_payment_method' && hasLastError;
     }
-    // fall through and create a new one if Stripe lost it
+    // fall through and create a fresh PI
   }
 
-  const idempotencyKey = `session_pay:${sessionId}:${amountCents}:${platformFeeCents}`;
+  // Salt the idempotency key when retrying after a failure so Stripe doesn't
+  // hand back the same dead PI. The salt is the existing PI id which never
+  // recurs, so retries are still idempotent within the new attempt.
+  const idempotencySalt = priorPiAttemptFailed && existing?.stripe_payment_intent_id
+    ? `:retry:${existing.stripe_payment_intent_id}`
+    : '';
+  const idempotencyKey = `session_pay:${sessionId}:${grossAmountCents}:${platformFeeCents}${idempotencySalt}`;
   const piRes = await createPaymentIntent(env, {
-    amountCents,
+    amountCents: grossAmountCents,
     applicationFeeAmountCents: platformFeeCents,
     destinationAccountId: connect.stripe_account_id,
     idempotencyKey,
     description: `Mane Line session ${sessionId}`,
     metadata: {
-      session_id: sessionId,
-      owner_id:   actorId,
-      trainer_id: row.trainer_id,
-      fee_bps:    String(feeBps),
+      session_id:                sessionId,
+      owner_id:                  actorId,
+      trainer_id:                row.trainer_id,
+      owner_fee_bps:             String(feeBps),
+      owner_fee_flat_cents:      String(ownerFlatCents),
+      trainer_fee_bps:           String(trainerFeeBps),
+      trainer_fee_flat_cents:    String(trainerFeeFlatCents),
+      trainer_price_cents:       String(amountCents),
+      gross_amount_cents:        String(grossAmountCents),
+      owner_surcharge_cents:     String(ownerSurchargeCents),
+      trainer_cut_cents:         String(trainerCutCents),
+      stripe_fee_estimate_cents: String(stripeFeeEstimateCents),
     },
   });
   if (!piRes.ok || !piRes.data?.id || !piRes.data?.client_secret) {
+    console.error('[handleSessionPay] createPaymentIntent failed', {
+      sessionId,
+      stripeError: piRes.error,
+      stripeMessage: piRes.message,
+      stripeStatus: piRes.status,
+      destinationAccountId: connect.stripe_account_id,
+      grossAmountCents,
+      platformFeeCents,
+    });
     return json({
       error: piRes.error || 'stripe_create_intent_failed',
-      message: piRes.message ?? null,
+      message: piRes.message ?? 'Could not create payment. Check Stripe configuration.',
     }, 502);
   }
 
   // Insert or update the session_payments row to track this intent.
+  // Phase 9 columns (gross_amount_cents etc.) may not exist yet if
+  // migration 00038 hasn't been applied — try with all columns first,
+  // fall back to core-only on a 400 (unknown column).
+  const phase9Cols = {
+    gross_amount_cents:        grossAmountCents,
+    owner_surcharge_cents:     ownerSurchargeCents,
+    trainer_cut_cents:         trainerCutCents,
+    stripe_fee_estimate_cents: stripeFeeEstimateCents,
+  };
   if (existing) {
-    const upd = await supabaseUpdateReturning(
+    const fullPayload = {
+      stripe_payment_intent_id:  piRes.data.id,
+      amount_cents:              amountCents,
+      platform_fee_cents:        platformFeeCents,
+      ...phase9Cols,
+      status:                    'pending',
+      failure_code:              null,
+      failure_message:           null,
+    };
+    let upd = await supabaseUpdateReturning(
       env,
       'session_payments',
       `id=eq.${encodeURIComponent(existing.id)}`,
-      {
-        stripe_payment_intent_id: piRes.data.id,
-        amount_cents:             amountCents,
-        platform_fee_cents:       platformFeeCents,
-        status:                   'pending',
-        failure_code:             null,
-        failure_message:          null,
-      }
+      fullPayload,
     );
+    if (!upd.ok && upd.status === 400) {
+      // Likely missing Phase 9 columns — retry without them.
+      const { gross_amount_cents: _a, owner_surcharge_cents: _b, trainer_cut_cents: _c, stripe_fee_estimate_cents: _d, ...corePayload } = fullPayload;
+      upd = await supabaseUpdateReturning(
+        env,
+        'session_payments',
+        `id=eq.${encodeURIComponent(existing.id)}`,
+        corePayload,
+      );
+    }
     if (!upd.ok) {
-      return json({ error: 'payment_update_failed', status: upd.status }, 500);
+      console.error('[handleSessionPay] payment update failed', upd);
+      return json({ error: 'payment_update_failed', message: 'Could not save payment record.', status: upd.status }, 500);
     }
   } else {
-    const ins = await supabaseInsertReturning(env, 'session_payments', {
-      session_id:               sessionId,
-      payer_id:                 actorId,
-      payee_id:                 row.trainer_id,
-      stripe_payment_intent_id: piRes.data.id,
-      amount_cents:             amountCents,
-      platform_fee_cents:       platformFeeCents,
-      currency:                 'usd',
-      status:                   'pending',
-    });
+    const fullPayload = {
+      session_id:                sessionId,
+      payer_id:                  actorId,
+      payee_id:                  row.trainer_id,
+      stripe_payment_intent_id:  piRes.data.id,
+      amount_cents:              amountCents,
+      platform_fee_cents:        platformFeeCents,
+      ...phase9Cols,
+      currency:                  'usd',
+      status:                    'pending',
+    };
+    let ins = await supabaseInsertReturning(env, 'session_payments', fullPayload);
+    if (!ins.ok && ins.status === 400) {
+      // Likely missing Phase 9 columns — retry without them.
+      const { gross_amount_cents: _a, owner_surcharge_cents: _b, trainer_cut_cents: _c, stripe_fee_estimate_cents: _d, ...corePayload } = fullPayload;
+      ins = await supabaseInsertReturning(env, 'session_payments', corePayload);
+    }
     if (!ins.ok) {
-      return json({ error: 'payment_insert_failed', status: ins.status }, 500);
+      console.error('[handleSessionPay] payment insert failed', ins);
+      return json({ error: 'payment_insert_failed', message: 'Could not save payment record.', status: ins.status }, 500);
     }
   }
 
@@ -5612,19 +5903,28 @@ async function handleSessionPay(request, env) {
     ip:           clientIp(request),
     user_agent:   request.headers.get('user-agent') || null,
     metadata:     {
-      payment_intent_id:  piRes.data.id,
-      amount_cents:       amountCents,
-      platform_fee_cents: platformFeeCents,
-      fee_bps:            feeBps,
+      payment_intent_id:     piRes.data.id,
+      amount_cents:          amountCents,
+      platform_fee_cents:    platformFeeCents,
+      gross_amount_cents:    grossAmountCents,
+      owner_surcharge_cents: ownerSurchargeCents,
+      trainer_cut_cents:     trainerCutCents,
+      owner_fee_bps:         feeBps,
+      owner_fee_flat_cents:  ownerFlatCents,
+      trainer_fee_bps:       trainerFeeBps,
+      trainer_fee_flat_cents: trainerFeeFlatCents,
     },
   });
 
   return json({
     status: 'pending',
-    client_secret: piRes.data.client_secret,
-    payment_intent_id: piRes.data.id,
-    amount_cents: amountCents,
-    platform_fee_cents: platformFeeCents,
+    client_secret:         piRes.data.client_secret,
+    payment_intent_id:     piRes.data.id,
+    amount_cents:          amountCents,
+    platform_fee_cents:    platformFeeCents,
+    gross_amount_cents:    grossAmountCents,
+    owner_surcharge_cents: ownerSurchargeCents,
+    trainer_cut_cents:     trainerCutCents,
   });
 }
 

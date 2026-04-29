@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronLeft } from "lucide-react";
+import { ChevronLeft, Loader2, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -34,6 +34,12 @@ import { EXPENSES_QUERY_KEY, listExpensesForSession } from "@/lib/expenses";
 import { ExpensesList } from "@/components/expenses/ExpensesList";
 import { RatingPrompt } from "@/components/ratings/RatingPrompt";
 
+type PaymentBreakdown = {
+  trainerCents: number;
+  serviceFee: number | null;
+  totalCents: number | null;
+};
+
 // SessionApproveAndPay — /app/sessions/:id/pay
 //
 // Two steps, same page:
@@ -49,6 +55,10 @@ export default function SessionApproveAndPay() {
   const queryClient = useQueryClient();
 
   const [intent, setIntent] = useState<StartPaymentResult | null>(null);
+  const [payError, setPayError] = useState<string | null>(null);
+  // Track whether we've already auto-fired payMut for this mount so the
+  // useEffect doesn't loop on dependency changes.
+  const autoStarted = useRef(false);
 
   const sessionQuery = useQuery({
     queryKey: [...SESSIONS_QUERY_KEY, id],
@@ -74,7 +84,7 @@ export default function SessionApproveAndPay() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: SESSIONS_QUERY_KEY });
       // Kick off the payment intent creation immediately.
-      payMut.mutate();
+      firePayMut();
     },
     onError: (err) => notify.error(mapSupabaseError(err as Error)),
   });
@@ -82,24 +92,36 @@ export default function SessionApproveAndPay() {
   const payMut = useMutation({
     mutationFn: () => startPayment(id),
     onSuccess: (res) => {
+      setPayError(null);
       setIntent(res);
       queryClient.invalidateQueries({ queryKey: SESSION_PAYMENTS_QUERY_KEY });
     },
-    onError: (err) => notify.error(mapSupabaseError(err as Error)),
+    onError: (err) => {
+      const msg = mapSupabaseError(err as Error);
+      setPayError(msg);
+      notify.error(msg);
+    },
   });
+
+  /** Shared helper so approve-flow and retry button use the same path. */
+  function firePayMut() {
+    setPayError(null);
+    autoStarted.current = true;
+    payMut.mutate();
+  }
 
   // Auto-start payment if the session is already approved and we land here
   // fresh (e.g. after reload or after clicking "Pay now" on the list view).
   useEffect(() => {
+    if (autoStarted.current) return;          // already fired
     if (!sessionQuery.data) return;
     if (intent) return;
     if (payMut.isPending) return;
     if (sessionQuery.data.status === "approved") {
-      payMut.mutate();
+      firePayMut();
     }
-    // payMut is stable enough; we only care about the session row shape.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionQuery.data, intent]);
+  }, [sessionQuery.data, intent, payMut.isPending]);
 
   const session = sessionQuery.data;
   const amountLabel = useMemo(
@@ -108,6 +130,64 @@ export default function SessionApproveAndPay() {
       : null),
     [session?.trainer_price_cents],
   );
+
+  // Breakdown shown above the card form: trainer's price + service fee
+  // (Stripe pass-through + platform margin) = total charged.
+  // Pulled from the live PaymentIntent response, falls back to the
+  // session_payments row if the user reloaded mid-flow.
+  const breakdown = useMemo<PaymentBreakdown | null>(() => {
+    const intentAny = intent as
+      | (StartPaymentResult & {
+          amount_cents?: number;
+          platform_fee_cents?: number;
+          gross_amount_cents?: number;
+          owner_surcharge_cents?: number;
+        })
+      | null;
+    if (
+      intentAny &&
+      intentAny.status !== "processing" &&
+      intentAny.status !== "succeeded" &&
+      intentAny.amount_cents != null &&
+      intentAny.gross_amount_cents != null
+    ) {
+      // Owner sees only the owner-side surcharge, not the trainer's
+      // platform deduction (that's the trainer's relationship with us,
+      // not the owner's concern).
+      const ownerFee = intentAny.owner_surcharge_cents
+        ?? (intentAny.gross_amount_cents - intentAny.amount_cents);
+      return {
+        trainerCents: intentAny.amount_cents,
+        serviceFee: ownerFee,
+        totalCents: intentAny.gross_amount_cents,
+      };
+    }
+    const row = paymentQuery.data as
+      | (typeof paymentQuery.data & {
+          gross_amount_cents?: number | null;
+          owner_surcharge_cents?: number | null;
+        })
+      | null
+      | undefined;
+    if (row && row.amount_cents != null) {
+      const total = row.gross_amount_cents
+        ?? (row.platform_fee_cents != null
+          ? row.amount_cents + row.platform_fee_cents
+          : null);
+      const ownerFee = row.owner_surcharge_cents
+        ?? (total != null ? total - row.amount_cents : null);
+      return {
+        trainerCents: row.amount_cents,
+        serviceFee: ownerFee,
+        totalCents: total,
+      };
+    }
+    return null;
+  }, [intent, paymentQuery.data]);
+
+  const totalLabel = breakdown?.totalCents != null
+    ? formatCents(breakdown.totalCents)
+    : amountLabel;
 
   if (sessionQuery.isLoading) {
     return <div className="h-48 animate-pulse rounded-lg border border-border bg-muted/40" />;
@@ -212,13 +292,26 @@ export default function SessionApproveAndPay() {
           animalId={session.animal_id}
           intent={intent}
           loading={payMut.isPending || paymentQuery.isLoading}
+          error={payError}
+          onRetry={firePayMut}
           onPaid={() => {
             queryClient.invalidateQueries({ queryKey: SESSIONS_QUERY_KEY });
             queryClient.invalidateQueries({ queryKey: SESSION_PAYMENTS_QUERY_KEY });
             notify.success("Payment sent to your trainer");
             navigate(`/app/animals/${session.animal_id}?paid=1`);
           }}
+          onPaymentFailed={() => {
+            // The PaymentIntent we just attempted is now poisoned (Stripe
+            // marks it requires_payment_method + last_payment_error).
+            // Drop the cached intent so we can re-fire startPayment(),
+            // which mints a fresh PI on the Worker.
+            setIntent(null);
+            autoStarted.current = false;
+            queryClient.invalidateQueries({ queryKey: SESSION_PAYMENTS_QUERY_KEY });
+          }}
           amountLabel={amountLabel ?? undefined}
+          breakdown={breakdown}
+          totalLabel={totalLabel ?? undefined}
         />
       )}
 
@@ -254,21 +347,55 @@ function PayPanel({
   animalId,
   intent,
   loading,
+  error,
+  onRetry,
   onPaid,
+  onPaymentFailed,
   amountLabel,
+  breakdown,
+  totalLabel,
 }: {
   sessionId: string;
   animalId: string;
   intent: StartPaymentResult | null;
   loading: boolean;
+  error: string | null;
+  onRetry: () => void;
   onPaid: () => void;
+  onPaymentFailed: () => void;
   amountLabel?: string;
+  breakdown: PaymentBreakdown | null;
+  totalLabel?: string;
 }) {
   void sessionId;
   if (loading && !intent) {
-    return <div className="h-32 animate-pulse rounded-lg border border-border bg-muted/40" />;
+    return (
+      <Card>
+        <CardContent className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Setting up payment…
+        </CardContent>
+      </Card>
+    );
   }
   if (!intent) {
+    // payMut failed — show actionable error with retry.
+    if (error) {
+      return (
+        <Card>
+          <CardContent className="space-y-3 py-6">
+            <p className="text-sm font-medium text-destructive">
+              Couldn't start the payment checkout.
+            </p>
+            <p className="text-sm text-muted-foreground">{error}</p>
+            <Button variant="outline" onClick={onRetry}>
+              <RefreshCw className="mr-1 h-4 w-4" />
+              Retry
+            </Button>
+          </CardContent>
+        </Card>
+      );
+    }
     return (
       <Card>
         <CardContent className="py-6 text-sm text-muted-foreground">
@@ -313,12 +440,31 @@ function PayPanel({
       <CardHeader>
         <CardTitle>Payment</CardTitle>
       </CardHeader>
-      <CardContent>
+      <CardContent className="space-y-4">
+        {breakdown && breakdown.totalCents != null && breakdown.trainerCents != null && (
+          <dl className="space-y-1 rounded-md border border-border bg-muted/30 p-3 text-sm">
+            <div className="flex justify-between">
+              <dt className="text-muted-foreground">Session</dt>
+              <dd>{formatCents(breakdown.trainerCents)}</dd>
+            </div>
+            {breakdown.serviceFee != null && breakdown.serviceFee > 0 && (
+              <div className="flex justify-between">
+                <dt className="text-muted-foreground">Service fee</dt>
+                <dd>{formatCents(breakdown.serviceFee)}</dd>
+              </div>
+            )}
+            <div className="flex justify-between border-t border-border pt-1 font-medium">
+              <dt>Total</dt>
+              <dd>{formatCents(breakdown.totalCents)}</dd>
+            </div>
+          </dl>
+        )}
         <PaymentForm
           clientSecret={intent.client_secret}
           returnUrl={returnUrl}
           onSuccess={onPaid}
-          amountLabel={amountLabel}
+          onFailure={onPaymentFailed}
+          amountLabel={totalLabel ?? undefined}
         />
       </CardContent>
     </Card>

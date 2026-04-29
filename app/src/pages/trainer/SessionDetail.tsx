@@ -25,6 +25,10 @@ import {
 } from "@/lib/expenses";
 import type { SessionStatus } from "@/lib/database.types";
 import { RatingPrompt } from "@/components/ratings/RatingPrompt";
+import {
+  SESSION_PAYMENTS_QUERY_KEY,
+  getPaymentForSession,
+} from "@/lib/sessionPayments";
 
 // SessionDetail — /trainer/sessions/:id.
 //
@@ -47,6 +51,12 @@ export default function SessionDetail() {
   const expensesQ = useQuery({
     queryKey: [...EXPENSES_QUERY_KEY, "session", id],
     queryFn: () => listExpensesForSession(id),
+    enabled: Boolean(id) && q.isSuccess,
+  });
+
+  const paymentQ = useQuery({
+    queryKey: [...SESSION_PAYMENTS_QUERY_KEY, id],
+    queryFn: () => getPaymentForSession(id),
     enabled: Boolean(id) && q.isSuccess,
   });
 
@@ -138,6 +148,11 @@ export default function SessionDetail() {
               </CardContent>
             </Card>
           )}
+
+          <PayoutCard
+            trainerPriceCents={q.data.trainer_price_cents}
+            payment={paymentQ.data}
+          />
 
           {/* Expenses tied to this session */}
           <Card>
@@ -245,5 +260,58 @@ function Detail({
         {value}
       </p>
     </div>
+  );
+}
+
+function PayoutCard({
+  trainerPriceCents,
+  payment,
+}: {
+  trainerPriceCents: number | null;
+  payment:
+    | (
+        | (Awaited<ReturnType<typeof getPaymentForSession>> & {
+            trainer_cut_cents?: number | null;
+          })
+        | null
+      )
+    | undefined;
+}) {
+  if (trainerPriceCents == null || trainerPriceCents <= 0) return null;
+
+  const cut = payment?.trainer_cut_cents ?? null;
+  const hasPayment = !!payment;
+  const isPaid = payment?.status === "succeeded";
+  const trainerNet = cut != null ? trainerPriceCents - cut : null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Your payout</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2 text-sm">
+        <dl className="space-y-1 rounded-md border border-border bg-muted/30 p-3">
+          <div className="flex justify-between">
+            <dt className="text-muted-foreground">Session price</dt>
+            <dd>{formatCents(trainerPriceCents)}</dd>
+          </div>
+          {cut != null && cut > 0 && (
+            <div className="flex justify-between text-muted-foreground">
+              <dt>Platform fee</dt>
+              <dd>−{formatCents(cut)}</dd>
+            </div>
+          )}
+          <div className="flex justify-between border-t border-border pt-1 font-medium">
+            <dt>{isPaid ? "Deposited" : "You'll receive"}</dt>
+            <dd>{formatCents(trainerNet ?? trainerPriceCents)}</dd>
+          </div>
+        </dl>
+        {!hasPayment && (
+          <p className="text-xs text-muted-foreground">
+            Final amount confirms when the owner pays.
+          </p>
+        )}
+      </CardContent>
+    </Card>
   );
 }

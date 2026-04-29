@@ -217,6 +217,13 @@ export function createAccountLink(env, {
  * calls) so a retry from the SPA doesn't create two intents for the same
  * session_payment row.
  */
+// Per-charge descriptor override so Mane Line owners see MANE LINE on
+// their card statements regardless of the platform Stripe account's
+// account-level default (which serves the platform's other businesses).
+// Max 22 chars, alphanumeric + spaces, must contain ≥1 letter, no
+// special chars except space. Stripe verifies these before charging.
+const MANELINE_STATEMENT_DESCRIPTOR = 'MANE LINE';
+
 export async function createPaymentIntent(env, {
   amountCents,
   applicationFeeAmountCents,
@@ -234,6 +241,7 @@ export async function createPaymentIntent(env, {
     application_fee_amount: applicationFeeAmountCents,
     transfer_data: { destination: destinationAccountId },
     automatic_payment_methods: { enabled: true },
+    statement_descriptor: MANELINE_STATEMENT_DESCRIPTOR,
     metadata,
   };
   if (description) body.description = description;

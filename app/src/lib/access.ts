@@ -114,6 +114,31 @@ export class TrainerProRequiredError extends Error {
   }
 }
 
+export type DirectoryTrainer = {
+  user_id: string;
+  email: string;
+  display_name: string | null;
+};
+
+export const TRAINER_DIRECTORY_QUERY_KEY = ["trainer_directory"] as const;
+
+/** Approved trainers an owner can pick from when granting access. */
+export async function listApprovedTrainers(): Promise<DirectoryTrainer[]> {
+  const { data } = await supabase.auth.getSession();
+  const token = data?.session?.access_token;
+  if (!token) throw new Error("Not signed in.");
+
+  const res = await fetch("/api/trainers/directory", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body?.error || `Directory lookup failed (${res.status})`);
+  }
+  const json = (await res.json()) as { trainers: DirectoryTrainer[] };
+  return json.trainers ?? [];
+}
+
 export async function grantAccess(input: GrantInput): Promise<GrantResult> {
   const res = await authedFetch("/api/access/grant", input);
   if (!res.ok) {
